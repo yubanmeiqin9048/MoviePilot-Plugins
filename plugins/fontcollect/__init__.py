@@ -1,6 +1,6 @@
 import time
+import py7zr
 import zipfile
-from py7zr import py7zr
 from pathlib import Path
 from typing import Any, List, Dict, Tuple
 
