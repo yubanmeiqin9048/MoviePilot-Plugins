@@ -1,6 +1,7 @@
 import time
-import py7zr
 import zipfile
+import threading
+from py7zr import py7zr
 from pathlib import Path
 from typing import Any, List, Dict, Tuple
 
@@ -21,7 +22,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -209,10 +210,10 @@ class FontCollect(_PluginBase):
             torrent_hash = self.qbittorrent.get_torrent_id_by_tag(tags=tag)
             if torrent_hash:
                 self.qbittorrent.remove_torrents_tag(ids=torrent_hash, tag='')
-                self.collect(torrent_hash=torrent_hash)
+                threading.Thread(target=self.collect, args=(torrent_hash,)).start()
                 return schemas.Response(success=True, message="种子添加下载成功")
             else:
-                return schemas.Response(success=False, message="获取种子文件失败，下载任务可能在暂停状态")
+                return schemas.Response(success=True, message="获取种子文件失败，下载任务可能在暂停状态")
         return schemas.Response(success=True, message="种子添加下载失败")
 
     @eventmanager.register(EventType.DownloadAdded)
