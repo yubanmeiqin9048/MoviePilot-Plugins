@@ -1,7 +1,7 @@
 import time
+import py7zr
 import zipfile
 import threading
-from py7zr import py7zr
 from pathlib import Path
 from typing import Any, List, Dict, Tuple
 
@@ -22,7 +22,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -163,16 +163,30 @@ class FontCollect(_PluginBase):
                     logger.error(f"检测失败")
                     break
 
+        def __set_torrent_foce_resume_status(torrent_hash: str):
+            # 恢复任务，只下载“Font”文件
+            if settings.QB_FORCE_RESUME:
+                # 强制继续
+                self.qbittorrent.torrents_set_force_start(torrent_hash)
+            else:
+                self.qbittorrent.start_torrents(torrent_hash)
+
         # 获取种子文件
         torrent_files = self.qbittorrent.get_files(torrent_hash)
         if not torrent_files:
             logger.error(f"获取种子文件失败，下载任务可能在暂停状态")
             return
         
+        # 获取优先级大于1的文件
+        need_files = [f for f in torrent_files if f.get('priority', 0) > 1]
+        if not need_files:
+            logger.error(f"种子中没有优先级大于1的文件")
+            return
+
         # 暂停任务
         self.qbittorrent.stop_torrents(torrent_hash)
 
-        for torrent_file in torrent_files:
+        for torrent_file in need_files:
             file_id = torrent_file.get("id")
             file_name = torrent_file.get("name")
             if "Font" in file_name:
@@ -184,19 +198,17 @@ class FontCollect(_PluginBase):
         if font_file_ids:
             self.qbittorrent.set_files(torrent_hash=torrent_hash, file_ids=font_file_ids, priority=7)
             self.qbittorrent.set_files(torrent_hash=torrent_hash, file_ids=other_file_ids, priority=0)
-        # 恢复任务，只下载“Font”文件
-        if settings.QB_FORCE_RESUME:
-            # 强制继续
-            self.qbittorrent.torrents_set_force_start(torrent_hash)
-        else:
-            self.qbittorrent.start_torrents(torrent_hash)
 
-        __wait_for_files_completion(torrent_hash=torrent_hash, file_ids=font_file_ids)
+            __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
 
-        __unzip_font_files(torrent_files=torrent_files, font_file_ids=font_file_ids)
+            __wait_for_files_completion(torrent_hash=torrent_hash, file_ids=font_file_ids)
 
-        self.qbittorrent.set_files(torrent_hash=torrent_hash, file_ids=other_file_ids, priority=1)
-        
+            __unzip_font_files(torrent_files=torrent_files, font_file_ids=font_file_ids)
+
+            self.qbittorrent.set_files(torrent_hash=torrent_hash, file_ids=other_file_ids, priority=1)
+
+        return __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
+
     def api_download_torrent(self, torrent_url: str) -> schemas.Response:
         """
         API调用下载种子
