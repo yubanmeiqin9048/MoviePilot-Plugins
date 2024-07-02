@@ -178,7 +178,7 @@ class FontCollect(_PluginBase):
             return
         
         # 获取优先级大于1的文件
-        need_files = [f for f in torrent_files if f.get('priority', 0) > 1]
+        need_files = [f for f in torrent_files if f.get('priority') >= 1]
         if not need_files:
             logger.error(f"种子中没有优先级大于1的文件")
             return
