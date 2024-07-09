@@ -46,8 +46,8 @@ class FontCollect(_PluginBase):
 
 
     def get_state(self) -> bool:
-        return self._enabled
-
+        return True if self._enabled and self._fontpath else False
+    
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
         pass
@@ -128,8 +128,7 @@ class FontCollect(_PluginBase):
             for font_file in font_files:
                 file_path = Path(save_path) / font_file["name"]
                 try:
-                    if self._fontpath:
-                        output_dir = Path(self._fontpath)
+                    output_dir = Path(self._fontpath)
                     output_dir.mkdir(parents=True, exist_ok=True)
 
                     if file_path.suffix == ".zip":
