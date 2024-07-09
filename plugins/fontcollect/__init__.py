@@ -22,7 +22,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -117,13 +117,9 @@ class FontCollect(_PluginBase):
         }
 
     def collect(self, torrent_hash: str = None):
-        # 获取根目录
-        torrent_info, _ = self.qbittorrent.get_torrents(ids=torrent_hash)
-        save_path = torrent_info[0].get("save_path")
-        # 筛选文件名包含“Font”的文件
-        font_file_ids = []
-        other_file_ids = []
-
+        """
+        等待字体下载完成并解压
+        """
         def __unzip_font_files(torrent_files: List[Dict[str, Any]], font_file_ids: List[int]):
             """
             解压下载完成的Font文件
@@ -134,8 +130,6 @@ class FontCollect(_PluginBase):
                 try:
                     if self._fontpath:
                         output_dir = Path(self._fontpath)
-                    else:
-                        output_dir = file_path.parent / "font"
                     output_dir.mkdir(parents=True, exist_ok=True)
 
                     if file_path.suffix == ".zip":
@@ -157,19 +151,33 @@ class FontCollect(_PluginBase):
                     files = self.qbittorrent.get_files(torrent_hash)
                     all_completed = all(file["priority"] == 7 and file["progress"] == 1 for file in files if file["id"] in file_ids)
                     if all_completed:
+                        self.qbittorrent.remove_torrents_tag(ids=torrent_hash, tag='')
                         break
                     time.sleep(5)  # 每隔5秒检查一次
                 except Exception as e:
-                    logger.error(f"检测失败")
+                    logger.error(f"检测失败, 原因:{e}")
                     break
 
         def __set_torrent_foce_resume_status(torrent_hash: str):
-            # 恢复任务，只下载“Font”文件
+            """
+            根据需要强制继续
+            """
             if settings.QB_FORCE_RESUME:
                 # 强制继续
                 self.qbittorrent.torrents_set_force_start(torrent_hash)
             else:
                 self.qbittorrent.start_torrents(torrent_hash)
+
+        if not torrent_hash:
+            logger.error(f"种子hash获取失败")
+            return
+        
+        # 获取根目录
+        torrent_info, _ = self.qbittorrent.get_torrents(ids=torrent_hash)
+        save_path = torrent_info[0].get("save_path")
+        # 筛选文件名包含“Font”的文件
+        font_file_ids = []
+        other_file_ids = []
 
         # 获取种子文件
         torrent_files = self.qbittorrent.get_files(torrent_hash)
@@ -199,6 +207,7 @@ class FontCollect(_PluginBase):
             self.qbittorrent.set_files(torrent_hash=torrent_hash, file_ids=font_file_ids, priority=7)
             self.qbittorrent.set_files(torrent_hash=torrent_hash, file_ids=other_file_ids, priority=0)
 
+            # 恢复任务，只下载“Font”文件
             __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
 
             __wait_for_files_completion(torrent_hash=torrent_hash, file_ids=font_file_ids)
@@ -221,12 +230,11 @@ class FontCollect(_PluginBase):
         if torrent:
             torrent_hash = self.qbittorrent.get_torrent_id_by_tag(tags=tag)
             if torrent_hash:
-                self.qbittorrent.remove_torrents_tag(ids=torrent_hash, tag='')
                 threading.Thread(target=self.collect, args=(torrent_hash,)).start()
-                return schemas.Response(success=True, message="种子添加下载成功")
+                return schemas.Response(success=True, message="下载成功")
             else:
-                return schemas.Response(success=True, message="获取种子文件失败，下载任务可能在暂停状态")
-        return schemas.Response(success=True, message="种子添加下载失败")
+                return schemas.Response(success=True, message="下载成功, 但获取种子hash失败")
+        return schemas.Response(success=False, message="种子添加下载失败")
 
     @eventmanager.register(EventType.DownloadAdded)
     def process(self, event: Event):
