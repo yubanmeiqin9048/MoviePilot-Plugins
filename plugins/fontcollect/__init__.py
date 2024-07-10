@@ -43,10 +43,13 @@ class FontCollect(_PluginBase):
             self._enabled = config.get("enabled")
             self._fontpath = config.get("fontpath")
             self.qbittorrent = Qbittorrent()
-
+        if not Path(self._fontpath).exists():
+            logger.error("未配置字体库路径，插件退出")
+            self._enabled = False
+            self.__update_config()
 
     def get_state(self) -> bool:
-        return True if self._enabled and self._fontpath else False
+        return self._enabled
     
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -115,6 +118,12 @@ class FontCollect(_PluginBase):
             "enable": False,
             "fontpath": ''
         }
+
+    def __update_config(self):
+        self.update_config({
+            "enabled": self._enabled,
+            "fontpath": self._fontpath,
+        })
 
     def collect(self, torrent_hash: str = None):
         """
