@@ -17,7 +17,7 @@ class AutoSubset(_PluginBase):
     # 插件描述
     plugin_desc = "转移完成后自动将目录下的字幕子集化"
     # 插件图标
-    # plugin_icon = "Themeengine_A.png"
+    plugin_icon = "assfonts.png"
     # 插件版本
     plugin_version = "1.0"
     # 插件作者
@@ -295,7 +295,7 @@ class AutoSubset(_PluginBase):
                 logger.info(f"{input_ass.name} 子集化失败")
                 return
             logger.info(f"{input_ass.name} 子集化成功")
-            
+
             # 处理完字幕后，如果设置了删除字体文件夹选项，则删除该文件夹
             if self._deletesubfontfolder:
                 font_folder_name = input_ass.stem + "_subsetted"
