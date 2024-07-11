@@ -19,7 +19,7 @@ class AutoSubset(_PluginBase):
     # 插件图标
     plugin_icon = "assfonts.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -33,10 +33,14 @@ class AutoSubset(_PluginBase):
 
     # 私有属性
     _enabled = False
+    _afpath = None
     _version = None
     _fontpath = None
+    _binaryname = None
     _overwrite = False
     _fontrename = False 
+    _hdrluminance = False
+    _sethdrluminance = False
     _deletesubfontfolder = False
 
     def init_plugin(self, config: dict = None):
@@ -45,15 +49,17 @@ class AutoSubset(_PluginBase):
             self._fontpath = config.get("fontpath")
             self._overwrite = config.get("overwrite")
             self._fontrename = config.get("fontrename")
+            self._hdrluminance = config.get("hdrluminance")
             self._deletesubfontfolder = config.get("deletesubfontfolder")
-            self._af_path = self.get_data_path()
-            self._binary_name = 'assfonts'
-            if not Path(self._fontpath).exists() or not Path(f'{self._af_path}/{self._binary_name}').exists():
+            self._afpath = self.get_data_path()
+            self._binaryname = 'assfonts'
+            if not Path(self._fontpath).exists() or not Path(f'{self._afpath}/{self._binaryname}').exists():
                 self._enabled = False
                 self.__update_config()
                 logger.error(f"未配置字体库或assfonts可执行版本不存在，插件退出")
                 return
             self.__update_config()
+            self.__init_assfonts()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -176,6 +182,22 @@ class AutoSubset(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
+                                            'model': 'hdrluminance',
+                                            'label': '调整字幕HDR亮度',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
                                             'model': 'deletesubfontfolder',
                                             'label': '删除子集化后的字体',
                                         }
@@ -213,6 +235,7 @@ class AutoSubset(_PluginBase):
             "fontpath": None,
             "overwrite":False,
             "fontrename": False,
+            "hdrluminance": False,
             "deletesubfontfolder": False
         }
     
@@ -223,12 +246,16 @@ class AutoSubset(_PluginBase):
             "fontpath": self._fontpath,
             "overwrite": self._overwrite,
             "fontrename": self._fontrename,
+            "hdrluminance": self._hdrluminance,
             "deletesubfontfolder": self._deletesubfontfolder
         })
 
+    def __init_assfonts(self):
+        os.popen(f'cd {self._afpath} && ./{self._binaryname} -b -f {self._fontpath} -d {self._fontpath}')
+
     def __get_version(self):
-        if Path(f'{self._af_path}/{self._binary_name}').exists():
-            self._version = SystemUtils.execute(f'cd {self._af_path} && chmod a+x {self._binary_name} && ./{self._binary_name}').split(" ")[1]
+        if Path(f'{self._afpath}/{self._binaryname}').exists():
+            self._version = SystemUtils.execute(f'cd {self._afpath} && chmod a+x {self._binaryname} && ./{self._binaryname}').split(" ")[1]
         return self._version
 
     def __overwrite_original_file(self, file: str, assfont_rename: bool):
@@ -249,7 +276,6 @@ class AutoSubset(_PluginBase):
         if os.path.exists(plain_rename_file):
             os.remove(plain_rename_file)
 
-
     def __assfonts_shell(self, text: str):
         if "[ERROR]" in text:
             error_lines = [line for line in text.splitlines() if "[ERROR]" in line]
@@ -264,16 +290,19 @@ class AutoSubset(_PluginBase):
 
     def __build_af_command(self, input_ass: Path) -> List[str]:
         af_command = [
-            f"{self._af_path}/{self._binary_name}",
+            f"{self._afpath}/{self._binaryname}",
             "-i", str(input_ass),
-            "-f", self._fontpath
+            "-d", self._fontpath
         ]
         if self._fontrename:
             af_command.append("-r")
+        if self._sethdrluminance:
+            af_command.append("-l")
         return af_command
 
     def __subset_ass_file(self, input_ass: Path):
         try:
+            self.__init_assfonts()
             af_command = self.__build_af_command(input_ass)
             result = subprocess.run(af_command, stdout=subprocess.PIPE, text=True)
 
@@ -281,12 +310,16 @@ class AutoSubset(_PluginBase):
 
         except Exception as e:
             logger.error(f"处理文件 {input_ass} 时发生错误: {e}")
-            
+            return 1
 
     @eventmanager.register(EventType.TransferComplete)
     def task_in(self, event: Event):
         #获取要处理的文件路径
         work_file = Path(event.event_data['transferinfo'].target_path)
+        #获取媒体质量
+        media_edition = event.event_data['meta'].edition
+        if "hdr" in media_edition and self._hdrluminance:
+            self._sethdrluminance = True
         # 获取同目录下的ass文件
         ass_list = [ass for ass in work_file.parent.rglob("*.ass") if ".assfonts." not in ass.name]        
         for input_ass in ass_list:
@@ -295,7 +328,7 @@ class AutoSubset(_PluginBase):
                 logger.info(f"{input_ass.name} 子集化失败")
                 return
             logger.info(f"{input_ass.name} 子集化成功")
-
+            
             # 处理完字幕后，如果设置了删除字体文件夹选项，则删除该文件夹
             if self._deletesubfontfolder:
                 font_folder_name = input_ass.stem + "_subsetted"
