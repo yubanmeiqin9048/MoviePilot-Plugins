@@ -17,7 +17,7 @@ class AutoSubset(_PluginBase):
     # 插件描述
     plugin_desc = "转移完成后自动将目录下的字幕子集化"
     # 插件图标
-    plugin_icon = "assfonts.png"
+    plugin_icon = "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Aassfonts.png"
     # 插件版本
     plugin_version = "1.1"
     # 插件作者
@@ -56,7 +56,7 @@ class AutoSubset(_PluginBase):
             if not Path(self._fontpath).exists() or not Path(f'{self._afpath}/{self._binaryname}').exists():
                 self._enabled = False
                 self.__update_config()
-                logger.error(f"未配置字体库或assfonts可执行版本不存在，插件退出")
+                logger.error("未配置字体库或assfonts可执行版本不存在，插件退出")
                 return
             self.__update_config()
             self.__init_assfonts()

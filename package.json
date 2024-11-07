@@ -19,11 +19,23 @@
         "description": "转移完成后自动对目录下的字幕做子集化",
         "labels": "整理",
         "version": "1.1",
-        "icon": "assfonts.png",
+        "icon": "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Assfonts.png",
         "author": "yubanmeiqin9048",
         "level": 1,
         "history": {
             "v1.1": "增加HDR选项，建立字体库",
+            "v1.0": "初版"
+        }
+    },
+    "Alist2Strm": {
+        "name": "Alist2Strm",
+        "description": "从alist生成strm文件。",
+        "labels": "整理",
+        "version": "1.0",
+        "icon": "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Alist.png",
+        "author": "yubanmeiqin9048",
+        "level": 2,
+        "history": {
             "v1.0": "初版"
         }
     }
