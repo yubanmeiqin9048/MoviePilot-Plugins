@@ -35,6 +35,7 @@
         "icon": "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Alist.png",
         "author": "yubanmeiqin9048",
         "level": 2,
+        "v2": true,
         "history": {
             "v1.0": "初版"
         }
