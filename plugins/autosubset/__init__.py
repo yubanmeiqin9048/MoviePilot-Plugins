@@ -17,7 +17,7 @@ class AutoSubset(_PluginBase):
     # 插件描述
     plugin_desc = "转移完成后自动将目录下的字幕子集化"
     # 插件图标
-    plugin_icon = "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Aassfonts.png"
+    plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Assfonts.png"
     # 插件版本
     plugin_version = "1.1"
     # 插件作者

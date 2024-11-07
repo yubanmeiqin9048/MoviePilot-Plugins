@@ -23,9 +23,9 @@ class Alist2Strm(_PluginBase):
     # 插件描述
     plugin_desc = "从alist生成strm。"
     # 插件图标
-    plugin_icon = "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Alist.png"
+    plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -48,6 +48,7 @@ class Alist2Strm(_PluginBase):
     _path_replace = ""
     _cron = ""
     _scheduler = None
+    _onlyonce = False
     _process_file_suffix = settings.RMT_SUBEXT + settings.RMT_MEDIAEXT
 
     processed_remote_paths_in_local = set()
