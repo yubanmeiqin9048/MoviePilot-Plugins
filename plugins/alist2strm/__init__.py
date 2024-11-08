@@ -139,7 +139,7 @@ class Alist2Strm(_PluginBase):
         # 计算保存路径
         target_path = self.__computed_target_path(path)
         # strm内容
-        content = path.alist_url + path.path
+        content = path.download_url
         # 创建父目录
         if not target_path.parent.exists():
             await to_thread(target_path.parent.mkdir, parents=True, exist_ok=True)
