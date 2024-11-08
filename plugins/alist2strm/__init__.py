@@ -1,5 +1,5 @@
 import os
-from asyncio import TaskGroup, run, to_thread
+from asyncio import Semaphore, TaskGroup, run, to_thread
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,9 +23,9 @@ class Alist2Strm(_PluginBase):
     # 插件描述
     plugin_desc = "从alist生成strm。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
+    plugin_icon = "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -50,6 +50,8 @@ class Alist2Strm(_PluginBase):
     _scheduler = None
     _onlyonce = False
     _process_file_suffix = settings.RMT_SUBEXT + settings.RMT_MEDIAEXT
+    _max_download_worker = None
+    _max_list_worker = None
 
     processed_remote_paths_in_local = set()
 
@@ -64,6 +66,16 @@ class Alist2Strm(_PluginBase):
             self._target_dir = config.get("target_dir")
             self._cron = config.get("cron")
             self._path_replace = config.get("path_replace")
+            self._max_download_worker = (
+                int(config.get("max_download_worker"))
+                if config.get("max_download_worker")
+                else 3
+            )
+            self._max_list_worker = (
+                int(config.get("max_list_worker"))
+                if config.get("max_list_worker")
+                else 32
+            )
             self.__update_config()
 
         if self.get_state() or self._onlyonce:
@@ -106,21 +118,22 @@ class Alist2Strm(_PluginBase):
 
             return True
 
-        async with AsyncExitStack() as stack:
-            tg = await stack.enter_async_context(TaskGroup())
-            client = await stack.enter_async_context(
-                AlistClient(url=self._url, token=self._token)
-            )
-            async for path in client.iter_path(
-                iter_dir=self._source_dir, filter_func=filter_func
-            ):
-                logger.debug(f"处理 {path.path}")
-                tg.create_task(self.__to_strm(path))
+        async with Semaphore(self._max_list_worker):
+            async with AsyncExitStack() as stack:
+                tg = await stack.enter_async_context(TaskGroup())
+                client = await stack.enter_async_context(
+                    AlistClient(url=self._url, token=self._token)
+                )
+                async for path in client.iter_path(
+                    iter_dir=self._source_dir, filter_func=filter_func
+                ):
+                    logger.debug(f"处理 {path.path}")
+                    tg.create_task(self.__to_strm(path))
         logger.info(f"{self._source_dir} 同步完成")
 
         if self._sync_remote:
             await self.__cleanup_invalid_strm()
-            logger.debug("清理过期的 .strm 文件完成")
+            logger.info("清理过期的 .strm 文件完成")
 
     async def __to_strm(self, path: AlistFile) -> None:
         # 计算保存路径
@@ -136,17 +149,18 @@ class Alist2Strm(_PluginBase):
                 await file.write(content)
         # 下载字幕文件
         elif target_path.suffix in settings.RMT_SUBEXT:
-            async with AsyncExitStack() as stack:
-                file = await stack.enter_async_context(open(target_path, mode="wb"))
-                logger.debug(f"下载字幕 {target_path}")
-                session = await stack.enter_async_context(ClientSession())
-                async with session.get(path.download_url) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(
-                            f"下载 {path.download_url} 失败，状态码：{resp.status}"
-                        )
-                    chunk = await resp.read()
-                    await file.write(chunk)
+            async with Semaphore(self._max_download_worker):
+                async with AsyncExitStack() as stack:
+                    file = await stack.enter_async_context(open(target_path, mode="wb"))
+                    logger.debug(f"下载字幕 {target_path}")
+                    session = await stack.enter_async_context(ClientSession())
+                    async with session.get(path.download_url) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(
+                                f"下载 {path.download_url} 失败，状态码：{resp.status}"
+                            )
+                        chunk = await resp.read()
+                        await file.write(chunk)
 
     async def __cleanup_invalid_strm(self) -> None:
         all_local_files = [f for f in Path(self._target_dir).rglob("*") if f.is_file()]
@@ -192,6 +206,8 @@ class Alist2Strm(_PluginBase):
                 "target_dir": self._target_dir,
                 "cron": self._cron,
                 "path_replace": self._path_replace,
+                "max_download_worker": self._max_download_worker,
+                "max_list_worker": self._max_list_worker,
             }
         )
 
@@ -372,6 +388,32 @@ class Alist2Strm(_PluginBase):
                                         }
                                     ],
                                 },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "max_list_worker",
+                                                "label": "扫库线程",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "max_download_worker",
+                                                "label": "下载线程",
+                                            },
+                                        }
+                                    ],
+                                },
                             ],
                         },
                         {
@@ -408,6 +450,8 @@ class Alist2Strm(_PluginBase):
                 "source_dir": "",
                 "target_dir": "",
                 "path_replace": None,
+                "max_list_worker": None,
+                "max_download_worker": None,
             },
         )
 
