@@ -8,13 +8,13 @@ from typing import Any, Dict, List, Tuple
 import pytz
 from aiofiles import open
 from aiohttp import ClientSession
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from plugins.alist2strm.alist import AlistClient, AlistFile
-
 from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from plugins.alist2strm.alist import AlistClient, AlistFile
 
 
 class Alist2Strm(_PluginBase):
@@ -23,7 +23,7 @@ class Alist2Strm(_PluginBase):
     # 插件描述
     plugin_desc = "从alist生成strm。"
     # 插件图标
-    plugin_icon = "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/Alist.png"
+    plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
     plugin_version = "1.2"
     # 插件作者
@@ -44,7 +44,6 @@ class Alist2Strm(_PluginBase):
     _source_dir = ""
     _target_dir = ""
     _sync_remote = False
-    _once = False
     _path_replace = ""
     _cron = ""
     _scheduler = None
@@ -95,6 +94,9 @@ class Alist2Strm(_PluginBase):
             self.__update_config()
 
     def alist2strm(self) -> None:
+        run(self.__process())
+
+    def api_in(self) -> None:
         run(self.__process())
 
     async def __process(self) -> None:
@@ -232,7 +234,7 @@ class Alist2Strm(_PluginBase):
         if self.get_state():
             return [
                 {
-                    "id": "IYUUAutoSeed",
+                    "id": "Alist2strm",
                     "name": "全量生成STRM",
                     "trigger": CronTrigger.from_crontab(self._cron),
                     "func": self.alist2strm,

@@ -4,7 +4,6 @@ from json import dumps
 from typing import AsyncGenerator, Callable, List, Optional
 
 from aiohttp import ClientSession
-
 from app.log import logger
 
 
