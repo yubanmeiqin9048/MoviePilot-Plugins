@@ -115,6 +115,31 @@ class FontCollect(_PluginBase):
             }
         )
 
+    def init_plugin(self, config: dict = None):
+        self.downloaderhelper = DownloaderHelper()
+        self.downloader_name = config.get("downloader_name")
+
+    @property
+    def service_info(self) -> Optional[ServiceInfo]:
+        """
+        服务信息
+        """
+        service = self.downloaderhelper.get_service(name=self.downloader_name)
+        if not service:
+            return None
+
+        if service.instance.is_inactive():
+            return None
+
+        return service
+
+    @property
+    def downloader(self) -> Optional[Union[Qbittorrent, Transmission]]:
+        """
+        下载器实例
+        """
+        return self.service_info.instance if self.service_info else None
+
     def __wait_for_files_completion(self, torrent_hash: str, file_ids: List[int]):
         """
         长轮询等待文件下载完成
@@ -184,9 +209,9 @@ class FontCollect(_PluginBase):
             """
             根据需要强制继续
             """
-            if settings.QB_FORCE_RESUME:
-                # 强制继续
-                self.qbittorrent.torrents_set_force_start(torrent_hash)
+            # 强制继续
+            if self.qbittorrent.torrents_set_force_start(torrent_hash):
+                pass
             else:
                 self.qbittorrent.start_torrents(torrent_hash)
 
