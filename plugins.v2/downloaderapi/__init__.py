@@ -21,7 +21,7 @@ class DownloaderApi(_PluginBase):
     # 插件图标
     plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -171,10 +171,11 @@ class DownloaderApi(_PluginBase):
             file_path, content, _, _, _ = await to_thread(
                 self.torrent_helper.download_torrent, torrent_url
             )
-            if content and file_path:
-                state = downloader.add_torrent(
-                    content=content, download_dir=self._save_path
-                )
+            state = (
+                downloader.add_torrent(content=content, download_dir=self._save_path)
+                if content and file_path
+                else None
+            )
             if not state:
                 return schemas.Response(success=False, message="种子添加下载失败")
             else:
