@@ -167,10 +167,10 @@ class DownloaderApi(_PluginBase):
         """
         downloader = self.downloader
         # 添加下载
-        _, content, _, _ = await to_thread(
+        file_path, content, _, _, _ = await to_thread(
             self.torrent_helper.download_torrent, torrent_url
         )
-        if content:
+        if content and file_path:
             state = downloader.add_torrent(
                 content=content, download_dir=self._save_path
             )
