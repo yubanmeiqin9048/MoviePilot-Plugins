@@ -165,23 +165,26 @@ class DownloaderApi(_PluginBase):
         """
         API调用下载种子
         """
-        downloader = self.downloader
-        # 添加下载
-        file_path, content, _, _, _ = await to_thread(
-            self.torrent_helper.download_torrent, torrent_url
-        )
-        if content and file_path:
-            state = downloader.add_torrent(
-                content=content, download_dir=self._save_path
+        try:
+            downloader = self.downloader
+            # 添加下载
+            file_path, content, _, _, _ = await to_thread(
+                self.torrent_helper.download_torrent, torrent_url
             )
-        if not state:
-            return schemas.Response(success=False, message="种子添加下载失败")
-        else:
-            self.eventmanager.send_event(
-                EventType.PluginAction,
-                {"action": "downloaderapi_add", "hash": f"{state.hashString}"},
-            )
-            return schemas.Response(success=True, message="下载成功")
+            if content and file_path:
+                state = downloader.add_torrent(
+                    content=content, download_dir=self._save_path
+                )
+            if not state:
+                return schemas.Response(success=False, message="种子添加下载失败")
+            else:
+                self.eventmanager.send_event(
+                    EventType.PluginAction,
+                    {"action": "downloaderapi_add", "hash": f"{state.hashString}"},
+                )
+                return schemas.Response(success=True, message="下载成功")
+        except Exception as e:
+            return schemas.Response(success=False, message=f"调用失败，原因：{e}")
 
     @property
     def service_info(self) -> Optional[ServiceInfo]:
