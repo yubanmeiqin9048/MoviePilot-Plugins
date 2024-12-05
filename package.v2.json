@@ -8,6 +8,7 @@
         "author": "yubanmeiqin9048",
         "level": 2,
         "history": {
+            "v1.5": "优化下载器配置和文件处理逻辑",
             "v1.4": "部分重构支持异步，支持V2",
             "v1.3": "完善日志，修复可能的错误",
             "v1.2": "只对已选中的文件做处理，兼容拆包",
@@ -18,12 +19,13 @@
     "DownloaderApi": {
         "name": "下载器API",
         "description": "外部调用API直接下载，不识别。",
-        "labels": "整理",
-        "version": "1.0",
-        "icon": "Themeengine_A.png",
+        "labels": "下载",
+        "version": "1.1",
+        "icon": "sync_file.png",
         "author": "yubanmeiqin9048",
         "level": 2,
         "history": {
+            "v1.1": "增加下载超时设置",
             "v1.0": "初版"
         }
     }

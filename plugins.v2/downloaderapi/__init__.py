@@ -1,23 +1,27 @@
+from asyncio import run, to_thread
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from app import schemas
 from app.helper.downloader import DownloaderHelper
+from app.helper.torrent import TorrentHelper
 from app.log import logger
 from app.modules.qbittorrent.qbittorrent import Qbittorrent
 from app.modules.transmission.transmission import Transmission
 from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
+from app.schemas.types import EventType
 
 
 class DownloaderApi(_PluginBase):
     # 插件名称
-    plugin_name = "下载API"
+    plugin_name = "下载器API"
     # 插件描述
     plugin_desc = "外部调用API直接下载，不识别。"
     # 插件图标
-    plugin_icon = "Themeengine_A.png"
+    # 插件图标
+    plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -33,11 +37,20 @@ class DownloaderApi(_PluginBase):
     _enabled = False
     # 下载器
     _downloader = None
+    _save_path = None
 
     def init_plugin(self, config: dict = None):
-        if config:
-            self.downloader_helper = DownloaderHelper()
-            self._enabled = config.get("enabled")
+        self.downloader_helper = DownloaderHelper()
+        self.torrent_helper = TorrentHelper()
+        if not config:
+            return
+        self._enabled = config.get("enabled")
+        self._save_path = config.get("save_path", None)
+        self._downloader = config.get("downloader", None)
+        if not self.downloader:
+            self._enabled = False
+            self.__update_config()
+            return
 
     def get_state(self) -> bool:
         return self._enabled
@@ -47,16 +60,15 @@ class DownloaderApi(_PluginBase):
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
-        # return [
-        #     {
-        #         "path": "/download_torrent_notest",
-        #         "endpoint": self.api_download_torrent,
-        #         "methods": ["POST"],
-        #         "summary": "下载种子",
-        #         "description": "直接下载种子，不识别",
-        #     }
-        # ]
+        return [
+            {
+                "path": "/download_torrent_notest",
+                "endpoint": self.process,
+                "methods": ["GET"],
+                "summary": "下载种子",
+                "description": "直接下载种子，不识别",
+            }
+        ]
 
     def get_page(self) -> List[dict]:
         pass
@@ -65,6 +77,11 @@ class DownloaderApi(_PluginBase):
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
+        downloader_options = [
+            {"title": config.name, "value": config.name}
+            for config in self.downloader_helper.get_configs().values()
+            if config.type == "qbittorrent"
+        ]
         return [
             {
                 "component": "VForm",
@@ -84,12 +101,48 @@ class DownloaderApi(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
+                            },
                         ],
-                    }
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "savepath",
+                                            "label": "保存路径",
+                                            "hint": "输入可访问路径",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "downloader",
+                                            "label": "下载器",
+                                            "items": downloader_options,
+                                            "hint": "选择下载器",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
                 ],
-            }
-        ], {"enable": False}
+            },
+        ], {"enable": False, "savepath": ""}
 
     def stop_service(self):
         """
@@ -97,25 +150,38 @@ class DownloaderApi(_PluginBase):
         """
         pass
 
-    def api_download_torrent(self, torrent_url: str) -> schemas.Response:
+    def __update_config(self):
+        self.update_config(
+            {
+                "enabled": self._enabled,
+                "fontpath": self._save_path,
+            }
+        )
+
+    def process(self, torrent_url: str):
+        run(self.download_torrent(torrent_url))
+
+    async def download_torrent(self, torrent_url: str) -> schemas.Response:
         """
         API调用下载种子
         """
-        pass
-        # # 添加下载
-        # tag = StringUtils.generate_random_str(10)
-        # # 直接使用下载器默认目录
-        # torrent = self.qbittorrent.add_torrent(content=torrent_url, tag=tag)
-
-        # if torrent:
-        #     torrent_hash = self.qbittorrent.get_torrent_id_by_tag(tags=tag)
-        #     if torrent_hash:
-        #         return schemas.Response(success=True, message="下载成功")
-        #     else:
-        #         return schemas.Response(
-        #             success=True, message="下载成功, 但获取种子hash失败"
-        #         )
-        # return schemas.Response(success=False, message="种子添加下载失败")
+        downloader = self.downloader
+        # 添加下载
+        _, content, _, _ = await to_thread(
+            self.torrent_helper.download_torrent, torrent_url
+        )
+        if content:
+            state = downloader.add_torrent(
+                content=content, download_dir=self._save_path
+            )
+        if not state:
+            return schemas.Response(success=False, message="种子添加下载失败")
+        else:
+            self.eventmanager.send_event(
+                EventType.PluginAction,
+                {"action": "downloaderapi_add", "hash": f"{state.hashString}"},
+            )
+            return schemas.Response(success=True, message="下载成功")
 
     @property
     def service_info(self) -> Optional[ServiceInfo]:
@@ -145,19 +211,3 @@ class DownloaderApi(_PluginBase):
         下载器实例
         """
         return self.service_info.instance if self.service_info else None
-
-    def check_downloader_type(self) -> bool:
-        """
-        检查下载器类型是否为 qbittorrent 或 transmission
-        """
-        if self.downloaderhelper.is_downloader(
-            service_type="qbittorrent", service=self.service_info
-        ):
-            # 处理 qbittorrent 类型
-            return True
-        elif self.downloaderhelper.is_downloader(
-            service_type="transmission", service=self.service_info
-        ):
-            # 处理 transmission 类型
-            return True
-        return False
