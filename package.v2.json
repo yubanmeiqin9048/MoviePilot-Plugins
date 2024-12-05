@@ -3,7 +3,7 @@
         "name": "字体收集",
         "description": "自动收集种子中的字体。",
         "labels": "整理",
-        "version": "1.4",
+        "version": "1.5",
         "icon": "Themeengine_A.png",
         "author": "yubanmeiqin9048",
         "level": 2,
@@ -25,7 +25,7 @@
         "author": "yubanmeiqin9048",
         "level": 2,
         "history": {
-            "v1.1": "增加下载超时设置",
+            "v1.1": "支持自定义保存路径",
             "v1.0": "初版"
         }
     }
