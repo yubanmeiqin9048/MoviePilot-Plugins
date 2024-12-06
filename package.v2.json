@@ -3,11 +3,12 @@
         "name": "字体收集",
         "description": "自动收集种子中的字体。",
         "labels": "整理",
-        "version": "1.6",
+        "version": "1.6.1",
         "icon": "Themeengine_A.png",
         "author": "yubanmeiqin9048",
         "level": 2,
         "history": {
+            "v1.6.1": "修复等待下载失败",
             "v1.6": "优化下载等待逻辑，配合监听下载器API插件事件",
             "v1.5": "优化下载器配置和文件处理逻辑",
             "v1.4": "部分重构支持异步，支持V2",

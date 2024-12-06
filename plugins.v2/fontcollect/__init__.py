@@ -1,4 +1,5 @@
 import os
+import traceback
 import zipfile
 from asyncio import gather, run, sleep, to_thread
 from pathlib import Path
@@ -23,7 +24,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.6"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -157,7 +158,7 @@ class FontCollect(_PluginBase):
         logger.info(f"开始等待{torrent_hash}")
         while True:
             try:
-                files = to_thread(self.downloader.get_files, torrent_hash)
+                files = await to_thread(self.downloader.get_files, torrent_hash)
                 all_completed = all(
                     file["priority"] == 7 and file["progress"] == 1
                     for file in files
@@ -166,10 +167,9 @@ class FontCollect(_PluginBase):
                 if all_completed:
                     logger.info(f"{torrent_hash} 字体包下载完成")
                     break
-                sleep(5)  # 每隔5秒检查一次
+                await sleep(5)  # 每隔5秒检查一次
             except Exception as e:
-                logger.error(f"检测失败, 原因:{e}")
-                break
+                raise RuntimeError(f"等待 {torrent_hash} 下载失败: {e}")
 
     def __extract_zip(self, file_path: Path, output_dir: Path):
         with zipfile.ZipFile(file_path, "r") as zip_ref:
@@ -267,9 +267,6 @@ class FontCollect(_PluginBase):
             # 设置“Font”文件的优先级为最高
             if font_file_ids:
                 self.downloader.set_files(
-                    torrent_hash=torrent_hash, file_ids=font_file_ids, priority=7
-                )
-                self.downloader.set_files(
                     torrent_hash=torrent_hash, file_ids=other_file_ids, priority=0
                 )
 
@@ -289,7 +286,9 @@ class FontCollect(_PluginBase):
 
             __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
         except Exception as e:
-            logger.error(f"下载任务处理失败，原因:{e}")
+            logger.debug(
+                f"处理 {torrent_hash} 失败：{str(e)} - {traceback.format_exc()}"
+            )
 
     @eventmanager.register(EventType.DownloadAdded)
     def process_inner(self, event: Event):
