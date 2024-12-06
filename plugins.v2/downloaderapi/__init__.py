@@ -10,6 +10,7 @@ from app.modules.transmission.transmission import Transmission
 from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType
+from app.utils.string import StringUtils
 
 
 class DownloaderApi(_PluginBase):
@@ -21,7 +22,7 @@ class DownloaderApi(_PluginBase):
     # 插件图标
     plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -159,7 +160,7 @@ class DownloaderApi(_PluginBase):
         )
 
     def process(self, torrent_url: str):
-        run(self.download_torrent(torrent_url))
+        return run(self.download_torrent(torrent_url))
 
     async def download_torrent(self, torrent_url: str) -> schemas.Response:
         """
@@ -168,20 +169,25 @@ class DownloaderApi(_PluginBase):
         try:
             downloader = self.downloader
             # 添加下载
+            tag = StringUtils.generate_random_str(10)
             file_path, content, _, _, _ = await to_thread(
                 self.torrent_helper.download_torrent, torrent_url
             )
             state = (
-                downloader.add_torrent(content=content, download_dir=self._save_path)
+                downloader.add_torrent(
+                    content=content, download_dir=self._save_path, tag=tag
+                )
                 if content and file_path
                 else None
             )
+            torrent_hash = downloader.get_torrent_id_by_tag(tag)
+
             if not state:
                 return schemas.Response(success=False, message="种子添加下载失败")
             else:
                 self.eventmanager.send_event(
                     EventType.PluginAction,
-                    {"action": "downloaderapi_add", "hash": f"{state.hashString}"},
+                    {"action": "downloaderapi_add", "hash": f"{torrent_hash}"},
                 )
                 return schemas.Response(success=True, message="下载成功")
         except Exception as e:
