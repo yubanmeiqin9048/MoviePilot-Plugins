@@ -1,8 +1,7 @@
 import os
 import zipfile
-from asyncio import gather, run, to_thread
+from asyncio import gather, run, sleep, to_thread
 from pathlib import Path
-from time import sleep
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import py7zr
@@ -24,7 +23,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -151,19 +150,21 @@ class FontCollect(_PluginBase):
         """
         pass
 
-    def __wait_for_files_completion(self, torrent_hash: str, file_ids: List[int]):
+    async def __wait_for_files_completion(self, torrent_hash: str, file_ids: List[int]):
         """
         长轮询等待文件下载完成
         """
+        logger.info(f"开始等待{torrent_hash}")
         while True:
             try:
-                files = self.downloader.get_files(torrent_hash)
+                files = to_thread(self.downloader.get_files, torrent_hash)
                 all_completed = all(
                     file["priority"] == 7 and file["progress"] == 1
                     for file in files
                     if file["id"] in file_ids
                 )
                 if all_completed:
+                    logger.info(f"{torrent_hash} 字体包下载完成")
                     break
                 sleep(5)  # 每隔5秒检查一次
             except Exception as e:
@@ -257,7 +258,7 @@ class FontCollect(_PluginBase):
                         other_file_ids.append(file_id)
 
             if not other_file_ids:
-                logger.error("种子中没有优先级大于1的文件")
+                logger.warning("种子中没有优先级大于1的文件")
                 return
 
             # 暂停任务
@@ -275,9 +276,7 @@ class FontCollect(_PluginBase):
                 # 恢复任务，只下载“Font”文件
                 __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
 
-                await to_thread(
-                    self.__wait_for_files_completion, torrent_hash, font_file_ids
-                )
+                await self.__wait_for_files_completion(torrent_hash, font_file_ids)
                 await self.unzip_font_files(
                     torrent_files=torrent_files,
                     font_file_ids=font_file_ids,
