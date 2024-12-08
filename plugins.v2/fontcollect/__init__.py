@@ -160,7 +160,7 @@ class FontCollect(_PluginBase):
             try:
                 files = await to_thread(self.downloader.get_files, torrent_hash)
                 all_completed = all(
-                    file["priority"] == 7 and file["progress"] == 1
+                    file["priority"] == 1 and file["progress"] == 1
                     for file in files
                     if file["id"] in file_ids
                 )
