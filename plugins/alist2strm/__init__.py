@@ -212,14 +212,14 @@ class Alist2Strm(_PluginBase):
             {
                 "enabled": self._enabled,
                 "onlyonce": False,
-                "url": self._url.rstrip("/"),
+                "url": self._url,
                 "token": self._token,
                 "source_dir": self._source_dir,
                 "sync_remote": self._sync_remote,
                 "target_dir": self._target_dir,
                 "cron": self._cron,
                 "path_replace": self._path_replace,
-                "url_replace": self._url_replace.rstrip("/"),
+                "url_replace": self._url_replace,
                 "max_download_worker": self._max_download_worker,
                 "max_list_worker": self._max_list_worker,
             }
@@ -396,8 +396,8 @@ class Alist2Strm(_PluginBase):
                                             "component": "VTextField",
                                             "props": {
                                                 "model": "path_replace",
-                                                "label": "路径替换",
-                                                "placeholder": "/replace_path",
+                                                "label": "目的路径路径替换",
+                                                "placeholder": "source_path -> replace_path",
                                             },
                                         }
                                     ],
@@ -437,6 +437,7 @@ class Alist2Strm(_PluginBase):
                                             "props": {
                                                 "model": "url_replace",
                                                 "label": "url替换",
+                                                "placeholder": "url/d -> replace_url",
                                             },
                                         }
                                     ],
