@@ -146,7 +146,7 @@ class Alist2Strm(_PluginBase):
         content = (
             path.download_url
             if not self._url_replace
-            else path.download_url.replace(self._url + "/d", self, self._url_replace)
+            else path.download_url.replace(self._url + "/d", self._url_replace)
         )
         # 创建父目录
         if not target_path.parent.exists():
