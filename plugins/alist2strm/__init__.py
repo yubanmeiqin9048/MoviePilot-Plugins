@@ -25,7 +25,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -45,6 +45,7 @@ class Alist2Strm(_PluginBase):
     _target_dir = ""
     _sync_remote = False
     _path_replace = ""
+    _url_replace = ""
     _cron = ""
     _scheduler = None
     _onlyonce = False
@@ -65,6 +66,7 @@ class Alist2Strm(_PluginBase):
             self._target_dir = config.get("target_dir")
             self._cron = config.get("cron")
             self._path_replace = config.get("path_replace")
+            self._url_replace = config.get("url_replace")
             self._max_download_worker = (
                 int(config.get("max_download_worker"))
                 if config.get("max_download_worker")
@@ -141,7 +143,11 @@ class Alist2Strm(_PluginBase):
         # 计算保存路径
         target_path = self.__computed_target_path(path)
         # strm内容
-        content = path.download_url
+        content = (
+            path.download_url
+            if not self._url_replace
+            else path.download_url.replace(self._url + "/d", self, self._url_replace)
+        )
         # 创建父目录
         if not target_path.parent.exists():
             await to_thread(target_path.parent.mkdir, parents=True, exist_ok=True)
@@ -206,13 +212,14 @@ class Alist2Strm(_PluginBase):
             {
                 "enabled": self._enabled,
                 "onlyonce": False,
-                "url": self._url,
+                "url": self._url.rstrip("/"),
                 "token": self._token,
                 "source_dir": self._source_dir,
                 "sync_remote": self._sync_remote,
                 "target_dir": self._target_dir,
                 "cron": self._cron,
                 "path_replace": self._path_replace,
+                "url_replace": self._url_replace.rstrip("/"),
                 "max_download_worker": self._max_download_worker,
                 "max_list_worker": self._max_list_worker,
             }
@@ -421,6 +428,19 @@ class Alist2Strm(_PluginBase):
                                         }
                                     ],
                                 },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "url_replace",
+                                                "label": "url替换",
+                                            },
+                                        }
+                                    ],
+                                },
                             ],
                         },
                         {
@@ -456,7 +476,8 @@ class Alist2Strm(_PluginBase):
                 "token": "",
                 "source_dir": "",
                 "target_dir": "",
-                "path_replace": None,
+                "path_replace": "",
+                "url_replace": "",
                 "max_list_worker": None,
                 "max_download_worker": None,
             },
