@@ -243,6 +243,9 @@ class FontCollect(_PluginBase):
                 logger.error("获取种子文件失败，下载任务可能在暂停状态")
                 return
 
+            # 暂停任务
+            self.downloader.stop_torrents(torrent_hash)
+
             # 获取优先级大于1的文件
             for torrent_file in torrent_files:
                 file_id = torrent_file.get("id")
@@ -261,30 +264,29 @@ class FontCollect(_PluginBase):
                 logger.warning("种子中没有优先级大于1的文件")
                 return
 
-            # 暂停任务
-            self.downloader.stop_torrents(torrent_hash)
+            if not font_file_ids:
+                __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
+                return
 
             # 设置“Font”文件的优先级为最高
-            if font_file_ids:
-                self.downloader.set_files(
-                    torrent_hash=torrent_hash, file_ids=other_file_ids, priority=0
-                )
+            self.downloader.set_files(
+                torrent_hash=torrent_hash, file_ids=other_file_ids, priority=0
+            )
 
-                # 恢复任务，只下载“Font”文件
-                __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
-
-                await self.__wait_for_files_completion(torrent_hash, font_file_ids)
-                await self.unzip_font_files(
-                    torrent_files=torrent_files,
-                    font_file_ids=font_file_ids,
-                    save_path=save_path,
-                )
-
-                self.downloader.set_files(
-                    torrent_hash=torrent_hash, file_ids=other_file_ids, priority=1
-                )
-
+            # 恢复任务，只下载“Font”文件
             __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
+
+            await self.__wait_for_files_completion(torrent_hash, font_file_ids)
+            await self.unzip_font_files(
+                torrent_files=torrent_files,
+                font_file_ids=font_file_ids,
+                save_path=save_path,
+            )
+
+            self.downloader.set_files(
+                torrent_hash=torrent_hash, file_ids=other_file_ids, priority=1
+            )
+
         except Exception as e:
             logger.debug(
                 f"处理 {torrent_hash} 失败：{str(e)} - {traceback.format_exc()}"
