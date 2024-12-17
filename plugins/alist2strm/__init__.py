@@ -165,7 +165,12 @@ class Alist2Strm(_PluginBase):
                         await file.write(chunk)
 
     async def __cleanup_invalid_strm(self) -> None:
-        all_local_files = [f for f in Path(self._target_dir).rglob("*") if f.is_file()]
+        all_local_files = [
+            f
+            for f in Path(self._target_dir).rglob("*")
+            if f.is_file()
+            and (f.suffix in self._process_file_suffix or f.suffix == ".strm")
+        ]
         files_need_to_delete = (
             set(all_local_files) - self.processed_remote_paths_in_local
         )
@@ -182,7 +187,7 @@ class Alist2Strm(_PluginBase):
         计算strm文件保存路径。
 
         :param path: AlistPath 对象
-        :return: 本地文件路径
+        :return: 本地文件路径,如果是媒体文件，则返回 .strm 后缀
         """
         target_path = Path(
             os.path.join(
@@ -432,7 +437,7 @@ class Alist2Strm(_PluginBase):
                                             "props": {
                                                 "type": "info",
                                                 "variant": "tonal",
-                                                "text": "定期同步远端文件到本地strm",
+                                                "text": "定期同步远端文件到本地strm，建议同步间隔大于一周。",
                                             },
                                         }
                                     ],
