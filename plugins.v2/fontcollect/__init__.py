@@ -269,7 +269,7 @@ class FontCollect(_PluginBase):
                     else:
                         other_file_ids.append(file_id)
 
-            if not other_file_ids or not font_file_ids:
+            if not font_file_ids:
                 __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
                 return
 
