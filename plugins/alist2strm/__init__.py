@@ -396,7 +396,7 @@ class Alist2Strm(_PluginBase):
                                             "component": "VTextField",
                                             "props": {
                                                 "model": "path_replace",
-                                                "label": "目的路径路径替换",
+                                                "label": "目的路径替换",
                                                 "placeholder": "source_path -> replace_path",
                                             },
                                         }

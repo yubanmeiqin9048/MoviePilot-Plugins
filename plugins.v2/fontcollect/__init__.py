@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import py7zr
+import rarfile
 from app.core.event import Event, eventmanager
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
@@ -24,7 +25,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.6.2"
+    plugin_version = "1.7"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -175,6 +176,10 @@ class FontCollect(_PluginBase):
         with zipfile.ZipFile(file_path, "r") as zip_ref:
             zip_ref.extractall(output_dir)
 
+    def __extract_rar(self, file_path: Path, output_dir: Path):
+        with rarfile.RarFile(file_path, "r") as rar_ref:
+            rar_ref.extractall(output_dir)
+
     def __extract_7z(self, file_path: Path, output_dir: Path):
         with py7zr.SevenZipFile(file_path, mode="r") as z_ref:
             z_ref.extractall(path=output_dir)
@@ -188,6 +193,10 @@ class FontCollect(_PluginBase):
                 await to_thread(self.__extract_zip, file_path, output_dir)
             elif file_path.suffix == ".7z":
                 await to_thread(self.__extract_7z, file_path, output_dir)
+            elif file_path.suffix == ".rar":
+                await to_thread(self.__extract_rar, file_path, output_dir)
+            else:
+                logger.error(f"不支持的压缩文件类型: {file_path.suffix}")
 
             logger.info(f"解压 {file_path} 到 {output_dir} 成功")
         except Exception as e:
@@ -260,11 +269,7 @@ class FontCollect(_PluginBase):
                     else:
                         other_file_ids.append(file_id)
 
-            if not other_file_ids:
-                logger.warning("种子中没有优先级大于1的文件")
-                return
-
-            if not font_file_ids:
+            if not other_file_ids or not font_file_ids:
                 __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
                 return
 
