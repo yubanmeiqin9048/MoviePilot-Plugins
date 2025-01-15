@@ -25,7 +25,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.7"
+    plugin_version = "1.7.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -167,6 +167,7 @@ class FontCollect(_PluginBase):
                 )
                 if all_completed:
                     logger.info(f"{torrent_hash} 字体包下载完成")
+                    await sleep(5)
                     break
                 await sleep(5)  # 每隔5秒检查一次
             except Exception as e:
