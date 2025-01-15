@@ -1,4 +1,4 @@
-from asyncio import TimeoutError
+from asyncio import Queue, TimeoutError
 from enum import Enum
 from json import dumps
 from typing import AsyncGenerator, Callable, List, Optional
@@ -163,7 +163,7 @@ class AlistClient:
 
         if result["code"] != 200:
             raise RuntimeError(
-                f'获取目录{dir_path}的文件列表失败，错误信息：{result["message"]}'
+                f"获取目录{dir_path}的文件列表失败，错误信息：{result['message']}"
             )
 
         logger.debug(f"获取目录{dir_path}的文件列表成功")
@@ -202,13 +202,13 @@ class AlistClient:
         else:
             raise RuntimeError("iter_dir 不能为空")
 
-        for path in await self.__async_fs_list(iter_dir):
-            if path.is_dir:
-                # 递归地遍历子目录中的所有文件
-                async for sub_path in self.iter_path(
-                    path.path, filter_func=filter_func
-                ):
-                    yield sub_path
-            # 如果是文件，使用 filter_func 进行过滤
-            if filter_func(path):
-                yield path
+        queue = Queue()
+        await queue.put(iter_dir)
+
+        while not queue.empty():
+            current_dir = await queue.get()
+            for path in await self.__async_fs_list(current_dir):
+                if path.is_dir:
+                    await queue.put(path.path)
+                if filter_func(path):
+                    yield path

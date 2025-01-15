@@ -1,10 +1,10 @@
-import os
-from asyncio import Semaphore, TaskGroup, run, to_thread
+from asyncio import Semaphore, TaskGroup, run
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import aiofiles.os as aio_os
 import pytz
 from aiofiles import open
 from aiohttp import ClientSession
@@ -25,7 +25,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -50,8 +50,8 @@ class Alist2Strm(_PluginBase):
     _scheduler = None
     _onlyonce = False
     _process_file_suffix = settings.RMT_SUBEXT + settings.RMT_MEDIAEXT
-    _max_download_worker = None
-    _max_list_worker = None
+    _max_download_worker = 3
+    _max_list_worker = 32
 
     processed_remote_paths_in_local = set()
 
@@ -96,40 +96,37 @@ class Alist2Strm(_PluginBase):
             self.__update_config()
 
     def alist2strm(self) -> None:
+        self.__max_download_sem = Semaphore(self._max_download_worker)
+        self.__max_list_sem = Semaphore(self._max_list_worker)
         run(self.__process())
 
-    def api_in(self) -> None:
-        run(self.__process())
+    def __filter_func(self, remote_path: AlistFile) -> bool:
+        if remote_path.is_dir:
+            return False
+
+        if remote_path.suffix.lower() not in self._process_file_suffix:
+            logger.debug(f"文件 {remote_path.path} 不在处理列表中")
+            return False
+
+        local_path = self.__computed_target_path(remote_path)
+        if self._sync_remote:
+            self.processed_remote_paths_in_local.add(local_path)
+
+        if local_path.exists():
+            logger.debug(f"文件 {local_path.name} 已存在，跳过处理 {remote_path.path}")
+            return False
+
+        return True
 
     async def __process(self) -> None:
-        def filter_func(remote_path: AlistFile) -> bool:
-            if remote_path.is_dir:
-                return False
-
-            if remote_path.suffix.lower() not in self._process_file_suffix:
-                logger.debug(f"文件 {remote_path.path} 不在处理列表中")
-                return False
-
-            local_path = self.__computed_target_path(remote_path)
-            if self._sync_remote:
-                self.processed_remote_paths_in_local.add(local_path)
-
-            if local_path.exists():
-                logger.debug(
-                    f"文件 {local_path.name} 已存在，跳过处理 {remote_path.path}"
-                )
-                return False
-
-            return True
-
-        async with Semaphore(self._max_list_worker):
-            async with AsyncExitStack() as stack:
-                tg = await stack.enter_async_context(TaskGroup())
-                client = await stack.enter_async_context(
-                    AlistClient(url=self._url, token=self._token)
-                )
+        async with AsyncExitStack() as stack:
+            tg = await stack.enter_async_context(TaskGroup())
+            client = await stack.enter_async_context(
+                AlistClient(url=self._url, token=self._token)
+            )
+            async with self.__max_list_sem:
                 async for path in client.iter_path(
-                    iter_dir=self._source_dir, filter_func=filter_func
+                    iter_dir=self._source_dir, filter_func=self.__filter_func
                 ):
                     logger.debug(f"处理 {path.path}")
                     tg.create_task(self.__to_strm(path))
@@ -146,22 +143,22 @@ class Alist2Strm(_PluginBase):
         content = (
             path.download_url
             if not self._url_replace
-            else path.download_url.replace(self._url + "/d", self._url_replace)
+            else path.download_url.replace(f"{self._url}/d", self._url_replace)
         )
         # 创建父目录
         if not target_path.parent.exists():
-            await to_thread(target_path.parent.mkdir, parents=True, exist_ok=True)
+            await aio_os.makedirs(target_path.parent)
         # 写入strm文件
         if target_path.suffix == ".strm":
             async with open(target_path, mode="w", encoding="utf-8") as file:
                 await file.write(content)
         # 下载字幕文件
         elif target_path.suffix in settings.RMT_SUBEXT:
-            async with Semaphore(self._max_download_worker):
-                async with AsyncExitStack() as stack:
-                    file = await stack.enter_async_context(open(target_path, mode="wb"))
-                    logger.debug(f"下载字幕 {target_path}")
-                    session = await stack.enter_async_context(ClientSession())
+            async with AsyncExitStack() as stack:
+                file = await stack.enter_async_context(open(target_path, mode="wb"))
+                logger.debug(f"下载字幕 {target_path}")
+                session = await stack.enter_async_context(ClientSession())
+                async with self.__max_download_sem:
                     async with session.get(path.download_url) as resp:
                         if resp.status != 200:
                             raise RuntimeError(
@@ -171,22 +168,27 @@ class Alist2Strm(_PluginBase):
                         await file.write(chunk)
 
     async def __cleanup_invalid_strm(self) -> None:
-        all_local_files = [
-            f
-            for f in Path(self._target_dir).rglob("*")
-            if f.is_file()
-            and (f.suffix in self._process_file_suffix or f.suffix == ".strm")
-        ]
-        files_need_to_delete = (
-            set(all_local_files) - self.processed_remote_paths_in_local
-        )
-        for file_need_to_delete in files_need_to_delete:
-            try:
-                if file_need_to_delete.exists():
-                    await to_thread(file_need_to_delete.unlink)
-                    logger.info(f"删除文件：{file_need_to_delete}")
-            except Exception as e:
-                logger.error(f"删除文件 {file_need_to_delete} 失败：{e}")
+        all_local_files = {
+            Path(entry.path)
+            for entry in await aio_os.scandir(self._target_dir)
+            if entry.is_file()
+            and (
+                entry.name.endswith(tuple(self._process_file_suffix))
+                or entry.name.endswith(".strm")
+            )
+        }
+        files_need_to_delete = all_local_files - self.processed_remote_paths_in_local
+        async with TaskGroup() as tg:
+            for file_need_to_delete in files_need_to_delete:
+                tg.create_task(self.__delete_file(file_need_to_delete))
+
+    async def __delete_file(self, file_need_to_delete: Path) -> None:
+        try:
+            if file_need_to_delete.exists():
+                await aio_os.remove(file_need_to_delete)
+                logger.info(f"删除文件：{file_need_to_delete}")
+        except Exception as e:
+            logger.error(f"删除文件 {file_need_to_delete} 失败：{e}")
 
     def __computed_target_path(self, path: AlistFile) -> Path:
         """
@@ -195,12 +197,9 @@ class Alist2Strm(_PluginBase):
         :param path: AlistPath 对象
         :return: 本地文件路径,如果是媒体文件，则返回 .strm 后缀
         """
-        target_path = Path(
-            os.path.join(
-                self._target_dir,
-                path.path.replace(self._source_dir, self._path_replace, 1).lstrip("/"),
-            )
-        )
+        target_path = Path(self._target_dir) / path.path.replace(
+            self._source_dir, self._path_replace, 1
+        ).lstrip("/")
 
         if path.suffix.lower() in settings.RMT_MEDIAEXT:
             target_path = target_path.with_suffix(".strm")
