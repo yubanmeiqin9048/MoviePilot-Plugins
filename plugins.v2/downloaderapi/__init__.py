@@ -22,7 +22,7 @@ class DownloaderApi(_PluginBase):
     # 插件图标
     plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -115,7 +115,7 @@ class DownloaderApi(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "savepath",
+                                            "model": "save_path",
                                             "label": "保存路径",
                                             "hint": "输入可访问路径",
                                             "persistent-hint": True,
@@ -143,7 +143,7 @@ class DownloaderApi(_PluginBase):
                     },
                 ],
             },
-        ], {"enable": False, "savepath": ""}
+        ], {"enable": False, "save_path": ""}
 
     def stop_service(self):
         """
@@ -155,7 +155,7 @@ class DownloaderApi(_PluginBase):
         self.update_config(
             {
                 "enabled": self._enabled,
-                "fontpath": self._save_path,
+                "save_path": self._save_path,
             }
         )
 
