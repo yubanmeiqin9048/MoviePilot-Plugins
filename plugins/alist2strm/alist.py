@@ -1,3 +1,12 @@
+# alist.py
+#
+# This file is based on AGPL-3.0 licensed code.
+# Original author: Akimio521 (https://github.com/Akimio521)
+# Modifications by: yubanmeiqin9048 (https://github.com/yubanmeiqin9048)
+#
+# Licensed under the AGPL-3.0 license.
+# See the LICENSE file in the / directory for more details.
+
 from asyncio import Queue, TimeoutError
 from enum import Enum
 from json import dumps
