@@ -1,8 +1,9 @@
+import traceback
 from asyncio import Semaphore, TaskGroup, run
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import aiofiles.os as aio_os
 import pytz
@@ -25,7 +26,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.5"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -51,9 +52,9 @@ class Alist2Strm(_PluginBase):
     _onlyonce = False
     _process_file_suffix = settings.RMT_SUBEXT + settings.RMT_MEDIAEXT
     _max_download_worker = 3
-    _max_list_worker = 32
+    _max_list_worker = 7
 
-    processed_remote_paths_in_local = set()
+    processed_remote_paths_in_local: Set[Path] = set()
 
     def init_plugin(self, config: dict = None) -> None:
         if config:
@@ -75,7 +76,7 @@ class Alist2Strm(_PluginBase):
             self._max_list_worker = (
                 int(config.get("max_list_worker"))
                 if config.get("max_list_worker")
-                else 32
+                else 7
             )
             self.__update_config()
 
@@ -96,14 +97,17 @@ class Alist2Strm(_PluginBase):
             self.__update_config()
 
     def alist2strm(self) -> None:
-        self.__max_download_sem = Semaphore(self._max_download_worker)
-        self.__max_list_sem = Semaphore(self._max_list_worker)
-        run(self.__process())
+        try:
+            self.__max_download_sem = Semaphore(self._max_download_worker)
+            self.__max_list_sem = Semaphore(self._max_list_worker)
+            run(self.__process())
+            logger.info("Alist2Strm 插件执行完成")
+        except Exception as e:
+            logger.error(
+                f"Alist2Strm 插件执行出错：{str(e)} - {traceback.format_exc()}"
+            )
 
     def __filter_func(self, remote_path: AlistFile) -> bool:
-        if remote_path.is_dir:
-            return False
-
         if remote_path.suffix.lower() not in self._process_file_suffix:
             logger.debug(f"文件 {remote_path.path} 不在处理列表中")
             return False
@@ -124,19 +128,27 @@ class Alist2Strm(_PluginBase):
             client = await stack.enter_async_context(
                 AlistClient(url=self._url, token=self._token)
             )
+            download_tg = await stack.enter_async_context(TaskGroup())
             async with self.__max_list_sem:
                 async for path in client.iter_path(
                     iter_dir=self._source_dir, filter_func=self.__filter_func
                 ):
-                    logger.debug(f"处理 {path.path}")
-                    tg.create_task(self.__to_strm(path))
-        logger.info(f"{self._source_dir} 同步完成")
-
-        if self._sync_remote:
-            await self.__cleanup_invalid_strm()
-            logger.info("清理过期的 .strm 文件完成")
+                    if path.suffix in settings.RMT_SUBEXT:
+                        # 字幕文件使用单独的任务组处理下载
+                        download_tg.create_task(self.__download_subtitle(path))
+                    else:
+                        # strm文件继续使用主任务组
+                        tg.create_task(self.__to_strm(path))
+            if self._sync_remote:
+                files_need_to_delete = await self.__get_invalid_files()
+                for file_need_to_delete in files_need_to_delete:
+                    tg.create_task(self.__delete_file(file_need_to_delete))
+                logger.info("清理过期的 .strm 文件完成")
 
     async def __to_strm(self, path: AlistFile) -> None:
+        """
+        将远程文件转换为strm文件。
+        """
         # 计算保存路径
         target_path = self.__computed_target_path(path)
         # strm内容
@@ -147,27 +159,38 @@ class Alist2Strm(_PluginBase):
         )
         # 创建父目录
         if not target_path.parent.exists():
-            await aio_os.makedirs(target_path.parent)
+            await aio_os.makedirs(target_path.parent, exist_ok=True)
         # 写入strm文件
-        if target_path.suffix == ".strm":
-            async with open(target_path, mode="w", encoding="utf-8") as file:
-                await file.write(content)
-        # 下载字幕文件
-        elif target_path.suffix in settings.RMT_SUBEXT:
-            async with AsyncExitStack() as stack:
-                file = await stack.enter_async_context(open(target_path, mode="wb"))
-                logger.debug(f"下载字幕 {target_path}")
-                session = await stack.enter_async_context(ClientSession())
-                async with self.__max_download_sem:
-                    async with session.get(path.download_url) as resp:
-                        if resp.status != 200:
-                            raise RuntimeError(
-                                f"下载 {path.download_url} 失败，状态码：{resp.status}"
-                            )
-                        chunk = await resp.read()
-                        await file.write(chunk)
+        async with open(target_path, mode="wb", encoding="utf-8") as file:
+            await file.write(content)
+        logger.info(f"已写入 .strm 文件: {target_path}")
 
-    async def __cleanup_invalid_strm(self) -> None:
+    async def __download_subtitle(self, path: AlistFile) -> None:
+        """
+        下载字幕文件。
+        """
+        # 计算保存路径
+        target_path = self.__computed_target_path(path)
+        # 创建父目录
+        if not target_path.parent.exists():
+            await aio_os.makedirs(target_path.parent, exist_ok=True)
+        async with AsyncExitStack() as stack:
+            file = await stack.enter_async_context(open(target_path, mode="wb"))
+            session = await stack.enter_async_context(ClientSession())
+            async with self.__max_download_sem:
+                async with session.get(path.download_url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(
+                            f"下载 {path.download_url} 失败，状态码：{resp.status}"
+                        )
+                    chunk = await resp.read()
+                    await file.write(chunk)
+                    logger.info(f"已下载字幕文件: {target_path}")
+
+    async def __get_invalid_files(self) -> Set[Path]:
+        """
+        清理无效的strm文件。
+        """
         all_local_files = {
             Path(entry.path)
             for entry in await aio_os.scandir(self._target_dir)
@@ -178,17 +201,16 @@ class Alist2Strm(_PluginBase):
             )
         }
         files_need_to_delete = all_local_files - self.processed_remote_paths_in_local
-        async with TaskGroup() as tg:
-            for file_need_to_delete in files_need_to_delete:
-                tg.create_task(self.__delete_file(file_need_to_delete))
+        self.processed_remote_paths_in_local.clear()
+        return files_need_to_delete
 
     async def __delete_file(self, file_need_to_delete: Path) -> None:
-        try:
-            if file_need_to_delete.exists():
-                await aio_os.remove(file_need_to_delete)
-                logger.info(f"删除文件：{file_need_to_delete}")
-        except Exception as e:
-            logger.error(f"删除文件 {file_need_to_delete} 失败：{e}")
+        """
+        删除指定文件。
+        """
+        if file_need_to_delete.exists():
+            await aio_os.remove(file_need_to_delete)
+            logger.info(f"删除文件：{file_need_to_delete}")
 
     def __computed_target_path(self, path: AlistFile) -> Path:
         """
@@ -207,6 +229,9 @@ class Alist2Strm(_PluginBase):
         return target_path
 
     def __update_config(self) -> None:
+        """
+        更新插件配置。
+        """
         self.update_config(
             {
                 "enabled": self._enabled,
