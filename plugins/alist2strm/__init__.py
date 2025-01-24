@@ -198,7 +198,7 @@ class Alist2Strm(_PluginBase):
 
     async def __get_invalid_files(self) -> Set[Path]:
         """
-        清理无效的strm文件。
+        获取无效的文件。
         """
         all_local_files = {
             Path(entry.path)
