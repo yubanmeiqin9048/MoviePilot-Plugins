@@ -203,21 +203,41 @@ class AlistClient:
         traversal_mode: str = "bfs",
         filter_func: Callable[[AlistFile], bool] = lambda x: True,
     ) -> AsyncGenerator[AlistFile, None]:
-        """
-        异步路径列表生成器
-
-        :param iter_dir: 目录路径
-        :return: AlistFile 对象生成器
-        """
-        # 根据遍历模式动态选择队列类型
+        """异步路径列表生成器（BFS层级并行，DFS串行）"""
+        # 初始化队列类型（BFS用Queue，DFS用LifoQueue）
         queue_class = asyncio.LifoQueue if traversal_mode == "dfs" else asyncio.Queue
         queue = queue_class()
-        # 处理起始目录格式
         start_dir = (iter_dir or "").rstrip("/") + "/"
         await queue.put((start_dir, 0))
 
-        async def process_dir(current_dir: str, current_depth: int):
-            """并发处理单个目录"""
+        async def bfs_process_dir(
+            current_dir: str, current_depth: int
+        ):
+            """处理单个目录并返回文件列表"""
+            async with max_list_workers:
+                try:
+                    files = []
+                    dirs_to_enqueue = []
+                    # 获取目录内容
+                    for path in await self.__async_fs_list(current_dir):
+                        if path.is_dir:
+                            next_depth = current_depth + 1
+                            if max_depth == -1 or next_depth <= max_depth:
+                                dirs_to_enqueue.append(
+                                    (path.path.rstrip("/") + "/", next_depth)
+                                )
+                        elif filter_func(path):
+                            files.append(path)
+                    # 延迟入队以实现层级分组
+                    for dir_info in dirs_to_enqueue:
+                        await queue.put(dir_info)
+                    return files
+                except Exception as e:
+                    logger.error(f"目录处理失败 {current_dir}: {str(e)}")
+                    return []
+
+        async def dfs_process_dir(current_dir: str, current_depth: int):
+            """处理单个目录并返回文件"""
             async with max_list_workers:
                 try:
                     for path in await self.__async_fs_list(current_dir):
@@ -232,11 +252,40 @@ class AlistClient:
                 except Exception as e:
                     logger.error(f"目录处理失败 {current_dir}: {str(e)}")
 
-        while not queue.empty():
-            current_dir, depth = await queue.get()
-            async for file in process_dir(current_dir, depth):
-                yield file
-            queue.task_done()
+        # BFS逻辑：按层级并行
+        if traversal_mode == "bfs":
+            current_level = 0
+            current_level_dirs = []
+            while not queue.empty():
+                # 提取当前层级所有目录
+                while not queue.empty():
+                    dir_path, depth = await queue.get()
+                    if depth == current_level:
+                        current_level_dirs.append(dir_path)
+                    else:
+                        # 非当前层级的目录重新放回队列
+                        await queue.put((dir_path, depth))
+                        break
+
+                # 并发处理当前层级所有目录
+                if current_level_dirs:
+                    tasks = [
+                        bfs_process_dir(dir_path, current_level)
+                        for dir_path in current_level_dirs
+                    ]
+                    for task in asyncio.as_completed(tasks):
+                        for file in await task:
+                            yield file
+                    current_level_dirs.clear()
+                    current_level += 1
+
+        # DFS逻辑：串行
+        else:
+            while not queue.empty():
+                current_dir, depth = await queue.get()
+                async for file in dfs_process_dir(current_dir, depth):
+                    yield file
+                queue.task_done()
 
         iter_tasks_done.set()
         logger.info(f"目录遍历完成: {start_dir}")

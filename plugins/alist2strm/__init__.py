@@ -36,7 +36,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.6"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -114,6 +114,7 @@ class Alist2Strm(_PluginBase):
             self.__max_download_sem = asyncio.Semaphore(self._max_download_worker)
             self.__max_list_sem = asyncio.Semaphore(self._max_list_worker)
             self.__iter_tasks_done = asyncio.Event()
+            logger.info("Alist2Strm 插件开始执行")
             asyncio.run(self.__process())
             logger.info("Alist2Strm 插件执行完成")
         except Exception as e:
@@ -198,6 +199,7 @@ class Alist2Strm(_PluginBase):
             item = await queue.get()
             if item is None:  # 结束信号
                 queue.task_done()
+                logger.info("所有strm生成完成")
                 break
             path, target_path = item
             try:
@@ -215,6 +217,7 @@ class Alist2Strm(_PluginBase):
             item = await queue.get()
             if item is None:  # 结束信号
                 queue.task_done()
+                logger.info("所有字幕下载完成")
                 break
             path, target_path = item
             try:
