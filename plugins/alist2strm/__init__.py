@@ -36,7 +36,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.5.1"
+    plugin_version = "1.6"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -63,7 +63,8 @@ class Alist2Strm(_PluginBase):
     _process_file_suffix = settings.RMT_SUBEXT + settings.RMT_MEDIAEXT
     _max_download_worker = 3
     _max_list_worker = 7
-
+    _max_depth = -1
+    _traversal_mode = "bfs"
     processed_remote_paths_in_local: Set[Path] = set()
 
     def init_plugin(self, config: dict = None) -> None:
@@ -88,6 +89,8 @@ class Alist2Strm(_PluginBase):
                 if config.get("max_list_worker")
                 else 7
             )
+            self._max_depth = config.get("max_depth") or -1
+            self._traversal_mode = config.get("traversal_mode") or "bfs"
             self.__update_config()
 
         if self.get_state() or self._onlyonce:
@@ -139,9 +142,7 @@ class Alist2Strm(_PluginBase):
 
         async with AsyncExitStack() as stack:
             client = await stack.enter_async_context(
-                AlistClient(
-                    url=self._url, token=self._token, list_sem=self.__max_list_sem
-                )
+                AlistClient(url=self._url, token=self._token)
             )
             session = await stack.enter_async_context(ClientSession())
             tg = await stack.enter_async_context(asyncio.TaskGroup())
@@ -174,6 +175,9 @@ class Alist2Strm(_PluginBase):
         """遍历Alist目录并分发任务到相应队列"""
         async for path in client.iter_path(
             iter_tasks_done=self.__iter_tasks_done,
+            max_depth=self._max_depth,
+            traversal_mode=self._traversal_mode,
+            max_list_workers=self.__max_list_sem,
             iter_dir=self._source_dir,
             filter_func=self.__filter_func,
         ):
@@ -308,6 +312,8 @@ class Alist2Strm(_PluginBase):
                 "url_replace": self._url_replace,
                 "max_download_worker": self._max_download_worker,
                 "max_list_worker": self._max_list_worker,
+                "max_depth": self._max_depth,
+                "traversal_mode": self._traversal_mode,
             }
         )
 
@@ -528,6 +534,43 @@ class Alist2Strm(_PluginBase):
                                         }
                                     ],
                                 },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VSelect",
+                                            "props": {
+                                                "model": "traversal_mode",
+                                                "label": "遍历模式",
+                                                "items": [
+                                                    {
+                                                        "title": "广度优先(BFS)",
+                                                        "value": "bfs",
+                                                    },
+                                                    {
+                                                        "title": "深度优先(DFS)",
+                                                        "value": "dfs",
+                                                    },
+                                                ],
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "max_depth",
+                                                "label": "最大遍历深度",
+                                                "placeholder": "-1表示无限深度",
+                                            },
+                                        }
+                                    ],
+                                },
                             ],
                         },
                         {
@@ -548,7 +591,23 @@ class Alist2Strm(_PluginBase):
                                             },
                                         }
                                     ],
-                                }
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {
+                                        "cols": 12,
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "VAlert",
+                                            "props": {
+                                                "type": "info",
+                                                "variant": "tonal",
+                                                "text": "建议配合响应时间和QPS设置线程",
+                                            },
+                                        }
+                                    ],
+                                },
                             ],
                         },
                     ],
@@ -567,6 +626,8 @@ class Alist2Strm(_PluginBase):
                 "url_replace": "",
                 "max_list_worker": None,
                 "max_download_worker": None,
+                "max_depth": -1,
+                "traversal_mode": "bfs",
             },
         )
 

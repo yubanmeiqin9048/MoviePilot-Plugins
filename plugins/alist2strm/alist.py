@@ -7,7 +7,7 @@
 # Licensed under the AGPL-3.0 license.
 # See the LICENSE file in the / directory for more details.
 
-from asyncio import Event, Queue, Semaphore, TimeoutError
+import asyncio
 from enum import Enum
 from json import dumps
 from typing import AsyncGenerator, Callable, List, Optional
@@ -111,7 +111,7 @@ class AlistClient:
     Alist 客户端 API
     """
 
-    def __init__(self, url: str, token: str, list_sem: Semaphore) -> None:
+    def __init__(self, url: str, token: str) -> None:
         """
         AlistClient 类初始化
 
@@ -122,7 +122,6 @@ class AlistClient:
             "Content-Type": "application/json",
         }
         self._url = url.rstrip("/")
-        self._list_sem = list_sem
         self._token = token
 
     async def __aenter__(self):
@@ -160,15 +159,14 @@ class AlistClient:
         )
 
         try:
-            async with self._list_sem:
-                async with self._session.post(api_url, data=payload) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(
-                            f"获取目录{dir_path}的文件列表请求发送失败，状态码：{resp.status}"
-                        )
+            async with self._session.post(api_url, data=payload) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"获取目录{dir_path}的文件列表请求发送失败，状态码：{resp.status}"
+                    )
 
-                    result = await resp.json()
-        except TimeoutError:
+                result = await resp.json()
+        except asyncio.TimeoutError:
             raise RuntimeError(f"获取目录{dir_path}的文件列表的请求超时")
 
         if result["code"] != 200:
@@ -198,8 +196,11 @@ class AlistClient:
 
     async def iter_path(
         self,
-        iter_tasks_done: Event,
-        iter_dir: Optional[str] = None,
+        iter_tasks_done: asyncio.Event,
+        max_list_workers: asyncio.Semaphore,
+        iter_dir: str,
+        max_depth: int = -1,
+        traversal_mode: str = "bfs",
         filter_func: Callable[[AlistFile], bool] = lambda x: True,
     ) -> AsyncGenerator[AlistFile, None]:
         """
@@ -208,20 +209,34 @@ class AlistClient:
         :param iter_dir: 目录路径
         :return: AlistFile 对象生成器
         """
-        queue = Queue()
-        await queue.put(iter_dir)
+        # 根据遍历模式动态选择队列类型
+        queue_class = asyncio.LifoQueue if traversal_mode == "dfs" else asyncio.Queue
+        queue = queue_class()
+        # 处理起始目录格式
+        start_dir = (iter_dir or "").rstrip("/") + "/"
+        await queue.put((start_dir, 0))
+
+        async def process_dir(current_dir: str, current_depth: int):
+            """并发处理单个目录"""
+            async with max_list_workers:
+                try:
+                    for path in await self.__async_fs_list(current_dir):
+                        if path.is_dir:
+                            next_depth = current_depth + 1
+                            if max_depth == -1 or next_depth <= max_depth:
+                                await queue.put(
+                                    (path.path.rstrip("/") + "/", next_depth)
+                                )
+                        elif filter_func(path):
+                            yield path
+                except Exception as e:
+                    logger.error(f"目录处理失败 {current_dir}: {str(e)}")
 
         while not queue.empty():
-            current_dir = await queue.get()
-            if current_dir:
-                current_dir = current_dir.rstrip("/") + "/"
-            else:
-                raise RuntimeError("iter_dir 不能为空")
-            for path in await self.__async_fs_list(current_dir):
-                if path.is_dir:
-                    await queue.put(path.path)
-                else:
-                    if filter_func(path):
-                        yield path
+            current_dir, depth = await queue.get()
+            async for file in process_dir(current_dir, depth):
+                yield file
+            queue.task_done()
+
         iter_tasks_done.set()
-        logger.info(f"目录 {iter_dir} 遍历完成")
+        logger.info(f"目录遍历完成: {start_dir}")
