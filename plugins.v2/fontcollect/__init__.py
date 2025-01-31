@@ -230,7 +230,6 @@ class FontCollect(_PluginBase):
             """
             根据需要强制继续
             """
-            # 强制继续
             if self.downloader.torrents_set_force_start(torrent_hash):
                 pass
             else:

@@ -7,7 +7,7 @@
 # Licensed under the AGPL-3.0 license.
 # See the LICENSE file in the / directory for more details.
 
-from asyncio import Queue, TimeoutError
+from asyncio import Event, Queue, Semaphore, TimeoutError
 from enum import Enum
 from json import dumps
 from typing import AsyncGenerator, Callable, List, Optional
@@ -111,7 +111,7 @@ class AlistClient:
     Alist 客户端 API
     """
 
-    def __init__(self, url: str, token: str) -> None:
+    def __init__(self, url: str, token: str, list_sem: Semaphore) -> None:
         """
         AlistClient 类初始化
 
@@ -122,7 +122,7 @@ class AlistClient:
             "Content-Type": "application/json",
         }
         self._url = url.rstrip("/")
-
+        self._list_sem = list_sem
         self._token = token
 
     async def __aenter__(self):
@@ -160,13 +160,14 @@ class AlistClient:
         )
 
         try:
-            async with self._session.post(api_url, data=payload) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"获取目录{dir_path}的文件列表请求发送失败，状态码：{resp.status}"
-                    )
+            async with self._list_sem:
+                async with self._session.post(api_url, data=payload) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(
+                            f"获取目录{dir_path}的文件列表请求发送失败，状态码：{resp.status}"
+                        )
 
-                result = await resp.json()
+                    result = await resp.json()
         except TimeoutError:
             raise RuntimeError(f"获取目录{dir_path}的文件列表的请求超时")
 
@@ -197,6 +198,7 @@ class AlistClient:
 
     async def iter_path(
         self,
+        iter_tasks_done: Event,
         iter_dir: Optional[str] = None,
         filter_func: Callable[[AlistFile], bool] = lambda x: True,
     ) -> AsyncGenerator[AlistFile, None]:
@@ -206,18 +208,20 @@ class AlistClient:
         :param iter_dir: 目录路径
         :return: AlistFile 对象生成器
         """
-        if iter_dir:
-            iter_dir = iter_dir.rstrip("/") + "/"
-        else:
-            raise RuntimeError("iter_dir 不能为空")
-
         queue = Queue()
         await queue.put(iter_dir)
 
         while not queue.empty():
             current_dir = await queue.get()
+            if current_dir:
+                current_dir = current_dir.rstrip("/") + "/"
+            else:
+                raise RuntimeError("iter_dir 不能为空")
             for path in await self.__async_fs_list(current_dir):
                 if path.is_dir:
                     await queue.put(path.path)
-                if filter_func(path):
-                    yield path
+                else:
+                    if filter_func(path):
+                        yield path
+        iter_tasks_done.set()
+        logger.info(f"目录 {iter_dir} 遍历完成")

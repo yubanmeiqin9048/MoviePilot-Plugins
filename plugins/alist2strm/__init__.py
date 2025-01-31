@@ -7,10 +7,11 @@
 # Licensed under the AGPL-3.0 license.
 # See the LICENSE file in the / directory for more details.
 
+import asyncio
 import traceback
-from asyncio import Semaphore, TaskGroup, run
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
@@ -107,9 +108,10 @@ class Alist2Strm(_PluginBase):
 
     def alist2strm(self) -> None:
         try:
-            self.__max_download_sem = Semaphore(self._max_download_worker)
-            self.__max_list_sem = Semaphore(self._max_list_worker)
-            run(self.__process())
+            self.__max_download_sem = asyncio.Semaphore(self._max_download_worker)
+            self.__max_list_sem = asyncio.Semaphore(self._max_list_worker)
+            self.__iter_tasks_done = asyncio.Event()
+            asyncio.run(self.__process())
             logger.info("Alist2Strm 插件执行完成")
         except Exception as e:
             logger.error(
@@ -118,7 +120,7 @@ class Alist2Strm(_PluginBase):
 
     def __filter_func(self, remote_path: AlistFile) -> bool:
         if remote_path.suffix.lower() not in self._process_file_suffix:
-            logger.debug(f"文件 {remote_path.path} 不在处理列表中")
+            logger.debug(f"文件类型 {remote_path.path} 不在处理列表中")
             return False
 
         local_path = self.__computed_target_path(remote_path)
@@ -132,69 +134,116 @@ class Alist2Strm(_PluginBase):
         return True
 
     async def __process(self) -> None:
+        strm_queue = asyncio.Queue()
+        subtitle_queue = asyncio.Queue()
+
         async with AsyncExitStack() as stack:
-            tg = await stack.enter_async_context(TaskGroup())
             client = await stack.enter_async_context(
-                AlistClient(url=self._url, token=self._token)
+                AlistClient(
+                    url=self._url, token=self._token, list_sem=self.__max_list_sem
+                )
             )
-            download_tg = await stack.enter_async_context(TaskGroup())
-            async with self.__max_list_sem:
-                async for path in client.iter_path(
-                    iter_dir=self._source_dir, filter_func=self.__filter_func
-                ):
-                    if path.suffix in settings.RMT_SUBEXT:
-                        # 字幕文件使用单独的任务组处理下载
-                        download_tg.create_task(self.__download_subtitle(path))
-                    else:
-                        # strm文件继续使用主任务组
-                        tg.create_task(self.__to_strm(path))
+            session = await stack.enter_async_context(ClientSession())
+            tg = await stack.enter_async_context(asyncio.TaskGroup())
+
+            # 启动生产者线程
+            tg.create_task(
+                self.__produce_paths(
+                    client=client, strm_queue=strm_queue, subtitle_queue=subtitle_queue
+                )
+            )
+
+            # 启动消费者线程
+            tg.create_task(self.__strm_tasks(strm_queue))
+            tg.create_task(self.__subtitle_tasks(subtitle_queue, session))
+
+            # 清理任务
             if self._sync_remote:
+                await self.__iter_tasks_done.wait()
                 files_need_to_delete = await self.__get_invalid_files()
                 for file_need_to_delete in files_need_to_delete:
                     tg.create_task(self.__delete_file(file_need_to_delete))
                 logger.info("清理过期的 .strm 文件完成")
 
-    async def __to_strm(self, path: AlistFile) -> None:
-        """
-        将远程文件转换为strm文件。
-        """
-        # 计算保存路径
-        target_path = self.__computed_target_path(path)
-        # strm内容
+    async def __produce_paths(
+        self,
+        client: AlistClient,
+        strm_queue: asyncio.Queue,
+        subtitle_queue: asyncio.Queue,
+    ) -> None:
+        """遍历Alist目录并分发任务到相应队列"""
+        async for path in client.iter_path(
+            iter_tasks_done=self.__iter_tasks_done,
+            iter_dir=self._source_dir,
+            filter_func=self.__filter_func,
+        ):
+            target_path = self.__computed_target_path(path)
+            # 根据文件类型分发到不同队列
+            if path.suffix in settings.RMT_SUBEXT:
+                await subtitle_queue.put((path, target_path))
+            else:
+                await strm_queue.put((path, target_path))
+
+        # 发送结束信号
+        await strm_queue.put(None)
+        await subtitle_queue.put(None)
+
+    async def __strm_tasks(self, queue: asyncio.Queue) -> None:
+        """strm生成队列"""
+        while True:
+            item = await queue.get()
+            if item is None:  # 结束信号
+                queue.task_done()
+                break
+            path, target_path = item
+            try:
+                await self.__to_strm(path, target_path)
+            except Exception as e:
+                logger.error(f"生成.strm失败: {target_path}, 错误: {str(e)}")
+            finally:
+                queue.task_done()
+
+    async def __subtitle_tasks(
+        self, queue: asyncio.Queue, session: ClientSession
+    ) -> None:
+        """字幕下载队列"""
+        while True:
+            item = await queue.get()
+            if item is None:  # 结束信号
+                queue.task_done()
+                break
+            path, target_path = item
+            try:
+                await self.__download_subtitle(path, target_path, session)
+            except Exception as e:
+                logger.error(f"下载字幕失败: {target_path}, 错误: {str(e)}")
+            finally:
+                queue.task_done()
+
+    async def __to_strm(self, path: AlistFile, target_path: Path) -> None:
+        """生成strm文件"""
         content = (
             path.download_url
             if not self._url_replace
             else path.download_url.replace(f"{self._url}/d", self._url_replace)
         )
-        # 创建父目录
         if not target_path.parent.exists():
             await aio_os.makedirs(target_path.parent, exist_ok=True)
-        # 写入strm文件
-        async with open(target_path, mode="wb", encoding="utf-8") as file:
+        async with open(target_path, mode="w", encoding="utf-8") as file:
             await file.write(content)
-        logger.info(f"已写入 .strm 文件: {target_path}")
+        logger.debug(f"已写入.strm: {target_path}")
 
-    async def __download_subtitle(self, path: AlistFile) -> None:
-        """
-        下载字幕文件。
-        """
-        # 计算保存路径
-        target_path = self.__computed_target_path(path)
-        # 创建父目录
+    async def __download_subtitle(
+        self, path: AlistFile, target_path: Path, session: ClientSession
+    ) -> None:
+        """下载字幕"""
         if not target_path.parent.exists():
             await aio_os.makedirs(target_path.parent, exist_ok=True)
-        async with AsyncExitStack() as stack:
-            file = await stack.enter_async_context(open(target_path, mode="wb"))
-            session = await stack.enter_async_context(ClientSession())
-            async with self.__max_download_sem:
-                async with session.get(path.download_url) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(
-                            f"下载 {path.download_url} 失败，状态码：{resp.status}"
-                        )
-                    chunk = await resp.read()
-                    await file.write(chunk)
-                    logger.info(f"已下载字幕文件: {target_path}")
+        async with self.__max_download_sem:
+            async with session.get(path.download_url) as resp:
+                async with open(target_path, mode="wb") as file:
+                    await file.write(await resp.read())
+        logger.debug(f"已下载字幕: {target_path}")
 
     async def __get_invalid_files(self) -> Set[Path]:
         """
@@ -225,14 +274,18 @@ class Alist2Strm(_PluginBase):
         """
         计算strm文件保存路径。
 
-        :param path: AlistPath 对象
+        :param path: AlistFile 对象
         :return: 本地文件路径,如果是媒体文件，则返回 .strm 后缀
         """
-        target_path = Path(self._target_dir) / path.path.replace(
+        return self.__cached_computed_target_path(path.path, path.suffix)
+
+    @lru_cache(maxsize=2048)
+    def __cached_computed_target_path(self, path: str, suffix: str) -> Path:
+        target_path = Path(self._target_dir) / path.replace(
             self._source_dir, self._path_replace, 1
         ).lstrip("/")
 
-        if path.suffix.lower() in settings.RMT_MEDIAEXT:
+        if suffix.lower() in settings.RMT_MEDIAEXT:
             target_path = target_path.with_suffix(".strm")
 
         return target_path
