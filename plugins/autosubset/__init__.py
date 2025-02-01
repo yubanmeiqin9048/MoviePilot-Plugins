@@ -249,7 +249,6 @@ class AutoSubset(_PluginBase):
 
     def __process_ass(self, ass_file: Path):
         try:
-            self.__init_assfonts()
             cmd = self.__build_af_command()
             result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
 
@@ -311,7 +310,7 @@ class AutoSubset(_PluginBase):
         self._sethdrluminance = (
             "hdr" in event.event_data["meta"].edition and self._hdrluminance
         )
-
+        self.__init_assfonts()
         for ass in target.parent.glob("**/*.ass"):
             if ".assfonts." in ass.name:
                 continue
