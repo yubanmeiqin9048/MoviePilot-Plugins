@@ -10,7 +10,7 @@
 import asyncio
 from enum import Enum
 from json import dumps
-from typing import AsyncGenerator, Callable, List, Optional
+from typing import AsyncGenerator, Callable, List, Optional, Tuple
 
 from aiohttp import ClientSession
 from app.log import logger
@@ -203,57 +203,48 @@ class AlistClient:
         traversal_mode: str = "bfs",
         filter_func: Callable[[AlistFile], bool] = lambda x: True,
     ) -> AsyncGenerator[AlistFile, None]:
-        """异步路径列表生成器（BFS层级并行，DFS串行）"""
-        # 初始化队列类型（BFS用Queue，DFS用LifoQueue）
-        queue_class = asyncio.LifoQueue if traversal_mode == "dfs" else asyncio.Queue
+        """
+        异步路径生成器
+
+        :param iter_tasks_done: 事件对象，用于通知遍历已经结束
+        :param max_list_workers: 信号量对象，用于控制并发列出目录的协程数量
+        :param iter_dir: 要遍历的起始目录路径
+        :param max_depth: 最大遍历深度。默认值为 -1
+        :param traversal_mode: 遍历模式，支持“bfs”和“dfs”
+        :param filter_func: 过滤函数，接收一个 AlistFile 对象并返回布尔值
+        :return: AlistFile 对象生成器
+        """
+        # 初始化队列类型
+        queue_class = asyncio.Queue if traversal_mode == "bfs" else asyncio.LifoQueue
         queue = queue_class()
         start_dir = (iter_dir or "").rstrip("/") + "/"
         await queue.put((start_dir, 0))
 
-        async def bfs_process_dir(
+        async def process_dir(
             current_dir: str, current_depth: int
-        ):
-            """处理单个目录并返回文件列表"""
+        ) -> List[Tuple[str, int]]:
+            """处理单个目录，返回文件列表和子目录信息"""
             async with max_list_workers:
                 try:
+                    entries = await self.__async_fs_list(current_dir)
                     files = []
-                    dirs_to_enqueue = []
-                    # 获取目录内容
-                    for path in await self.__async_fs_list(current_dir):
+                    subdirs = []
+                    for path in entries:
                         if path.is_dir:
                             next_depth = current_depth + 1
                             if max_depth == -1 or next_depth <= max_depth:
-                                dirs_to_enqueue.append(
+                                subdirs.append(
                                     (path.path.rstrip("/") + "/", next_depth)
                                 )
                         elif filter_func(path):
                             files.append(path)
-                    # 延迟入队以实现层级分组
-                    for dir_info in dirs_to_enqueue:
-                        await queue.put(dir_info)
-                    return files
+                    return files, subdirs
                 except Exception as e:
                     logger.error(f"目录处理失败 {current_dir}: {str(e)}")
-                    return []
+                    return [], []
 
-        async def dfs_process_dir(current_dir: str, current_depth: int):
-            """处理单个目录并返回文件"""
-            async with max_list_workers:
-                try:
-                    for path in await self.__async_fs_list(current_dir):
-                        if path.is_dir:
-                            next_depth = current_depth + 1
-                            if max_depth == -1 or next_depth <= max_depth:
-                                await queue.put(
-                                    (path.path.rstrip("/") + "/", next_depth)
-                                )
-                        elif filter_func(path):
-                            yield path
-                except Exception as e:
-                    logger.error(f"目录处理失败 {current_dir}: {str(e)}")
-
-        # BFS逻辑：按层级并行
-        if traversal_mode == "bfs":
+        # BFS层级并发逻辑
+        async def bfs_traversal():
             current_level = 0
             current_level_dirs = []
             while not queue.empty():
@@ -263,29 +254,45 @@ class AlistClient:
                     if depth == current_level:
                         current_level_dirs.append(dir_path)
                     else:
-                        # 非当前层级的目录重新放回队列
                         await queue.put((dir_path, depth))
                         break
 
-                # 并发处理当前层级所有目录
+                # 并发处理当前层级
                 if current_level_dirs:
                     tasks = [
-                        bfs_process_dir(dir_path, current_level)
+                        asyncio.create_task(process_dir(dir_path, current_level))
                         for dir_path in current_level_dirs
                     ]
+
                     for task in asyncio.as_completed(tasks):
-                        for file in await task:
+                        files, subdirs = await task
+                        for file in files:
                             yield file
+                        # 子目录入队（下一层级）
+                        for subdir_path, next_depth in subdirs:
+                            await queue.put((subdir_path, next_depth))
+
                     current_level_dirs.clear()
                     current_level += 1
 
-        # DFS逻辑：串行
-        else:
+        # DFS递归逻辑
+        async def dfs_traversal():
             while not queue.empty():
                 current_dir, depth = await queue.get()
-                async for file in dfs_process_dir(current_dir, depth):
+                files, subdirs = await process_dir(current_dir, depth)
+                # 先返回当前目录的文件
+                for file in files:
                     yield file
+                for subdir_path, next_depth in subdirs:
+                    await queue.put((subdir_path, next_depth))
                 queue.task_done()
+
+        if traversal_mode == "bfs":
+            async for file in bfs_traversal():
+                yield file
+        else:
+            async for file in dfs_traversal():
+                yield file
 
         iter_tasks_done.set()
         logger.info(f"目录遍历完成: {start_dir}")
