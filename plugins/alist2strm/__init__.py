@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 import aiofiles.os as aio_os
 import pytz
-from aiofiles import open
+from aiofiles import open as async_open
 from aiohttp import ClientSession
 from app.core.config import settings
 from app.log import logger
@@ -26,6 +26,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from plugins.alist2strm.alist import AlistClient, AlistFile
+from plugins.alist2strm.filter import BloomCleaner, IoCleaner, SetCleaner
 
 
 class Alist2Strm(_PluginBase):
@@ -36,7 +37,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -65,6 +66,7 @@ class Alist2Strm(_PluginBase):
     _max_list_worker = 7
     _max_depth = -1
     _traversal_mode = "bfs"
+    _filter_mode = "set"
     processed_remote_paths_in_local: Set[Path] = set()
 
     def init_plugin(self, config: dict = None) -> None:
@@ -91,6 +93,8 @@ class Alist2Strm(_PluginBase):
             )
             self._max_depth = config.get("max_depth") or -1
             self._traversal_mode = config.get("traversal_mode") or "bfs"
+            self._filter_mode = config.get("filter_mode") or "set"
+            self.init_cleaner()
             self.__update_config()
 
         if self.get_state() or self._onlyonce:
@@ -108,6 +112,23 @@ class Alist2Strm(_PluginBase):
                     self._scheduler.print_jobs()
                     self._scheduler.start()
             self.__update_config()
+
+    def init_cleaner(self) -> None:
+        """
+        根据 filter_mode 实例化对应的 Cleaner。
+        """
+        if self._filter_mode == "set":
+            use_cleaner = SetCleaner
+        elif self._filter_mode == "io":
+            use_cleaner = IoCleaner
+        elif self._filter_mode == "bf":
+            use_cleaner = BloomCleaner
+        else:
+            raise ValueError(f"未知的过滤模式: {self._filter_mode}")
+        self.cleaner = use_cleaner(
+            need_suffix=self._process_file_suffix + ["strm"],
+            target_dir=self._target_dir,
+        )
 
     def alist2strm(self) -> None:
         try:
@@ -131,7 +152,7 @@ class Alist2Strm(_PluginBase):
         if self._sync_remote:
             self.processed_remote_paths_in_local.add(local_path)
 
-        if local_path.exists():
+        if local_path in self.cleaner:
             logger.debug(f"文件 {local_path.name} 已存在，跳过处理 {remote_path.path}")
             return False
 
@@ -162,9 +183,8 @@ class Alist2Strm(_PluginBase):
             # 清理任务
             if self._sync_remote:
                 await self.__iter_tasks_done.wait()
-                files_need_to_delete = await self.__get_invalid_files()
-                for file_need_to_delete in files_need_to_delete:
-                    tg.create_task(self.__delete_file(file_need_to_delete))
+                await self.cleaner.clean_inviially(self.processed_remote_paths_in_local)
+                self.processed_remote_paths_in_local.clear()
                 logger.info("清理过期的 .strm 文件完成")
 
     async def __produce_paths(
@@ -188,7 +208,8 @@ class Alist2Strm(_PluginBase):
                 await subtitle_queue.put((path, target_path))
             else:
                 await strm_queue.put((path, target_path))
-
+            # 记录已处理文件
+            self.cleaner.add(target_path)
         # 发送结束信号
         await strm_queue.put(None)
         await subtitle_queue.put(None)
@@ -234,48 +255,21 @@ class Alist2Strm(_PluginBase):
             if not self._url_replace
             else path.download_url.replace(f"{self._url}/d", self._url_replace)
         )
-        if not target_path.parent.exists():
-            await aio_os.makedirs(target_path.parent, exist_ok=True)
-        async with open(target_path, mode="w", encoding="utf-8") as file:
+        await aio_os.makedirs(target_path.parent, exist_ok=True)
+        async with async_open(target_path, mode="w", encoding="utf-8") as file:
             await file.write(content)
-        logger.debug(f"已写入.strm: {target_path}")
+        logger.info(f"已写入.strm: {target_path}")
 
     async def __download_subtitle(
         self, path: AlistFile, target_path: Path, session: ClientSession
     ) -> None:
         """下载字幕"""
-        if not target_path.parent.exists():
-            await aio_os.makedirs(target_path.parent, exist_ok=True)
+        await aio_os.makedirs(target_path.parent, exist_ok=True)
         async with self.__max_download_sem:
             async with session.get(path.download_url) as resp:
-                async with open(target_path, mode="wb") as file:
+                async with async_open(target_path, mode="wb") as file:
                     await file.write(await resp.read())
-        logger.debug(f"已下载字幕: {target_path}")
-
-    async def __get_invalid_files(self) -> Set[Path]:
-        """
-        获取无效的文件。
-        """
-        all_local_files = {
-            Path(entry.path)
-            for entry in await aio_os.scandir(self._target_dir)
-            if entry.is_file()
-            and (
-                entry.name.endswith(tuple(self._process_file_suffix))
-                or entry.name.endswith(".strm")
-            )
-        }
-        files_need_to_delete = all_local_files - self.processed_remote_paths_in_local
-        self.processed_remote_paths_in_local.clear()
-        return files_need_to_delete
-
-    async def __delete_file(self, file_need_to_delete: Path) -> None:
-        """
-        删除指定文件。
-        """
-        if file_need_to_delete.exists():
-            await aio_os.remove(file_need_to_delete)
-            logger.info(f"删除文件：{file_need_to_delete}")
+        logger.info(f"已下载字幕: {target_path}")
 
     def __computed_target_path(self, path: AlistFile) -> Path:
         """
@@ -286,7 +280,7 @@ class Alist2Strm(_PluginBase):
         """
         return self.__cached_computed_target_path(path.path, path.suffix)
 
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=10000)
     def __cached_computed_target_path(self, path: str, suffix: str) -> Path:
         target_path = Path(self._target_dir) / path.replace(
             self._source_dir, self._path_replace, 1
@@ -317,6 +311,7 @@ class Alist2Strm(_PluginBase):
                 "max_list_worker": self._max_list_worker,
                 "max_depth": self._max_depth,
                 "traversal_mode": self._traversal_mode,
+                "filter_mode": self._filter_mode,
             }
         )
 
@@ -574,6 +569,33 @@ class Alist2Strm(_PluginBase):
                                         }
                                     ],
                                 },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VSelect",
+                                            "props": {
+                                                "model": "filter_mode",
+                                                "label": "过滤模式",
+                                                "items": [
+                                                    {
+                                                        "title": "集合过滤",
+                                                        "value": "set",
+                                                    },
+                                                    {
+                                                        "title": "磁盘过滤",
+                                                        "value": "io",
+                                                    },
+                                                    {
+                                                        "title": "布隆过滤",
+                                                        "value": "bf",
+                                                    },
+                                                ],
+                                            },
+                                        }
+                                    ],
+                                },
                             ],
                         },
                         {
@@ -631,6 +653,7 @@ class Alist2Strm(_PluginBase):
                 "max_download_worker": None,
                 "max_depth": -1,
                 "traversal_mode": "bfs",
+                "filter_mode": "set",
             },
         )
 
