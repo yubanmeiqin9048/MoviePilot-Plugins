@@ -37,7 +37,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.8"
+    plugin_version = "1.8.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -136,6 +136,7 @@ class Alist2Strm(_PluginBase):
             self.__max_list_sem = asyncio.Semaphore(self._max_list_worker)
             self.__iter_tasks_done = asyncio.Event()
             logger.info("Alist2Strm 插件开始执行")
+            asyncio.run(self.cleaner.init_cleaner())
             asyncio.run(self.__process())
             logger.info("Alist2Strm 插件执行完成")
         except Exception as e:
@@ -145,15 +146,15 @@ class Alist2Strm(_PluginBase):
 
     def __filter_func(self, remote_path: AlistFile) -> bool:
         if remote_path.suffix.lower() not in self._process_file_suffix:
-            logger.debug(f"文件类型 {remote_path.path} 不在处理列表中")
+            logger.info(f"文件类型 {remote_path.path} 不在处理列表中")
             return False
 
         local_path = self.__computed_target_path(remote_path)
         if self._sync_remote:
             self.processed_remote_paths_in_local.add(local_path)
 
-        if local_path in self.cleaner:
-            logger.debug(f"文件 {local_path.name} 已存在，跳过处理 {remote_path.path}")
+        if self.cleaner.contains(local_path):
+            logger.info(f"文件 {local_path.name} 已存在，跳过处理 {remote_path.path}")
             return False
 
         return True
