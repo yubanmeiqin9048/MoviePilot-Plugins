@@ -11,6 +11,9 @@ from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType
 from app.utils.string import StringUtils
+from app.core.metainfo import MetaInfo
+from app.chain.media import MediaChain
+from app.core.context import Context
 
 
 class DownloaderApi(_PluginBase):
@@ -68,6 +71,13 @@ class DownloaderApi(_PluginBase):
                 "methods": ["GET"],
                 "summary": "下载种子",
                 "description": "直接下载种子，不识别",
+            },
+            {
+                'path': '/recognize',
+                'endpoint': self.recognize,
+                'methods': ['GET'],
+                'auth': 'apikey',
+                'summary': '识别种子名称'
             }
         ]
 
@@ -221,3 +231,19 @@ class DownloaderApi(_PluginBase):
         下载器实例
         """
         return self.service_info.instance if self.service_info else None
+
+    def recognize(self,title:str,subtitle:str):
+        if self._enabled:
+            if title.strip() == "" and subtitle.strip() == "":
+                logger.info('没有传入标题和副标题！')
+                return schemas.Response(success=False, message="标题或副标题为空！")
+            else:
+                logger.info(f'开始识别,标题：{title},副标题{subtitle}')
+                metainfo = MetaInfo(title, subtitle)
+                mediainfo = MediaChain().recognize_by_meta(metainfo)
+                if mediainfo:
+                    return schemas.Response(success=True, message="识别成功！",data=Context(meta_info=metainfo, media_info=mediainfo).to_dict())
+                else:
+                    return schemas.Response(success=False, message="未识别到媒体信息！")
+        else:
+            return schemas.Response(success=False, message="插件未启用！")
