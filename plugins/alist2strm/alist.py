@@ -38,7 +38,7 @@ class AlistFile:
     def __init__(
         self,
         alist_url: str,
-        path: str,
+        _path: str,
         is_dir: bool,
         modified: str,
         name: str,
@@ -51,7 +51,7 @@ class AlistFile:
         **_,
     ) -> None:
         self._alist_url = alist_url
-        self._path = path
+        self._path = _path
         self._is_dir = is_dir
         self._modified = modified
         self._name = name
@@ -184,7 +184,7 @@ class AlistClient:
             return [
                 AlistFile(
                     alist_url=self._url,
-                    path=dir_path + content["name"],
+                    _path=dir_path + content["name"],
                     **content,
                 )
                 for content in result["data"]["content"]
