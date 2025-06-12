@@ -13,7 +13,7 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiofiles.os as aio_os
 import pytz
@@ -37,7 +37,7 @@ class Alist2Strm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     # 插件版本
-    plugin_version = "1.8.2"
+    plugin_version = "1.8.3"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -69,28 +69,20 @@ class Alist2Strm(_PluginBase):
     _filter_mode = "set"
     processed_remote_paths_in_local: Set[Path] = set()
 
-    def init_plugin(self, config: dict = None) -> None:
+    def init_plugin(self, config: Optional[dict] = None) -> None:
         if config:
             self._enabled = config.get("enabled")
             self._onlyonce = config.get("onlyonce")
-            self._url = config.get("url")
-            self._token = config.get("token")
-            self._source_dir = config.get("source_dir")
+            self._url = config.get("url", "")
+            self._token = config.get("token", "")
+            self._source_dir = config.get("source_dir", "")
             self._sync_remote = config.get("sync_remote")
-            self._target_dir = config.get("target_dir")
+            self._target_dir = config.get("target_dir", "")
             self._cron = config.get("cron")
-            self._path_replace = config.get("path_replace")
+            self._path_replace = config.get("path_replace", "")
             self._url_replace = config.get("url_replace")
-            self._max_download_worker = (
-                int(config.get("max_download_worker"))
-                if config.get("max_download_worker")
-                else 3
-            )
-            self._max_list_worker = (
-                int(config.get("max_list_worker"))
-                if config.get("max_list_worker")
-                else 7
-            )
+            self._max_download_worker = int(config.get("max_download_worker", 3))
+            self._max_list_worker = int(config.get("max_list_worker", 7))
             self._max_depth = config.get("max_depth") or -1
             self._traversal_mode = config.get("traversal_mode") or "bfs"
             self._filter_mode = config.get("filter_mode") or "set"
@@ -101,7 +93,7 @@ class Alist2Strm(_PluginBase):
             if self._onlyonce:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
                 self._scheduler.add_job(
-                    self.alist2strm,
+                    self.run_in_scheduler,
                     "date",
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ))
                     + timedelta(seconds=3),
@@ -127,17 +119,21 @@ class Alist2Strm(_PluginBase):
             raise ValueError(f"未知的过滤模式: {self._filter_mode}")
         self.cleaner = use_cleaner(
             need_suffix=self._process_file_suffix + ["strm"],
-            target_dir=self._target_dir,
+            target_dir=Path(self._target_dir),
         )
 
-    def alist2strm(self) -> None:
+    def run_in_scheduler(self) -> None:
+        loop = asyncio.get_running_loop()
+        loop.run_until_complete(self.alist2strm())
+
+    async def alist2strm(self):
         try:
             self.__max_download_sem = asyncio.Semaphore(self._max_download_worker)
             self.__max_list_sem = asyncio.Semaphore(self._max_list_worker)
             self.__iter_tasks_done = asyncio.Event()
             logger.info("Alist2Strm 插件开始执行")
-            asyncio.run(self.cleaner.init_cleaner())
-            asyncio.run(self.__process())
+            await self.cleaner.init_cleaner()
+            await self.__process()
             logger.info("Alist2Strm 插件执行完成")
         except Exception as e:
             logger.error(
@@ -340,17 +336,17 @@ class Alist2Strm(_PluginBase):
                     "id": "Alist2strm",
                     "name": "全量生成STRM",
                     "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self.alist2strm,
+                    "func": self.run_in_scheduler,
                     "kwargs": {},
                 }
             ]
         return []
 
     @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def get_command() -> List[Dict[str, Any]]:  # type: ignore
         pass
 
-    def get_api(self) -> List[Dict[str, Any]]:
+    def get_api(self) -> List[Dict[str, Any]]:  # type: ignore
         pass
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -658,7 +654,7 @@ class Alist2Strm(_PluginBase):
             },
         )
 
-    def get_page(self) -> List[dict]:
+    def get_page(self) -> List[dict]:  # type: ignore
         pass
 
     def stop_service(self) -> None:
