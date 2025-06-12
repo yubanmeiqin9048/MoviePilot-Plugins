@@ -10,7 +10,7 @@
 import asyncio
 from enum import Enum
 from json import dumps
-from typing import AsyncGenerator, Callable, List, Optional, Tuple
+from typing import AsyncGenerator, Callable, List
 
 from aiohttp import ClientSession
 from app.log import logger
@@ -38,7 +38,7 @@ class AlistFile:
     def __init__(
         self,
         alist_url: str,
-        _path: str,
+        path: str,
         is_dir: bool,
         modified: str,
         name: str,
@@ -51,7 +51,7 @@ class AlistFile:
         **_,
     ) -> None:
         self._alist_url = alist_url
-        self._path = _path
+        self._path = path
         self._is_dir = is_dir
         self._modified = modified
         self._name = name
@@ -133,9 +133,7 @@ class AlistClient:
     async def __aexit__(self, *_):
         await self._session.close()
 
-    async def __async_fs_list(
-        self, path_in: Optional[str] = None
-    ) -> List[AlistFile | None]:
+    async def __async_fs_list(self, path_in: str) -> List[AlistFile]:
         """
         获取文件列表
 
@@ -143,8 +141,7 @@ class AlistClient:
         :return: AlistFile 对象列表
         """
 
-        if path_in:
-            dir_path = path_in
+        dir_path = path_in
         logger.debug(f"获取目录{dir_path}下的文件列表")
 
         api_url = AlistApi.list.full_url(self._url)
@@ -220,9 +217,7 @@ class AlistClient:
         start_dir = (iter_dir or "").rstrip("/") + "/"
         await queue.put((start_dir, 0))
 
-        async def process_dir(
-            current_dir: str, current_depth: int
-        ) -> List[Tuple[str, int]]:
+        async def process_dir(current_dir: str, current_depth: int):
             """处理单个目录，返回文件列表和子目录信息"""
             async with max_list_workers:
                 try:
@@ -241,7 +236,7 @@ class AlistClient:
                     return files, subdirs
                 except Exception as e:
                     logger.error(f"目录处理失败 {current_dir}: {str(e)}")
-                    return [], []
+                    raise e
 
         # BFS层级并发逻辑
         async def bfs_traversal():
