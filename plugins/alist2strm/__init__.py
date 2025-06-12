@@ -123,8 +123,7 @@ class Alist2Strm(_PluginBase):
         )
 
     def run_in_scheduler(self) -> None:
-        loop = asyncio.get_running_loop()
-        loop.run_until_complete(self.alist2strm())
+        asyncio.run(self.alist2strm())
 
     async def alist2strm(self):
         try:
