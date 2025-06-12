@@ -1,4 +1,4 @@
-from asyncio import run, to_thread
+from asyncio import to_thread
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from app import schemas
@@ -22,7 +22,7 @@ class DownloaderApi(_PluginBase):
     # 插件图标
     plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -40,12 +40,12 @@ class DownloaderApi(_PluginBase):
     _downloader = None
     _save_path = None
 
-    def init_plugin(self, config: dict = None):
+    def init_plugin(self, config: Optional[dict] = None):
         self.downloader_helper = DownloaderHelper()
         self.torrent_helper = TorrentHelper()
         if not config:
             return
-        self._enabled = config.get("enabled")
+        self._enabled = config.get("enabled", False)
         self._save_path = config.get("save_path", None)
         self._downloader = config.get("downloader", None)
         if not self.downloader:
@@ -57,21 +57,21 @@ class DownloaderApi(_PluginBase):
         return self._enabled
 
     @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def get_command() -> List[Dict[str, Any]]:  # type: ignore
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
                 "path": "/download_torrent_notest",
-                "endpoint": self.process,
+                "endpoint": self.download_torrent,
                 "methods": ["GET"],
                 "summary": "下载种子",
                 "description": "直接下载种子，不识别",
             }
         ]
 
-    def get_page(self) -> List[dict]:
+    def get_page(self) -> List[dict]:  # type: ignore
         pass
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -159,14 +159,13 @@ class DownloaderApi(_PluginBase):
             }
         )
 
-    def process(self, torrent_url: str):
-        return run(self.download_torrent(torrent_url))
-
     async def download_torrent(self, torrent_url: str) -> schemas.Response:
         """
         API调用下载种子
         """
         try:
+            if not self.downloader:
+                return schemas.Response(success=False, message="未配置下载器")
             downloader = self.downloader
             # 添加下载
             tag = StringUtils.generate_random_str(10)
