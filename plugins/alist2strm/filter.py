@@ -85,7 +85,7 @@ class Cleaner(ABC):
         entries = target_dir
         for entry in await aio_os.scandir(entries):
             if entry.is_dir():
-                async for sub_path in self._walk_local_files(entry.path):
+                async for sub_path in self._walk_local_files(Path(entry.path)):
                     yield sub_path
             elif entry.is_file() and entry.name.endswith(self.need_suffix):
                 yield Path(entry.path)
