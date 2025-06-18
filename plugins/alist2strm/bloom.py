@@ -45,68 +45,8 @@ class BloomLayer:
         return all(self.counters[idx] > 0 for idx in indices)
 
 
-class ScalableCoutingBloomFilter:
-    """分层计数布隆过滤器"""
-
-    def __init__(self, max_error=0.001, initial_elements=100000):
-        self.max_error = max_error
-        self.layers: List[BloomLayer] = []
-        self.remaining_error = max_error
-        self._add_layer(initial_elements, max_error / 2)
-
-    def _add_layer(self, n: int, layer_error: float):
-        new_layer = BloomLayer(n, layer_error)
-        self.layers.append(new_layer)
-        self.remaining_error -= layer_error
-
-    def _hash(self, element: bytes, layer: BloomLayer) -> List[int]:
-        """哈希函数"""
-        hash_full = hashlib.sha1(element).digest()
-        hash1 = int.from_bytes(hash_full[:4], byteorder="big")
-        hash2 = int.from_bytes(hash_full[4:8], byteorder="big")
-        return [(hash1 + i * hash2) % layer.m for i in range(layer.k)]
-
-    def add(self, element):
-        current_layer = self.layers[-1]
-
-        # 自动扩容逻辑
-        if current_layer.load_factor() > 0.75:
-            new_error = self.remaining_error * 0.5
-            new_n = current_layer.element_count * 2
-            self._add_layer(new_n, new_error)
-        element_bytes = self._to_bytes(element)
-        indices = self._hash(element_bytes, self.layers[-1])
-        self.layers[-1].update(indices, 1)
-
-    def __contains__(self, element) -> bool:
-        element_bytes = self._to_bytes(element)
-        for layer in self.layers:
-            indices = self._hash(element_bytes, layer)
-            if layer.check(indices):
-                return True
-        return False
-
-    def remove(self, element):
-        element_bytes = self._to_bytes(element)
-        for layer in reversed(self.layers):
-            indices = self._hash(element_bytes, layer)
-            if layer.check(indices):
-                layer.update(indices, -1)
-                return
-        raise ValueError("Element not found")
-
-    def _to_bytes(self, element):
-        # 将元素转换为字节
-        if isinstance(element, bytes):
-            return element
-        elif isinstance(element, str):
-            return element.encode("utf-8")
-        else:
-            return pickle.dumps(element)
-
-
 class CoutingBloomFilter:
-    """计数布隆过滤器"""
+    """分层计数布隆过滤器"""
 
     def __init__(self, max_error=0.001, initial_elements=100000):
         self.max_error = max_error
@@ -133,24 +73,48 @@ class CoutingBloomFilter:
 
     def __contains__(self, element) -> bool:
         element_bytes = self._to_bytes(element)
-        indices = self._hash(element_bytes, self.layers[0])
-        if self.layers[0].check(indices):
-            return True
+        for layer in reversed(self.layers):
+            indices = self._hash(element_bytes, layer)
+            if layer.check(indices):
+                return True
         return False
 
     def remove(self, element):
         element_bytes = self._to_bytes(element)
-        indices = self._hash(element_bytes, self.layers[0])
-        if self.layers[0].check(indices):
-            self.layers[0].update(indices, -1)
-            return
+        for layer in reversed(self.layers):
+            indices = self._hash(element_bytes, layer)
+            if layer.check(indices):
+                layer.update(indices, -1)
+                return
         raise ValueError("Element not found")
 
     def _to_bytes(self, element):
         # 将元素转换为字节
-        if isinstance(element, str):
-            return element.encode("utf-8")
-        elif isinstance(element, bytes):
+        if isinstance(element, bytes):
             return element
+        elif isinstance(element, str):
+            return element.encode("utf-8")
         else:
             return pickle.dumps(element)
+
+
+class ScalableCoutingBloomFilter(CoutingBloomFilter):
+    """计数布隆过滤器"""
+
+    def __init__(self, max_error=0.001, initial_elements=200000):
+        self.max_error = max_error
+        self.layers: List[BloomLayer] = []
+        self.remaining_error = max_error
+        self._add_layer(initial_elements, max_error / 2)
+
+    def add(self, element):
+        current_layer = self.layers[-1]
+
+        # 自动扩容逻辑
+        if current_layer.load_factor() > 0.75:
+            new_error = self.remaining_error * 0.5
+            new_n = current_layer.element_count * 2
+            self._add_layer(new_n, new_error)
+        element_bytes = self._to_bytes(element)
+        indices = self._hash(element_bytes, self.layers[-1])
+        self.layers[-1].update(indices, 1)
