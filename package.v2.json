@@ -39,7 +39,7 @@
       "v1.0": "初版"
     }
   },
-  "TorrentRemover": {
+  "TorrentRemoverRuff": {
     "name": "自动删种(ruff版)",
     "description": "自动删除下载器中的下载任务。",
     "labels": "做种",
