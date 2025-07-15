@@ -38,7 +38,7 @@ class AlistFile:
     def __init__(
         self,
         alist_url: str,
-        path: str,
+        _path: str,
         is_dir: bool,
         modified: str,
         name: str,
@@ -51,7 +51,7 @@ class AlistFile:
         **_,
     ) -> None:
         self._alist_url = alist_url
-        self._path = path
+        self._path = _path
         self._is_dir = is_dir
         self._modified = modified
         self._name = name
