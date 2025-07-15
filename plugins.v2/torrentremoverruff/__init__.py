@@ -42,11 +42,11 @@ class TorrentInfo(BaseModel):
         return self.id == other.id and self.name == other.name and self.site == other.site and self.size == other.size
 
 
-class TorrentRemover(_PluginBase):
+class TorrentRemoverRuff(_PluginBase):
     # 插件名称
     plugin_name = "自动删种(ruff版)"
     # 插件描述
-    plugin_desc = "自动删除下载器中的下载任务。"
+    plugin_desc = "自动删除下载器中的下载任务，基于官方插件二次开发。"
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
@@ -56,7 +56,7 @@ class TorrentRemover(_PluginBase):
     # 作者主页
     author_url = "https://github.com/yubanmeiqin9048"
     # 插件配置项ID前缀
-    plugin_config_prefix = "torrentremover_"
+    plugin_config_prefix = "torrentremoverruff_"
     # 加载顺序
     plugin_order = 8
     # 可使用的用户级别
