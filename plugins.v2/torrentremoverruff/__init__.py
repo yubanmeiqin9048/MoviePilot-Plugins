@@ -67,7 +67,8 @@ class TorrentRemoverRuff(_PluginBase):
     _enabled = False
     _onlyonce = False
     _downloaders = []
-
+    _scheduler: Optional[BackgroundScheduler] = None
+    
     def init_plugin(self, config: Optional[dict] = None):
         if config:
             self._enabled: bool = config.get("enabled", False)
