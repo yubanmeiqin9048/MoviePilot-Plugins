@@ -111,7 +111,7 @@ class TorrentRemoverRuff(_PluginBase):
             self._strategy_action: Literal["old_seeds", "small_seeds", "inactive_seeds"] = config.get(
                 "strategy_action", "old_seeds"
             )
-            self._complateonly: bool = config.get("only_complate", False)
+            self._complateonly: bool = config.get("complateonly", False)
         self.stop_service()
 
         if self.get_state() or self._onlyonce:
