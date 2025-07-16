@@ -111,6 +111,7 @@ class TorrentRemoverRuff(_PluginBase):
             self._strategy_action: Literal["old_seeds", "small_seeds", "inactive_seeds"] = config.get(
                 "strategy_action", "old_seeds"
             )
+            self._complateonly: bool = config.get("only_complate", False)
         self.stop_service()
 
         if self.get_state() or self._onlyonce:
@@ -151,6 +152,7 @@ class TorrentRemoverRuff(_PluginBase):
                         "strategy_value": self._strategy_value,
                         "strategy_action": self._strategy_action,
                         "remove_mode": self._remove_mode,
+                        "complateonly": self._complateonly,
                     }
                 )
                 if self._scheduler and self._scheduler.get_jobs():
@@ -265,6 +267,19 @@ class TorrentRemoverRuff(_PluginBase):
                                         "props": {
                                             "model": "mponly",
                                             "label": "仅MoviePilot任务",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "complateonly",
+                                            "label": "仅已完成的种子",
                                         },
                                     }
                                 ],
@@ -718,6 +733,7 @@ class TorrentRemoverRuff(_PluginBase):
             "strategy_value": 0.0,
             "remove_mode": "condition",
             "freespace_detect_path": "",
+            "complateonly": False,
         }
 
     def get_page(self) -> list[dict]:  # type: ignore
@@ -801,7 +817,7 @@ class TorrentRemoverRuff(_PluginBase):
 
     def _handle_action(self, downloader: str, downlader_obj: Qbittorrent | Transmission, torrents: set[TorrentInfo]):
         if self._action == "pause":
-            message_text = f"{downloader.title()} 共暂停{len(torrents)}个种子"
+            message_text = f"{downloader.title()} 共暂停 {len(torrents)} 个种子"
             for torrent in torrents:
                 if self._event.is_set():
                     logger.info("自动删种服务停止")
@@ -812,7 +828,7 @@ class TorrentRemoverRuff(_PluginBase):
                 message_text = f"{message_text}\n{text_item}"
             return message_text
         elif self._action == "delete":
-            message_text = f"{downloader.title()} 共删除{len(torrents)}个种子"
+            message_text = f"{downloader.title()} 共删除 {len(torrents)} 个种子"
             for torrent in torrents:
                 if self._event.is_set():
                     logger.info("自动删种服务停止")
@@ -823,7 +839,7 @@ class TorrentRemoverRuff(_PluginBase):
                 message_text = f"{message_text}\n{text_item}"
             return message_text
         elif self._action == "deletefile":
-            message_text = f"{downloader.title()} 共删除{len(torrents)}个种子及文件"
+            message_text = f"{downloader.title()} 共删除 {len(torrents)} 个种子及文件"
             for torrent in torrents:
                 if self._event.is_set():
                     logger.info("自动删种服务停止")
@@ -996,17 +1012,21 @@ class TorrentRemoverRuff(_PluginBase):
         if self._mponly:
             tags.append(settings.TORRENT_TAG)
         # 查询种子
-        torrents, error_flag = downloader_obj.get_torrents(tags=tags or None)
+        if self._complateonly:
+            torrents = downloader_obj.get_completed_torrents(tags=tags or None)
+            error_flag = torrents is not None
+        else:
+            torrents, error_flag = downloader_obj.get_torrents(tags=tags or None)
         if error_flag:
             return set()
         if self._remove_mode == "condition":
-            return self._get_remove_torrents_by_condition(torrents)
+            return self._get_remove_torrents_by_condition(cast(list, torrents))
         elif self._remove_mode == "strategy":
-            return self._get_remove_torrents_by_strategy(torrents)
+            return self._get_remove_torrents_by_strategy(cast(list, torrents))
         else:
             raise ValueError(f"未知删种模式 {self._remove_mode}")
 
-    def _get_remove_torrents_by_condition(self, torrents) -> set[TorrentInfo]:
+    def _get_remove_torrents_by_condition(self, torrents: list[Torrent] | list[TorrentDictionary]) -> set[TorrentInfo]:
         group_map: defaultdict[tuple[str, int], set[TorrentInfo]] = defaultdict(set)
         remove_torrents: set[TorrentInfo] = set()
         remove_keys: set[tuple[str, int]] = set()
@@ -1024,7 +1044,9 @@ class TorrentRemoverRuff(_PluginBase):
                 remove_torrents.update(group_map[key])
         return remove_torrents
 
-    def _get_sorted_torrents(self, torrents: list) -> list:
+    def _get_sorted_torrents(
+        self, torrents: list[Torrent] | list[TorrentDictionary]
+    ) -> list[Torrent | TorrentDictionary]:
         """获取排序后的种子列表"""
         if self._strategy_action == "inactive_seeds":
             return self.inactive_seeds(torrents)
@@ -1033,9 +1055,9 @@ class TorrentRemoverRuff(_PluginBase):
         elif self._strategy_action == "small_seeds":
             return self.small_seeds(torrents)
         else:
-            raise ValueError(f"未知策略动作{self._strategy_action}")
+            raise ValueError(f"未知策略动作 {self._strategy_action}")
 
-    def _get_remove_torrents_by_strategy(self, torrents: list) -> set[TorrentInfo]:
+    def _get_remove_torrents_by_strategy(self, torrents: list[Torrent] | list[TorrentDictionary]) -> set[TorrentInfo]:
         sorted_torrents = self._get_sorted_torrents(torrents)
         if self._strategy == "freespace":
             return self._remove_by_freespace(sorted_torrents)
@@ -1046,7 +1068,7 @@ class TorrentRemoverRuff(_PluginBase):
         else:
             raise ValueError(f"未知策略{self._strategy}")
 
-    def _remove_by_freespace(self, sorted_torrents: list) -> set[TorrentInfo]:
+    def _remove_by_freespace(self, sorted_torrents: list[Torrent | TorrentDictionary]) -> set[TorrentInfo]:
         """限制最小磁盘容量策略"""
         group_map: defaultdict[tuple[str, int], set[TorrentInfo]] = defaultdict(set)
         remove_torrents: set[TorrentInfo] = set()
@@ -1075,7 +1097,7 @@ class TorrentRemoverRuff(_PluginBase):
                 remove_torrents.update(group_map[key])
         return remove_torrents
 
-    def _remove_by_maximum_count(self, sorted_torrents: list) -> set[TorrentInfo]:
+    def _remove_by_maximum_count(self, sorted_torrents: list[Torrent | TorrentDictionary]) -> set[TorrentInfo]:
         """限制最大种子数量策略"""
         group_map: defaultdict[tuple[str, int], set[TorrentInfo]] = defaultdict(set)
         remove_torrents: set[TorrentInfo] = set()
@@ -1102,7 +1124,7 @@ class TorrentRemoverRuff(_PluginBase):
                 remove_torrents.update(group_map[key])
         return remove_torrents
 
-    def _remove_by_maximum_size(self, sorted_torrents: list) -> set[TorrentInfo]:
+    def _remove_by_maximum_size(self, sorted_torrents: list[Torrent | TorrentDictionary]) -> set[TorrentInfo]:
         """限制最大种子总大小策略"""
         group_map: defaultdict[tuple[str, int], set[TorrentInfo]] = defaultdict(set)
         remove_torrents: set[TorrentInfo] = set()
