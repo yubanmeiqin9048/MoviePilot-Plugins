@@ -885,7 +885,7 @@ class TorrentRemoverRuff(_PluginBase):
             self._event_queue.append(size)
             logger.info(
                 f"自动删种事件触发，新任务大小 "
-                f"{StringUtils.str_filesize(size)} 已加入队列。"
+                f"{size} 字节，已加入队列。"
                 f"当前队列长度: {len(self._event_queue)}"
             )
         with self._debounce_lock:
@@ -910,7 +910,7 @@ class TorrentRemoverRuff(_PluginBase):
                 return
             total_size_offset = sum(self._event_queue)
             self._event_queue.clear()
-            logger.info(f"开始处理累积的删种事件，新增总大小: {StringUtils.str_filesize(total_size_offset)}")
+            logger.info(f"开始处理累积的删种事件，新增总大小: {total_size_offset} 字节")
 
         self.delete_torrents(size_offset_bytes=total_size_offset)
 
