@@ -62,7 +62,7 @@ class TorrentRemoverRuff(_PluginBase):
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "2.4"
+    plugin_version = "2.5"
     # 插件作者
     plugin_author = "jxxghp,yubanmeiqin9048"
     # 作者主页
@@ -167,7 +167,7 @@ class TorrentRemoverRuff(_PluginBase):
         if self.get_state():
             return [
                 {
-                    "id": "TorrentRemover",
+                    "id": "TorrentRemoverRuff",
                     "name": "自动删种服务",
                     "trigger": CronTrigger.from_crontab(self._cron),
                     "func": self.delete_torrents,
