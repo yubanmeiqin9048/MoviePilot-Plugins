@@ -1,5 +1,5 @@
 from asyncio import to_thread
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from app import schemas
 from app.helper.downloader import DownloaderHelper
@@ -40,7 +40,7 @@ class DownloaderApi(_PluginBase):
     _downloader = None
     _save_path = None
 
-    def init_plugin(self, config: Optional[dict] = None):
+    def init_plugin(self, config: dict | None = None):
         self.downloader_helper = DownloaderHelper()
         self.torrent_helper = TorrentHelper()
         if not config:
@@ -57,10 +57,10 @@ class DownloaderApi(_PluginBase):
         return self._enabled
 
     @staticmethod
-    def get_command() -> List[Dict[str, Any]]:  # type: ignore
+    def get_command() -> list[dict[str, Any]]:  # type: ignore
         pass
 
-    def get_api(self) -> List[Dict[str, Any]]:
+    def get_api(self) -> list[dict[str, Any]]:
         return [
             {
                 "path": "/download_torrent_notest",
@@ -71,10 +71,10 @@ class DownloaderApi(_PluginBase):
             }
         ]
 
-    def get_page(self) -> List[dict]:  # type: ignore
+    def get_page(self) -> list[dict]:  # type: ignore
         pass
 
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+    def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
@@ -166,34 +166,32 @@ class DownloaderApi(_PluginBase):
         try:
             if not self.downloader:
                 return schemas.Response(success=False, message="未配置下载器")
+            if isinstance(self.downloader, Transmission):
+                return schemas.Response(success=False, message="暂不支持TR下载器")
             downloader = self.downloader
             # 添加下载
             tag = StringUtils.generate_random_str(10)
-            file_path, content, _, _, _ = await to_thread(
-                self.torrent_helper.download_torrent, torrent_url
-            )
+            file_path, content, _, _, _ = await to_thread(self.torrent_helper.download_torrent, torrent_url)
             state = (
-                downloader.add_torrent(
-                    content=content, download_dir=self._save_path, tag=tag
-                )
+                downloader.add_torrent(content=content, download_dir=self._save_path, tag=tag)
                 if content and file_path
                 else None
             )
             torrent_hash = downloader.get_torrent_id_by_tag(tag)
-
             if not state:
                 return schemas.Response(success=False, message="种子添加下载失败")
-            else:
-                self.eventmanager.send_event(
-                    EventType.PluginAction,
-                    {"action": "downloaderapi_add", "hash": f"{torrent_hash}"},
-                )
-                return schemas.Response(success=True, message="下载成功")
+            torrents, success = downloader.get_torrents(torrent_hash)
+            size = torrents[0].size if success else 0
+            self.eventmanager.send_event(
+                EventType.PluginAction,
+                {"action": "downloaderapi_add", "hash": f"{torrent_hash}", "size": size},
+            )
+            return schemas.Response(success=True, message="下载成功")
         except Exception as e:
             return schemas.Response(success=False, message=f"调用失败，原因：{e}")
 
     @property
-    def service_info(self) -> Optional[ServiceInfo]:
+    def service_info(self) -> ServiceInfo | None:
         """
         服务信息
         """
@@ -201,13 +199,13 @@ class DownloaderApi(_PluginBase):
             logger.warning("尚未配置下载器，请检查配置")
             return None
 
-        service = self.downloader_helper.get_service(
-            name=self._downloader, type_filter="qbittorrent"
-        )
+        service = self.downloader_helper.get_service(name=self._downloader, type_filter="qbittorrent")
         if not service:
             logger.warning("获取下载器实例失败，请检查配置")
             return None
-
+        if not service.instance:
+            logger.warning("下载器实例为空，请检查配置")
+            return None
         if service.instance.is_inactive():
             logger.warning(f"下载器 {self._downloader} 未连接，请检查配置")
             return None
@@ -215,7 +213,7 @@ class DownloaderApi(_PluginBase):
         return service
 
     @property
-    def downloader(self) -> Optional[Union[Qbittorrent, Transmission]]:
+    def downloader(self) -> Qbittorrent | Transmission | None:
         """
         下载器实例
         """

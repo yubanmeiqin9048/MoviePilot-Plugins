@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from datetime import datetime, timedelta
-from typing import Any, Literal, Optional, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -39,11 +39,11 @@ class TorrentInfo(BaseModel):
     need_delete: bool
     path: str
     trackers: list[str]
-    state: Optional[str]
-    category: Optional[str]
+    state: str | None
+    category: str | None
     site: str
     name: str
-    error_string: Optional[str]
+    error_string: str | None
 
     def __hash__(self):
         return hash((self.id, self.name, self.site, self.size))
@@ -82,15 +82,15 @@ class TorrentRemoverRuff(_PluginBase):
         self._enabled = False
         self._onlyonce = False
         self._downloaders = []
-        self._scheduler: Optional[BackgroundScheduler] = None
+        self._scheduler: BackgroundScheduler | None = None
         self._event_queue = []
         self._queue_lock = threading.Lock()
-        self._debounce_timer: Optional[threading.Timer] = None
+        self._debounce_timer: threading.Timer | None = None
         self._debounce_lock = threading.Lock()
         self._delete_torrent_lock = threading.Lock()
         self._DEBOUNCE_DELAY = 5
 
-    def init_plugin(self, config: Optional[dict] = None):
+    def init_plugin(self, config: dict | None = None):
         if config:
             self._enabled: bool = config.get("enabled", False)
             self._onlyonce: bool = config.get("onlyonce", False)
@@ -829,7 +829,7 @@ class TorrentRemoverRuff(_PluginBase):
         )
 
     @property
-    def service_infos(self) -> Optional[dict[str, ServiceInfo]]:
+    def service_infos(self) -> dict[str, ServiceInfo] | None:
         """
         服务信息
         """
