@@ -1205,7 +1205,7 @@ class TorrentRemoverRuff(_PluginBase):
     def _remove_by_freespace(self, sorted_torrents: list[TorrentType], size_offset_bytes: int = 0) -> set[TorrentInfo]:
         """限制最小磁盘容量策略"""
         try:
-            free_bytes = shutil.disk_usage(self._freespace_detect_path).free / (1024**3)  # 单位GB
+            free_bytes = shutil.disk_usage(self._freespace_detect_path).free
         except FileNotFoundError:
             logger.error(f"容量检测路径 {self._freespace_detect_path} 不存在，跳过删种")
             return set()
