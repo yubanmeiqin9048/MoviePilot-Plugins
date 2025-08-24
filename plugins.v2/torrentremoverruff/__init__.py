@@ -874,7 +874,7 @@ class TorrentRemoverRuff(_PluginBase):
 
     @eventmanager.register(EventType.DownloadAdded)
     def process_inner(self, event):
-        torrent_size = event.event_data["context"]["torrent_info"].size
+        torrent_size = event.event_data["context"].torrent_info.size
         self.immidiate_delete(torrent_size)
 
     def immidiate_delete(self, size: int):
