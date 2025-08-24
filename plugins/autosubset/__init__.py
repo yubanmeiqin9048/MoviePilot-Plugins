@@ -2,10 +2,12 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Literal
 
-from app.core.event import Event, eventmanager
+from app.core.config import settings
+from app.core.event import eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
@@ -32,32 +34,21 @@ class AutoSubset(_PluginBase):
     # 可使用的用户级别
     auth_level = 1
 
-    # 私有属性
-    _enabled = False
-    _afpath = None
-    _version = None
-    _fontpath = None
-    _binaryname = None
-    _overwrite = False
-    _fontrename = False
-    _hdrluminance = False
-    _sethdrluminance = False
-    _deletesubfontfolder = False
+    def __init__(self):
+        super().__init__()
+        self._enabled = False
 
-    def init_plugin(self, config: dict = None):
+    def init_plugin(self, config: dict | None = None):
         if config:
-            self._enabled = config.get("enabled")
-            self._fontpath = config.get("fontpath")
-            self._overwrite = config.get("overwrite")
-            self._fontrename = config.get("fontrename")
-            self._hdrluminance = config.get("hdrluminance")
-            self._deletesubfontfolder = config.get("deletesubfontfolder")
+            self._enabled: bool = config.get("enabled", False)
+            self._fontpath: str = config.get("fontpath", "")
+            self._overwrite: bool = config.get("overwrite", False)
+            self._fontrename: bool = config.get("fontrename", False)
+            self._hdrluminance: bool = config.get("hdrluminance", False)
+            self._deletesubfontfolder: bool = config.get("deletesubfontfolder", False)
             self._afpath = self.get_data_path()
             self._binaryname = "assfonts"
-            if (
-                not Path(self._fontpath).exists()
-                or not Path(f"{self._afpath}/{self._binaryname}").exists()
-            ):
+            if not Path(self._fontpath).exists() or not Path(f"{self._afpath}/{self._binaryname}").exists():
                 self._enabled = False
                 self.__update_config()
                 logger.error("未配置字体库或assfonts可执行版本不存在，插件退出")
@@ -69,16 +60,16 @@ class AutoSubset(_PluginBase):
         return self._enabled
 
     @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def get_command() -> list[dict[str, Any]]:  # type: ignore
         pass
 
-    def get_api(self) -> List[Dict[str, Any]]:
+    def get_api(self) -> list[dict[str, Any]]:  # type: ignore
         pass
 
-    def get_page(self) -> List[dict]:
+    def get_page(self) -> list[dict]:  # type: ignore
         pass
 
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+    def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
@@ -236,9 +227,7 @@ class AutoSubset(_PluginBase):
         )
 
     def __init_assfonts(self):
-        os.popen(
-            f"cd {self._afpath} && ./{self._binaryname} -b -f {self._fontpath} -d {self._fontpath}"
-        )
+        os.popen(f"cd {self._afpath} && ./{self._binaryname} -b -f {self._fontpath} -d {self._fontpath}")  # noqa: S605
 
     def __get_version(self):
         if Path(f"{self._afpath}/{self._binaryname}").exists():
@@ -249,31 +238,19 @@ class AutoSubset(_PluginBase):
 
     def __process_ass(self, ass_file: Path):
         try:
-            cmd = self.__build_af_command()
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-
+            cmd = self.__build_af_command(ass_file)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)  # noqa: PLW1510, S603
             if self.__check_errors(result.stdout):
                 return False
-
             if self._deletesubfontfolder:
-                shutil.rmtree(
-                    ass_file.parent / f"{ass_file.stem}_subsetted", ignore_errors=True
-                )
-
+                shutil.rmtree(ass_file.parent / f"{ass_file.stem}_subsetted", ignore_errors=True)
             if self._fontrename:
-                (ass_file.parent / f"{ass_file.stem}.rename.ass").unlink(
-                    missing_ok=True
-                )
-
+                (ass_file.parent / f"{ass_file.stem}.rename.ass").unlink(missing_ok=True)
             if self._overwrite:
-                new_file = ass_file.with_name(
-                    f"{ass_file.stem}{'.rename' if self._fontrename else ''}.assfonts.ass"
-                )
+                new_file = ass_file.with_name(f"{ass_file.stem}{'.rename' if self._fontrename else ''}.assfonts.ass")
                 if new_file.exists():
                     new_file.replace(ass_file)
-
             return True
-
         except Exception as e:
             logger.error(f"处理 {ass_file.name} 失败: {e}")
             return False
@@ -290,7 +267,11 @@ class AutoSubset(_PluginBase):
             return False
         return True
 
-    def __build_af_command(self, input_ass: Path) -> List[str]:
+    @property
+    def mp_version(self) -> Literal["v1", "v2"]:
+        return "v2" if hasattr(settings, "VERSION_FLAG") else "v1"
+
+    def __build_af_command(self, input_ass: Path) -> list[str]:
         af_command = [
             f"{self._afpath}/{self._binaryname}",
             "-i",
@@ -305,16 +286,17 @@ class AutoSubset(_PluginBase):
         return af_command
 
     @eventmanager.register(EventType.TransferComplete)
-    def task_in(self, event: Event):
-        target = Path(event.event_data["transferinfo"].target_path)
-        self._sethdrluminance = (
-            "hdr" in event.event_data["meta"].edition and self._hdrluminance
+    def task_in(self, event):
+        iter_ass: Iterable[Path] = (
+            Path(event.event_data["transferinfo"].target_path).parent.glob("**/*.ass")
+            if self.mp_version == "v1"
+            else [Path(sub) for sub in event.event_data["transferinfo"].subtitle_list_new]
         )
+        self._sethdrluminance = "hdr" in event.event_data["meta"].edition and self._hdrluminance
         self.__init_assfonts()
-        for ass in target.parent.glob("**/*.ass"):
-            if ".assfonts." in ass.name:
+        for ass in iter_ass:
+            if ass.suffix != ".ass":
                 continue
-
             if self.__process_ass(ass):
                 logger.info(f"{ass.name} 处理成功")
             else:
