@@ -25,11 +25,12 @@
     "name": "下载器API",
     "description": "外部调用API直接下载，不识别。",
     "labels": "下载",
-    "version": "1.3.1",
+    "version": "1.3.2",
     "icon": "sync_file.png",
     "author": "yubanmeiqin9048",
     "level": 2,
     "history": {
+      "v1.3.2": "修复size获取错误",
       "v1.3.1": "广播事件增加size",
       "v1.3": "直接异步调用API",
       "v1.2.1": "修复下载目录未应用的问题",

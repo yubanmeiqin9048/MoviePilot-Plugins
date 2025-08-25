@@ -22,7 +22,7 @@ class DownloaderApi(_PluginBase):
     # 插件图标
     plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -180,11 +180,11 @@ class DownloaderApi(_PluginBase):
             torrent_hash = downloader.get_torrent_id_by_tag(tag)
             if not state:
                 return schemas.Response(success=False, message="种子添加下载失败")
-            torrents, success = downloader.get_torrents(torrent_hash)
-            size = torrents[0].size if success else 0
+            torrents, error = downloader.get_torrents(torrent_hash)
+            size = torrents[0].size if not error else 0
             self.eventmanager.send_event(
                 EventType.PluginAction,
-                {"action": "downloaderapi_add", "hash": f"{torrent_hash}", "size": size},
+                {"action": "downloaderapi_add", "hash": torrent_hash, "size": size},
             )
             return schemas.Response(success=True, message="下载成功")
         except Exception as e:
