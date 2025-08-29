@@ -45,11 +45,12 @@
     "name": "自动删种(ruff版)",
     "description": "自动删除下载器中的下载任务。",
     "labels": "做种",
-    "version": "2.6",
+    "version": "2.6.1",
     "icon": "delete.jpg",
     "author": "jxxghp,yubanmeiqin9048",
     "level": 2,
     "history": {
+      "v2.6.1": "修复预筛选功能失效问题",
       "v2.6": "策略删种模式可应用条件删种进行过滤",
       "v2.5": "增加防抖机制和新配置选项，优化种子删除逻辑",
       "v2.4": "支持仅已完成种子",
