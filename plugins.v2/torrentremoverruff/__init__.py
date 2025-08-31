@@ -46,12 +46,31 @@ class TorrentInfo(BaseModel):
     error_string: str | None
 
     def __hash__(self):
-        return hash(self)
+        return hash(
+            (
+                self.is_qb,
+                self.id,
+                self.date_done,
+                self.torrent_seeding_time,
+                self.uploaded,
+                self.size,
+                self.ratio,
+                self.upspeed,
+                self.path,
+                tuple(self.trackers),
+                self.state,
+                self.category,
+                self.site,
+                self.name,
+                self.error_string,
+            )
+        )
 
     def __eq__(self, other):
         if not isinstance(other, TorrentInfo):
             return False
         return hash(self) == hash(other)
+
 
 class TorrentRemoverRuff(_PluginBase):
     # 插件名称
@@ -61,7 +80,7 @@ class TorrentRemoverRuff(_PluginBase):
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "2.6.2"
+    plugin_version = "2.6.3"
     # 插件作者
     plugin_author = "jxxghp,yubanmeiqin9048"
     # 作者主页
@@ -894,15 +913,13 @@ class TorrentRemoverRuff(_PluginBase):
     def process_outter(self, event):
         if event.event_data.get("action") != "downloaderapi_add":
             return
-        torrent_size = event.event_data.get("size")
-        self.immidiate_delete(torrent_size)
+        self.immidiate_delete()
 
     @eventmanager.register(EventType.DownloadAdded)
     def process_inner(self, event):
-        torrent_size = event.event_data["context"].torrent_info.size
-        self.immidiate_delete(torrent_size)
+        self.immidiate_delete()
 
-    def immidiate_delete(self, size: int):
+    def immidiate_delete(self):
         """
         添加防抖机制的即时删种处理
         """
