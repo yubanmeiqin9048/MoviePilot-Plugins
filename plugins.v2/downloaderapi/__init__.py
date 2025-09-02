@@ -22,7 +22,7 @@ class DownloaderApi(_PluginBase):
     # 插件图标
     plugin_icon = "sync_file.png"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -168,19 +168,15 @@ class DownloaderApi(_PluginBase):
                 return schemas.Response(success=False, message="未配置下载器")
             if isinstance(self.downloader, Transmission):
                 return schemas.Response(success=False, message="暂不支持TR下载器")
-            downloader = self.downloader
             # 添加下载
             tag = StringUtils.generate_random_str(10)
-            file_path, content, _, _, _ = await to_thread(self.torrent_helper.download_torrent, torrent_url)
-            state = (
-                downloader.add_torrent(content=content, download_dir=self._save_path, tag=tag)
-                if content and file_path
-                else None
+            state = await to_thread(
+                self.downloader.add_torrent, content=torrent_url, download_dir=self._save_path, tag=tag
             )
-            torrent_hash = downloader.get_torrent_id_by_tag(tag)
+            torrent_hash = await to_thread(self.downloader.get_torrent_id_by_tag, tag)
             if not state:
                 return schemas.Response(success=False, message="种子添加下载失败")
-            torrents, error = downloader.get_torrents(torrent_hash)
+            torrents, error = await to_thread(self.downloader.get_torrents, torrent_hash)
             size = torrents[0].size if not error else 0
             self.eventmanager.send_event(
                 EventType.PluginAction,
