@@ -1,17 +1,17 @@
-import os
+import time
 import traceback
 import zipfile
-from asyncio import gather, run, sleep, to_thread
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import py7zr
 import rarfile
-from app.core.event import Event, eventmanager
+from qbittorrentapi import TorrentFilesList
+
+from app.core.event import eventmanager
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.modules.qbittorrent.qbittorrent import Qbittorrent
-from app.modules.transmission.transmission import Transmission
 from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType
@@ -25,7 +25,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.7.1"
+    plugin_version = "1.8"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -37,18 +37,17 @@ class FontCollect(_PluginBase):
     # 可使用的用户级别
     auth_level = 2
 
-    # 私有属性
-    _enabled = False
-    _fontpath = ""
-    _downloader = None
-
-    def init_plugin(self, config: dict = None):
+    def __init__(self):
+        super().__init__()
+        self._enabled = False
+        self._downloader = ""
         self.downloader_helper = DownloaderHelper()
-        self._downloader = config.get("downloader", None)
-        if config:
-            self._enabled = config.get("enabled")
-            self._fontpath = config.get("fontpath")
 
+    def init_plugin(self, config: dict | None = None):
+        if config:
+            self._downloader: str = config.get("downloader", "") or ""
+            self._enabled = config.get("enabled", False)
+            self._fontpath = config.get("fontpath", "") or ""
             if not Path(self._fontpath).exists() or not self.downloader:
                 logger.error("未配置字体库路径或下载器，插件退出")
                 self._enabled = False
@@ -58,16 +57,16 @@ class FontCollect(_PluginBase):
         return self._enabled
 
     @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def get_command() -> list[dict[str, Any]]:  # type: ignore
         pass
 
-    def get_api(self) -> List[Dict[str, Any]]:
+    def get_api(self) -> list[dict[str, Any]]:  # type: ignore
         pass
 
-    def get_page(self) -> List[dict]:
+    def get_page(self) -> list[dict]:  # type: ignore
         pass
 
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+    def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
@@ -152,26 +151,26 @@ class FontCollect(_PluginBase):
         """
         pass
 
-    async def __wait_for_files_completion(self, torrent_hash: str, file_ids: List[int]):
+    def __wait_for_files_completion(self, torrent_hash: str, file_ids: list[str]):
         """
         长轮询等待文件下载完成
         """
         logger.info(f"开始等待{torrent_hash}")
         while True:
             try:
-                files = await to_thread(self.downloader.get_files, torrent_hash)
+                files = self.downloader.get_files(torrent_hash)
+                if not files:  # 获取文件列表失败
+                    raise RuntimeError(f"获取 {torrent_hash} 文件列表失败")
                 all_completed = all(
-                    file["priority"] == 1 and file["progress"] == 1
-                    for file in files
-                    if file["id"] in file_ids
+                    file["priority"] == 1 and file["progress"] == 1 for file in files if file["id"] in file_ids
                 )
                 if all_completed:
                     logger.info(f"{torrent_hash} 字体包下载完成")
-                    await sleep(5)
+                    time.sleep(5)
                     break
-                await sleep(5)  # 每隔5秒检查一次
+                time.sleep(5)  # 每隔5秒检查一次
             except Exception as e:
-                raise RuntimeError(f"等待 {torrent_hash} 下载失败: {e}")
+                raise RuntimeError(f"等待 {torrent_hash} 下载失败: {e}") from e
 
     def __extract_zip(self, file_path: Path, output_dir: Path):
         with zipfile.ZipFile(file_path, "r") as zip_ref:
@@ -185,132 +184,77 @@ class FontCollect(_PluginBase):
         with py7zr.SevenZipFile(file_path, mode="r") as z_ref:
             z_ref.extractall(path=output_dir)
 
-    async def __unzip_single_file(self, file_path: Path, output_dir: Path):
+    def __unzip_single_file(self, file_path: Path, output_dir: Path):
         try:
-            if not output_dir.exists():
-                await to_thread(output_dir.mkdir(parents=True, exist_ok=True))
-
+            output_dir.mkdir(parents=True, exist_ok=True)
             if file_path.suffix == ".zip":
-                await to_thread(self.__extract_zip, file_path, output_dir)
+                self.__extract_zip(file_path, output_dir)
             elif file_path.suffix == ".7z":
-                await to_thread(self.__extract_7z, file_path, output_dir)
+                self.__extract_7z(file_path, output_dir)
             elif file_path.suffix == ".rar":
-                await to_thread(self.__extract_rar, file_path, output_dir)
+                self.__extract_rar(file_path, output_dir)
             else:
                 logger.error(f"不支持的压缩文件类型: {file_path.suffix}")
-
             logger.info(f"解压 {file_path} 到 {output_dir} 成功")
         except Exception as e:
             logger.error(f"解压 {file_path} 失败，原因: {e}")
 
-    async def unzip_font_files(
+    def unzip_font_files(
         self,
-        torrent_files: List[Dict[str, Any]],
-        font_file_ids: List[int],
+        torrent_files: TorrentFilesList,
+        font_file_ids: list[str],
         save_path: str,
     ):
         """
         解压下载完成的 Font 文件
         """
-        font_files = [file for file in torrent_files if file["id"] in font_file_ids]
-        tasks = []
+        font_files: list[str] = [file.name for file in torrent_files if file.id in font_file_ids]
         for font_file in font_files:
-            file_path = os.path.join(save_path, font_file["name"])
-            tasks.append(
-                self.__unzip_single_file(Path(file_path), Path(self._fontpath))
-            )
-        await gather(*tasks)
+            file_path = Path(save_path) / font_file
+            self.__unzip_single_file(file_path, Path(self._fontpath))
 
-    async def collect(self, torrent_hash: str = None):
+    def collect(self, torrent_hash: str):
         """
         等待字体下载完成并解压
         """
-
-        def __set_torrent_foce_resume_status(torrent_hash: str):
-            """
-            根据需要强制继续
-            """
-            if self.downloader.torrents_set_force_start(torrent_hash):
-                pass
-            else:
-                self.downloader.start_torrents(torrent_hash)
-
-        if not torrent_hash:
-            logger.error("种子hash获取失败")
-            return
         try:
             # 获取根目录
             torrent_info, _ = self.downloader.get_torrents(ids=torrent_hash)
-            save_path = torrent_info[0].get("save_path")
-            # 筛选文件名包含“Font”的文件
-            font_file_ids = []
-            other_file_ids = []
-
+            save_path = torrent_info[0].save_path
             # 获取种子文件
             torrent_files = self.downloader.get_files(torrent_hash)
             if not torrent_files:
                 logger.error("获取种子文件失败，下载任务可能在暂停状态")
                 return
-
-            # 暂停任务
-            self.downloader.stop_torrents(torrent_hash)
-
-            # 获取优先级大于1的文件
-            for torrent_file in torrent_files:
-                file_id = torrent_file.get("id")
-                file_name = torrent_file.get("name")
-                priority = torrent_file.get("priority")
-
-                # 检查优先级条件
-                if priority >= 1 or "Font" in file_name:
-                    # 分类文件
-                    if "Font" in file_name:
-                        font_file_ids.append(file_id)
-                    else:
-                        other_file_ids.append(file_id)
-
+            # 筛选文件名包含"Font"的文件
+            font_file_ids = [torrent_file.id for torrent_file in torrent_files if "Font" in torrent_file.name]
             if not font_file_ids:
-                __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
                 return
-
-            # 设置“Font”文件的优先级为最高
-            self.downloader.set_files(
-                torrent_hash=torrent_hash, file_ids=other_file_ids, priority=0
-            )
-
-            # 恢复任务，只下载“Font”文件
-            __set_torrent_foce_resume_status(torrent_hash=torrent_hash)
-
-            await self.__wait_for_files_completion(torrent_hash, font_file_ids)
-            await self.unzip_font_files(
-                torrent_files=torrent_files,
-                font_file_ids=font_file_ids,
-                save_path=save_path,
-            )
-
-            self.downloader.set_files(
-                torrent_hash=torrent_hash, file_ids=other_file_ids, priority=1
-            )
-
+            # 设置"Font"文件的优先级为最高
+            self.downloader.set_files(torrent_hash=torrent_hash, file_ids=font_file_ids, priority=7)
+            self.__wait_for_files_completion(torrent_hash, font_file_ids)
+            self.unzip_font_files(torrent_files=torrent_files, font_file_ids=font_file_ids, save_path=save_path)
         except Exception as e:
-            logger.debug(
-                f"处理 {torrent_hash} 失败：{str(e)} - {traceback.format_exc()}"
-            )
+            logger.debug(f"处理 {torrent_hash} 失败：{e} - {traceback.format_exc()}")
 
     @eventmanager.register(EventType.DownloadAdded)
-    def process_inner(self, event: Event):
-        torrent_hash = event.event_data.get("hash")
-        run(self.collect(torrent_hash=torrent_hash))
+    def process_inner(self, event):
+        torrent_hash: str | None = event.event_data.get("hash")
+        if not torrent_hash:
+            return
+        self.collect(torrent_hash=torrent_hash)
 
     @eventmanager.register(EventType.PluginAction)
-    def process_outter(self, event: Event):
+    def process_outter(self, event):
         if event.event_data.get("action") != "downloaderapi_add":
             return
-        torrent_hash = event.event_data.get("hash")
-        run(self.collect(torrent_hash=torrent_hash))
+        torrent_hash: str | None = event.event_data.get("hash")
+        if not torrent_hash:
+            return
+        self.collect(torrent_hash=torrent_hash)
 
     @property
-    def service_info(self) -> Optional[ServiceInfo]:
+    def service_info(self) -> ServiceInfo | None:
         """
         服务信息
         """
@@ -318,13 +262,13 @@ class FontCollect(_PluginBase):
             logger.warning("尚未配置下载器，请检查配置")
             return None
 
-        service = self.downloader_helper.get_service(
-            name=self._downloader, type_filter="qbittorrent"
-        )
+        service = self.downloader_helper.get_service(name=self._downloader, type_filter="qbittorrent")
         if not service:
             logger.warning("获取下载器实例失败，请检查配置")
             return None
-
+        if not service.instance:
+            logger.warning("下载器实例为空，请检查配置")
+            return None
         if service.instance.is_inactive():
             logger.warning(f"下载器 {self._downloader} 未连接，请检查配置")
             return None
@@ -332,8 +276,10 @@ class FontCollect(_PluginBase):
         return service
 
     @property
-    def downloader(self) -> Optional[Union[Qbittorrent, Transmission]]:
+    def downloader(self) -> Qbittorrent:
         """
         下载器实例
         """
-        return self.service_info.instance if self.service_info else None
+        if self.service_info and self.service_info.instance:
+            return self.service_info.instance
+        raise Exception("下载器实例为空")
