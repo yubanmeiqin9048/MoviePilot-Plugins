@@ -1077,47 +1077,42 @@ class TorrentRemoverRuff(_PluginBase):
             # QB字段
             is_qb = True
             date_done = torrent.completion_on if torrent.completion_on > 0 else torrent.added_on
-            uploaded = torrent.uploaded
             size = torrent.size
-            ratio = torrent.ratio
+            uploaded = torrent.uploaded
             path = torrent.save_path
             trackers = [
                 str(t["url"]) for t in torrent.trackers if t["url"] not in {"** [LSD] **", "** [PeX] **", "** [DHT] **"}
             ]
-            state = torrent.state
-            category = torrent.category
             site = StringUtils.get_url_sld(str(trackers[0])) if trackers else ""
             hash_id = torrent.hash
-            name = torrent.name
+            state = torrent.state
+            category = torrent.category
             error_string = None
         else:
             # TR字段
             date_done = torrent.date_done or torrent.date_added
             size = torrent.size_when_done
-            ratio = torrent.ratio
-            uploaded = ratio * size
+            uploaded = torrent.uploaded_ever
             path = cast(str, torrent.download_dir)
             trackers = [t.announce for t in torrent.trackers]
             site = torrent.trackers[0].get("sitename") if trackers else ""
-            error_string = torrent.error_string
             hash_id = torrent.hashString
-            name = torrent.name
             state = None
             category = None
-        upspeed = uploaded / torrent_seeding_time if torrent_seeding_time else 0
+            error_string = torrent.error_string
         return TorrentInfo(
             date_done=date_done,
             torrent_seeding_time=torrent_seeding_time,
             size=size,
-            ratio=ratio,
+            ratio=torrent.ratio,
             uploaded=uploaded,
-            upspeed=upspeed,
+            upspeed=uploaded / torrent_seeding_time if torrent_seeding_time else 0,
             path=path,
             trackers=trackers,
             site=site,
             error_string=error_string,
             id=hash_id,
-            name=name,
+            name=torrent.name,
             state=state,
             category=category,
             is_qb=is_qb,
