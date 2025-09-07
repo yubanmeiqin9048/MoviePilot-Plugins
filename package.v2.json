@@ -47,11 +47,12 @@
     "name": "自动删种(ruff版)",
     "description": "自动删除下载器中的下载任务。",
     "labels": "做种",
-    "version": "2.6.4",
+    "version": "2.6.5",
     "icon": "delete.jpg",
     "author": "jxxghp,yubanmeiqin9048",
     "level": 2,
     "history": {
+      "v2.6.5": "修复剩余空间偏移失效",
       "v2.6.4": "重构仅已完成种子实现",
       "v2.6.3": "修复无限递归",
       "v2.6.2": "优化最小剩余空间策略",

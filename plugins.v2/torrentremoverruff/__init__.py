@@ -81,7 +81,7 @@ class TorrentRemoverRuff(_PluginBase):
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "2.6.4"
+    plugin_version = "2.6.5"
     # 插件作者
     plugin_author = "jxxghp,yubanmeiqin9048"
     # 作者主页
@@ -1030,9 +1030,10 @@ class TorrentRemoverRuff(_PluginBase):
 
         return sorted(torrents, key=get_upspeed)
 
+    def __matches_complateonly(self, torrent: TorrentInfo) -> bool:
+        return not (self._complateonly and torrent.progress < 1)
+
     def __matches_remove_condition(self, torrent: TorrentInfo) -> bool:  # noqa: C901
-        if self._complateonly and torrent.progress < 1:
-            return False
         if self._strategy_pre_filter_by_condition or self._remove_mode == "condition":
             connect_type = any if self._connection == "or" else all
             sizes = self._size.split("-") if self._size else []
@@ -1148,7 +1149,7 @@ class TorrentRemoverRuff(_PluginBase):
         remove_keys: set[tuple[str, int]] = set()
         for torrent in torrents:
             item = self.__format_torrent_info(torrent)
-            should_remove = self.__matches_remove_condition(item)
+            should_remove = self.__matches_remove_condition(item) and self.__matches_complateonly(item)
             key = (item.name, item.size)
             if self._samedata:
                 group_map[key].add(item)
@@ -1223,9 +1224,9 @@ class TorrentRemoverRuff(_PluginBase):
             # 计算有效可用空间
             sotred_progress_torrent = sorted(sorted_torrents, key=lambda x: x.progress)
             for progress_torrent in sotred_progress_torrent:
-                if progress_torrent.progress >= 1:
-                    break
                 torrent_info = self.__format_torrent_info(progress_torrent)
+                if torrent_info.progress >= 1:
+                    break
                 if self.__matches_remove_condition(torrent_info):
                     size_offset_bytes += torrent_info.size * (1 - progress_torrent.progress)
         effective_free_bytes = free_bytes - size_offset_bytes
@@ -1239,7 +1240,11 @@ class TorrentRemoverRuff(_PluginBase):
             for torrent in sorted_torrents:
                 torrent_info = self.__format_torrent_info(torrent)
                 item_size_bytes = torrent_info.size
-                should_remove = need_space_bytes > 0 and self.__matches_remove_condition(torrent_info)
+                should_remove = (
+                    need_space_bytes > 0
+                    and self.__matches_remove_condition(torrent_info)
+                    and self.__matches_complateonly(torrent_info)
+                )
                 if should_remove:
                     need_space_bytes -= item_size_bytes
                 should_break = need_space_bytes <= 0 and not self._samedata
@@ -1257,7 +1262,11 @@ class TorrentRemoverRuff(_PluginBase):
             remove_count = current_count - int(self._strategy_value)
             for i, torrent in enumerate(sorted_torrents):
                 torrent_info = self.__format_torrent_info(torrent)
-                should_remove = i < remove_count and self.__matches_remove_condition(torrent_info)
+                should_remove = (
+                    i < remove_count
+                    and self.__matches_remove_condition(torrent_info)
+                    and self.__matches_complateonly(torrent_info)
+                )
                 should_break = i >= remove_count and not self._samedata
                 yield torrent_info, should_remove, should_break
 
@@ -1279,7 +1288,11 @@ class TorrentRemoverRuff(_PluginBase):
                     1024**3
                 )
                 torrent_info = self.__format_torrent_info(torrent)
-                should_remove = need_remove_size_gb > 0 and self.__matches_remove_condition(torrent_info)
+                should_remove = (
+                    need_remove_size_gb > 0
+                    and self.__matches_remove_condition(torrent_info)
+                    and self.__matches_complateonly(torrent_info)
+                )
                 if should_remove:
                     need_remove_size_gb -= item_size_gb
                 should_break = need_remove_size_gb <= 0 and not self._samedata
