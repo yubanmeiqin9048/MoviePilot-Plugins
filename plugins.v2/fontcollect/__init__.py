@@ -25,7 +25,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.8"
+    plugin_version = "1.8.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -41,7 +41,6 @@ class FontCollect(_PluginBase):
         super().__init__()
         self._enabled = False
         self._downloader = ""
-        self.downloader_helper = DownloaderHelper()
 
     def init_plugin(self, config: dict | None = None):
         if config:
@@ -72,7 +71,7 @@ class FontCollect(_PluginBase):
         """
         downloader_options = [
             {"title": config.name, "value": config.name}
-            for config in self.downloader_helper.get_configs().values()
+            for config in DownloaderHelper().get_configs().values()
             if config.type == "qbittorrent"
         ]
         return [
@@ -162,7 +161,7 @@ class FontCollect(_PluginBase):
                 if not files:  # 获取文件列表失败
                     raise RuntimeError(f"获取 {torrent_hash} 文件列表失败")
                 all_completed = all(
-                    file["priority"] == 1 and file["progress"] == 1 for file in files if file["id"] in file_ids
+                    file["progress"] == 1 for file in files if file["id"] in file_ids
                 )
                 if all_completed:
                     logger.info(f"{torrent_hash} 字体包下载完成")
@@ -262,7 +261,7 @@ class FontCollect(_PluginBase):
             logger.warning("尚未配置下载器，请检查配置")
             return None
 
-        service = self.downloader_helper.get_service(name=self._downloader, type_filter="qbittorrent")
+        service = DownloaderHelper().get_service(name=self._downloader, type_filter="qbittorrent")
         if not service:
             logger.warning("获取下载器实例失败，请检查配置")
             return None
