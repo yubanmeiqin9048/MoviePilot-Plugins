@@ -171,10 +171,10 @@ class FontCollect(_PluginBase):
             raise Exception("安装指令完成但仍无法找到 7z 命令")
         except subprocess.CalledProcessError as e:
             logger.error(f"安装失败！错误码: {e.returncode}, 错误输出: {e.stderr}")
-            return False
+            raise e
         except Exception as e:
             logger.error(f"初始化插件依赖时发生未知错误: {e}")
-            return False
+            raise e
 
     def __wait_for_files_completion(self, torrent_hash: str, file_ids: list[str]):
         """
