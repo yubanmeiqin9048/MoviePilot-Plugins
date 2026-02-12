@@ -1,13 +1,12 @@
+import shutil
+import subprocess
 import time
 import traceback
 import zipfile
 from pathlib import Path
 from typing import Any
 
-import py7zr
 import rarfile
-from qbittorrentapi import TorrentFilesList
-
 from app.core.event import eventmanager
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
@@ -15,6 +14,7 @@ from app.modules.qbittorrent.qbittorrent import Qbittorrent
 from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType
+from qbittorrentapi import TorrentFilesList
 
 
 class FontCollect(_PluginBase):
@@ -25,7 +25,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.8.1"
+    plugin_version = "1.9"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -47,8 +47,8 @@ class FontCollect(_PluginBase):
             self._downloader: str = config.get("downloader", "") or ""
             self._enabled = config.get("enabled", False)
             self._fontpath = config.get("fontpath", "") or ""
-            if not Path(self._fontpath).exists() or not self.downloader:
-                logger.error("未配置字体库路径或下载器，插件退出")
+            if not Path(self._fontpath).exists() or not self.downloader or not self.ensure_7z_installed():
+                logger.error("未配置字体库路径、下载器或7z安装失败，插件退出")
                 self._enabled = False
                 self.__update_config()
 
@@ -150,6 +150,32 @@ class FontCollect(_PluginBase):
         """
         pass
 
+    def ensure_7z_installed(self):
+        """
+        检查系统是否存在 7z 命令，如果不存在则尝试通过 apt 安装
+        """
+        # 1. 检测 7z 是否已经在系统路径中
+        if shutil.which("7z"):
+            return True
+        logger.warn("未检测到 7z，尝试自动安装 p7zip-full...")
+        try:
+            if not Path("/usr/bin/apt-get").exists():
+                raise Exception("系统中未找到 apt-get 命令")
+            subprocess.run(["/usr/bin/apt-get", "update"], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["/usr/bin/apt-get", "install", "-y", "p7zip-full"], check=True, capture_output=True, text=True
+            )
+            if shutil.which("7z"):
+                logger.info("p7zip-full 安装成功！")
+                return True
+            raise Exception("安装指令完成但仍无法找到 7z 命令")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"安装失败！错误码: {e.returncode}, 错误输出: {e.stderr}")
+            return False
+        except Exception as e:
+            logger.error(f"初始化插件依赖时发生未知错误: {e}")
+            return False
+
     def __wait_for_files_completion(self, torrent_hash: str, file_ids: list[str]):
         """
         长轮询等待文件下载完成
@@ -160,9 +186,7 @@ class FontCollect(_PluginBase):
                 files = self.downloader.get_files(torrent_hash)
                 if not files:  # 获取文件列表失败
                     raise RuntimeError(f"获取 {torrent_hash} 文件列表失败")
-                all_completed = all(
-                    file["progress"] == 1 for file in files if file["id"] in file_ids
-                )
+                all_completed = all(file["progress"] == 1 for file in files if file["id"] in file_ids)
                 if all_completed:
                     logger.info(f"{torrent_hash} 字体包下载完成")
                     time.sleep(5)
@@ -180,8 +204,8 @@ class FontCollect(_PluginBase):
             rar_ref.extractall(output_dir)
 
     def __extract_7z(self, file_path: Path, output_dir: Path):
-        with py7zr.SevenZipFile(file_path, mode="r") as z_ref:
-            z_ref.extractall(path=output_dir)
+        self.ensure_7z_installed()
+        subprocess.run(["/usr/bin/7z", "x", file_path, f"-o{output_dir}", "-y"], check=True)  # noqa: S603
 
     def __unzip_single_file(self, file_path: Path, output_dir: Path):
         try:
