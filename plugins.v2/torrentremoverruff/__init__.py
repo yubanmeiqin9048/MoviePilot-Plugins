@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from datetime import datetime, timedelta
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, cast
 
 import pytz
 from app.core.config import settings
@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from qbittorrentapi import TorrentDictionary
 from transmission_rpc import Torrent
 
-TorrentType = TypeVar("TorrentType", Torrent, TorrentDictionary)
+TorrentType = Torrent | TorrentDictionary
 
 
 class TorrentInfo(BaseModel):
@@ -80,7 +80,7 @@ class TorrentRemoverRuff(_PluginBase):
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "2.6.5"
+    plugin_version = "2.6.6"
     # 插件作者
     plugin_author = "jxxghp,yubanmeiqin9048"
     # 作者主页
@@ -170,7 +170,7 @@ class TorrentRemoverRuff(_PluginBase):
     def get_api(self) -> list[dict[str, Any]]:  # type: ignore
         pass
 
-    def get_service(self) -> list[dict[str, Any]]:  # type: ignore
+    def get_service(self) -> list[dict[str, Any]]:
         """
         注册插件公共服务
         [{
@@ -1021,7 +1021,9 @@ class TorrentRemoverRuff(_PluginBase):
                 logger.info("自动删种服务停止")
                 break
             text_item = f"{torrent.name} 来自站点：{torrent.site} 大小：{StringUtils.str_filesize(torrent.size)}"
-            action_config["method"](ids=[torrent.id], **action_config["kwargs"])
+            action_method = cast(Callable[..., bool], action_config["method"])
+            action_kwargs = cast(dict[str, Any], action_config["kwargs"])
+            action_method(ids=[torrent.id], **action_kwargs)
             logger.info(f"自动删种任务 {action_config['log_text']}：{text_item}")
             message_text += f"\n{text_item}"
 
@@ -1165,13 +1167,13 @@ class TorrentRemoverRuff(_PluginBase):
         if self._mponly:
             tags.append(settings.TORRENT_TAG)
         # 查询种子
-        torrents, error_flag = downloader_obj.get_torrents(tags=tags or None)  # pyright: ignore[reportArgumentType]
+        torrents, error_flag = downloader_obj.get_torrents(tags=tags)
         if error_flag or not torrents:
             return set()
         if self._remove_mode == "condition":
-            return self._remove_by_condition(torrents)  # pyright: ignore[reportArgumentType]
+            return self._remove_by_condition(torrents)
         if self._remove_mode == "strategy":
-            return self._get_remove_torrents_by_strategy(torrents)  # pyright: ignore[reportArgumentType]
+            return self._get_remove_torrents_by_strategy(torrents)
         raise ValueError(f"未知删种模式 {self._remove_mode}")
 
     def _get_remove_torrents_by_strategy(self, torrents: Iterable[TorrentType]) -> set[TorrentInfo]:
