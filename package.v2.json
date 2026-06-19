@@ -2,7 +2,7 @@
   "FontCollect": {
     "name": "字体收集",
     "description": "自动收集种子中的字体。",
-    "labels": "整理",
+    "labels": "字幕",
     "version": "1.8.2",
     "icon": "Themeengine_A.png",
     "author": "yubanmeiqin9048",
@@ -67,6 +67,18 @@
       "v2.2": "优化执行周期输入，需要MoviePilot v2.2.1+",
       "v2.1.1": "修复兼容MoviePilot V2 版本",
       "v2.0": "兼容MoviePilot V2 版本"
+    }
+  },
+  "AutoSubtitle": {
+    "name": "自动字幕下载",
+    "description": "文件整理完成后自动搜索并下载缺失的字幕",
+    "labels": "字幕",
+    "version": "1.0",
+    "icon": "subtitle.png",
+    "author": "yubanmeiqin9048",
+    "level": 2,
+    "history": {
+      "v1.0": "初版"
     }
   }
 }
