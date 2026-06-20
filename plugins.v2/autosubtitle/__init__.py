@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -32,9 +33,9 @@ class AutoSubtitle(_PluginBase):
     # 插件描述
     plugin_desc = "文件整理完成后自动搜索并下载缺失的字幕"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/subtitle.png"
+    # plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/subtitle.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -44,7 +45,7 @@ class AutoSubtitle(_PluginBase):
     # 加载顺序
     plugin_order = 2
     # 可使用的用户级别
-    auth_level = 2
+    auth_level = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -80,6 +81,8 @@ class AutoSubtitle(_PluginBase):
             self._custom_save_path = config.get("custom_save_path") or ""
             self._notify = config.get("notify", False)
             self._multi_keyword = config.get("multi_keyword", False)
+            self._auto_sync = config.get("auto_sync", False)
+            self._skip_sync_pattern = config.get("skip_sync_pattern") or ""
             # YAKE 关键词提取器实例（top=3 配合多关键词开关使用）
             self._kw_extractor = yake.KeywordExtractor(
                 n=1,
@@ -87,6 +90,39 @@ class AutoSubtitle(_PluginBase):
                 lan="en",
             )
             self._subtitle_exts = set(settings.RMT_SUBEXT)
+            # ffprobe 内封字幕语言标签 → 简/繁体映射
+            self._embedded_simple_tags: frozenset[str] = frozenset(
+                {
+                    "zh-cn",
+                    "zh_cn",
+                    "zh-hans",
+                    "zh_hans",
+                    "zho-hans",
+                    "zho_hans",
+                    "chs",
+                    "chi_sim",
+                    "chi-hans",
+                    "chi_hans",
+                }
+            )
+            self._embedded_trad_tags: frozenset[str] = frozenset(
+                {
+                    "zh-tw",
+                    "zh_tw",
+                    "zh-hant",
+                    "zh_hant",
+                    "zho-hant",
+                    "zho_hant",
+                    "zh-hk",
+                    "zh_hk",
+                    "zh-mo",
+                    "zh_mo",
+                    "cht",
+                    "chi_tra",
+                    "chi-hant",
+                    "chi_hant",
+                }
+            )
             self.__update_config()
 
     def get_state(self) -> bool:
@@ -148,8 +184,8 @@ class AutoSubtitle(_PluginBase):
         fileitem = transferinfo.fileitem
         source_dir = Path(fileitem.path).parent if fileitem and fileitem.path else None
 
-        # 1. 检查已有字幕
-        missing_langs = self.__check_missing_subtitles(transferinfo)
+        # 1. 检查已有字幕（直接扫描视频所在目录）
+        missing_langs = await self.__check_missing_subtitles(video_file.path)
         if not missing_langs:
             logger.info("[AutoSubtitle] 已有符合要求的字幕，跳过")
             return
@@ -279,43 +315,76 @@ class AutoSubtitle(_PluginBase):
     # 字幕检测
     # ------------------------------------------------------------------
 
-    def __check_missing_subtitles(self, transferinfo: TransferInfo) -> list[str]:
+    async def __check_missing_subtitles(self, video_path: str) -> list[str]:
         """
-        检查已有字幕，返回缺失的语言列表。
+        检查已有字幕（外挂 + 内封），返回缺失的语言列表。
 
-        注意：系统整理后的字幕文件名仅可能包含 zh-cn（简体）
-        或 zh-tw（繁体）标记。无语言标记时无法判断类型，视为缺失。
+        三层检测：
+        1. 扫描视频所在目录的外挂字幕文件（含 .!qB 等未完成 torrent 临时文件）
+        2. stem 匹配但无语言标记的字幕 → 读文件内容精确判定
+        3. ffprobe 检测 MKV 等容器的内封字幕流
+
+        该方法替代了先前依赖 TransferInfo.file_list_new 的实现。
         """
-        existing_subtitles = self.__get_existing_subtitles(transferinfo)
-        has_simplified = False
-        has_traditional = False
+        video_file = Path(video_path)
+        video_stem = video_file.stem.lower()
+        has_simplified, has_traditional, need_verify = self.__scan_subtitles_in_dir(video_file.parent, video_stem)
 
-        for sub_path in existing_subtitles:
-            name = Path(sub_path).name.lower()
-            if any(m in name for m in self._SIMPLIFIED_FILE_MARKERS):
+        # 对 stem 匹配的无标记字幕做内容检测
+        for f in need_verify:
+            if has_simplified and has_traditional:
+                break
+            detected = await self.__detect_subtitle_lang(f)
+            if detected == "简体中文":
                 has_simplified = True
-            if any(m in name for m in self._TRADITIONAL_FILE_MARKERS):
+            elif detected == "繁體中文":
                 has_traditional = True
 
-        missing = []
+        # 检测内封字幕（MKV 等容器的内嵌字幕流）
+        if not has_simplified or not has_traditional:
+            emb_simple, emb_trad = await self.__probe_embedded_subtitles(video_path)
+            has_simplified = has_simplified or emb_simple
+            has_traditional = has_traditional or emb_trad
+
+        missing: list[str] = []
         if "简体中文" in self._subtitle_langs and not has_simplified:
             missing.append("简体中文")
         if "繁體中文" in self._subtitle_langs and not has_traditional:
             missing.append("繁體中文")
 
-        logger.info(f"[AutoSubtitle] 字幕检查: 简体缺失={not has_simplified}, 繁体缺失={not has_traditional}")
+        logger.info(
+            f"[AutoSubtitle] 字幕检查 (目录扫描): "
+            f"简体{'✓' if has_simplified else '✗'} "
+            f"繁体{'✓' if has_traditional else '✗'}"
+        )
         return missing
 
-    def __get_existing_subtitles(self, transferinfo: TransferInfo) -> list[str]:
-        """
-        从 file_list_new 中筛选出字幕文件路径。
-        TransferInfo 无独立的 subtitle_list_new，需按扩展名过滤。
-        """
-        return [
-            file_path
-            for file_path in transferinfo.file_list_new or []
-            if Path(file_path).suffix.lower() in self._subtitle_exts
-        ]
+    def __scan_subtitles_in_dir(self, video_dir: Path, video_stem: str) -> tuple[bool, bool, list[Path]]:
+        """扫描目录中的字幕文件，返回 (has_simplified, has_traditional, need_verify)."""
+        has_simplified = False
+        has_traditional = False
+        need_verify: list[Path] = []
+
+        for f in video_dir.iterdir():
+            if not f.is_file():
+                continue
+            # 识别字幕文件：suffix 命中 OR 双层 suffix 命中（如 .srt.!qB）
+            if not any(s.lower() in self._subtitle_exts for s in f.suffixes):
+                continue
+
+            name = f.name.lower()
+            name_has_marker = False
+            if any(m in name for m in self._SIMPLIFIED_FILE_MARKERS):
+                has_simplified = True
+                name_has_marker = True
+            if any(m in name for m in self._TRADITIONAL_FILE_MARKERS):
+                has_traditional = True
+                name_has_marker = True
+
+            if not name_has_marker and f.stem.lower() == video_stem:
+                need_verify.append(f)
+
+        return has_simplified, has_traditional, need_verify
 
     # ------------------------------------------------------------------
     # 关键词提取
@@ -466,9 +535,9 @@ class AutoSubtitle(_PluginBase):
             return True
 
         # 目标视频的季/集
-        target_season = getattr(meta, "begin_season", None)
-        target_ep = getattr(meta, "begin_episode", None)
-        target_ep_list = getattr(meta, "episode_list", []) or []
+        target_season = meta.begin_season
+        target_ep = meta.begin_episode
+        target_ep_list = meta.episode_list
 
         # 精确匹配 season_episode
         if sub_se and target_season is not None and target_ep is not None:
@@ -543,6 +612,165 @@ class AutoSubtitle(_PluginBase):
 
         trad_count = sum(1 for c in content if c in self._TRAD_CHARS)
         return "繁體中文" if trad_count >= 3 else "简体中文"
+
+    # ------------------------------------------------------------------
+    # 内封字幕检测
+    # ------------------------------------------------------------------
+
+    async def __probe_embedded_subtitles(self, video_path: str) -> tuple[bool, bool]:
+        """
+        使用 ffprobe 检测视频容器内封字幕流。
+
+        返回 (has_simplified, has_traditional)。
+        ffprobe 不可用或解析失败时返回 (False, False)，不阻塞主流程。
+        """
+        # 检查 ffprobe 是否可用
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-version",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+        except FileNotFoundError:
+            logger.info("[AutoSubtitle] ffprobe 未安装，跳过内封字幕检测")
+            return False, False
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "s",
+                video_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0 or not stdout:
+                return False, False
+
+            streams = json.loads(stdout).get("streams") or []
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"[AutoSubtitle] ffprobe 解析失败: {e}")
+            return False, False
+
+        has_simplified = False
+        has_traditional = False
+
+        for stream in streams:
+            if stream.get("codec_type") != "subtitle":
+                continue
+
+            tags = stream.get("tags") or {}
+            lang = (tags.get("language") or "").strip().lower()
+            title = (tags.get("title") or "").strip().lower()
+
+            simple, trad = self.__classify_embedded_lang(lang, title)
+            if simple:
+                has_simplified = True
+            if trad:
+                has_traditional = True
+            if has_simplified and has_traditional:
+                break
+
+        if has_simplified or has_traditional:
+            logger.info(
+                f"[AutoSubtitle] 内封字幕检测: "
+                f"简体{'✓' if has_simplified else '✗'} "
+                f"繁体{'✓' if has_traditional else '✗'}"
+            )
+        return has_simplified, has_traditional
+
+    def __classify_embedded_lang(self, lang: str, title: str) -> tuple[bool, bool]:
+        """
+        根据 ffprobe 语言标签判断简/繁体。返回 (is_simplified, is_traditional)。
+
+        仅有 chi/zho/zh 标签时从 title 字段辅助推断；无法判断的标签不做假定。
+        """
+        if lang in self._embedded_simple_tags:
+            return True, False
+        if lang in self._embedded_trad_tags:
+            return False, True
+
+        # chi/zho/zh: 标签本身不分简繁，尝试从 title 推断
+        if lang in ("chi", "zho", "zh"):
+            if any(k in title for k in ("简", "cn", "chs", "hans")):
+                return True, False
+            if any(k in title for k in ("繁", "tw", "cht", "hant", "hk")):
+                return False, True
+
+        # 无法识别的标签 → 不假定包含任何一种需要的字幕
+        return False, False
+
+    # ------------------------------------------------------------------
+    # 字幕时间轴同步
+    # ------------------------------------------------------------------
+
+    async def __sync_subtitle(self, sub_file: Path, video_path: str) -> bool:
+        """
+        使用 ffsubsync 以视频音频为参考调整字幕时间轴。
+
+        仅在 _auto_sync 开启时调用。ffsubsync 不可用时优雅跳过。
+        返回 True 表示同步成功。
+        """
+        if not self._auto_sync:
+            return False
+
+        # 不调轴关键字豁免：文件名匹配正则时跳过调轴
+        if self._skip_sync_pattern:
+            try:
+                if re.search(self._skip_sync_pattern, sub_file.name):
+                    logger.info(f"[AutoSubtitle] 字幕文件名匹配跳过规则，不调轴: {sub_file.name}")
+                    return False
+            except re.error as e:
+                logger.warning(f"[AutoSubtitle] 调轴跳过规则正则错误: {e}")
+
+        # 检查 ffsubsync 是否可用
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffsubsync",
+                "--help",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+        except FileNotFoundError:
+            logger.warning("[AutoSubtitle] 未安装 ffsubsync，跳过调轴")
+            return False
+
+        synced = sub_file.with_name(f"{sub_file.stem}.synced{sub_file.suffix}")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffsubsync",
+                video_path,
+                "-i",
+                str(sub_file),
+                "-o",
+                str(synced),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+            if proc.returncode == 0 and await AsyncPath(synced).exists():
+                # 用同步后的版本替换原始文件
+                await AsyncPath(synced).replace(AsyncPath(sub_file))
+                logger.info(f"[AutoSubtitle] ffsubsync 调轴成功: {sub_file.name}")
+                return True
+            else:
+                err_msg = stderr.decode(errors="ignore")[:200] if stderr else "unknown"
+                logger.warning(f"[AutoSubtitle] ffsubsync 调轴失败: {err_msg}")
+                return False
+        except Exception as e:
+            logger.warning(f"[AutoSubtitle] ffsubsync 调轴异常: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # 字幕下载与放置
@@ -638,7 +866,12 @@ class AutoSubtitle(_PluginBase):
                 # 以多数检测结果为准；全部不可读时放行
                 effective_lang = max(set(detected_langs), key=detected_langs.count) if detected_langs else lang
 
-            # 7. 重命名并移动到目标目录（使用确认后的语言名）
+            # 7. 自动调轴（以视频音频为参考，修正字幕时间偏差）
+            if self._auto_sync and video_file.path:
+                for f in subtitle_files:
+                    await self.__sync_subtitle(f, video_file.path)
+
+            # 8. 重命名并移动到目标目录（使用确认后的语言名）
             video_stem = Path(cast(str, video_file.name)).stem
             target_dir = self.__resolve_target_dir(video_file, mediainfo, source_dir)
 
@@ -649,7 +882,7 @@ class AutoSubtitle(_PluginBase):
 
             return True, sub_name, effective_lang
         finally:
-            # 8. 清理（仅清理本次下载的独立子目录，不影响其他并发下载）
+            # 9. 清理（仅清理本次下载的独立子目录，不影响其他并发下载）
             await aioshutil.rmtree(work_dir, ignore_errors=True)
 
     async def __extract_subtitle_files(self, temp_file: Path, save_dir: Path) -> list[Path]:
@@ -905,13 +1138,13 @@ class AutoSubtitle(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    # ── 开关行 ──
+                    # ── 开关行 (一行四列) ──
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -924,7 +1157,7 @@ class AutoSubtitle(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -937,13 +1170,47 @@ class AutoSubtitle(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "multi_keyword",
                                             "label": "多关键词搜索",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "auto_sync",
+                                            "label": "自动调轴 (ffsubsync)",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    # ── 不调轴关键字 ──
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "skip_sync_pattern",
+                                            "label": "不调轴关键字",
+                                            "placeholder": "e.g. WEB|NF|Amazon",
+                                            "v-show": "auto_sync",
                                         },
                                     }
                                 ],
@@ -965,8 +1232,6 @@ class AutoSubtitle(_PluginBase):
                                             "label": "媒体类型",
                                             "multiple": True,
                                             "chips": True,
-                                            "hint": "需要下载字幕的媒体类型",
-                                            "persistent-hint": True,
                                             "items": [
                                                 {"title": "电影", "value": "电影"},
                                                 {"title": "电视剧", "value": "电视剧"},
@@ -986,8 +1251,6 @@ class AutoSubtitle(_PluginBase):
                                             "label": "字幕语言",
                                             "multiple": True,
                                             "chips": True,
-                                            "hint": "需要下载的字幕语言，系统会自动检查缺失的语言并下载补齐",
-                                            "persistent-hint": True,
                                             "items": [
                                                 {"title": "简体中文", "value": "简体中文"},
                                                 {"title": "繁体中文", "value": "繁體中文"},
@@ -1013,8 +1276,6 @@ class AutoSubtitle(_PluginBase):
                                             "label": "字幕优先级",
                                             "multiple": True,
                                             "chips": True,
-                                            "hint": "按 下载次数 > 发布时间 > 站点优先级 排序，勾选即启用",
-                                            "persistent-hint": True,
                                             "items": [
                                                 {"title": "下载次数", "value": "downloads"},
                                                 {"title": "发布时间", "value": "pubdate"},
@@ -1034,8 +1295,6 @@ class AutoSubtitle(_PluginBase):
                                             "model": "request_delay",
                                             "label": "请求间隔(秒)",
                                             "type": "number",
-                                            "hint": "下载字幕间的等待时间，避免触发站点限流",
-                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -1049,8 +1308,6 @@ class AutoSubtitle(_PluginBase):
                                         "props": {
                                             "model": "save_path_strategy",
                                             "label": "存放位置",
-                                            "hint": "选择字幕文件的存放位置，适配不同场景",
-                                            "persistent-hint": True,
                                             "items": [
                                                 {"title": "视频同目录", "value": "same"},
                                                 {"title": "视频源目录", "value": "source"},
@@ -1076,8 +1333,6 @@ class AutoSubtitle(_PluginBase):
                                             "model": "custom_save_path",
                                             "label": "自定义路径模板",
                                             "placeholder": "/media/subtitles/{media_type}/{title} ({year})",
-                                            "hint": "变量: {media_type} {title} {en_title} {year} {season} {tmdb_id}",
-                                            "persistent-hint": True,
                                             "v-show": "save_path_strategy === 'custom'",
                                         },
                                     }
@@ -1117,7 +1372,7 @@ class AutoSubtitle(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "多关键词搜索搜到即停，会增加搜索次数但可提高命中率。",
+                                            "text": "多关键词搜索搜到即停，可能会增加搜索次数但可提高命中率。",
                                         },
                                     }
                                 ],
@@ -1128,7 +1383,7 @@ class AutoSubtitle(_PluginBase):
             }
         ], {
             "enabled": False,
-            "media_types": ["电影", "电视剧"],
+            "media_types": ["电影"],
             "subtitle_langs": ["简体中文"],
             "subtitle_priorities": ["downloads", "pubdate", "site_order"],
             "request_delay": 2.0,
@@ -1136,6 +1391,8 @@ class AutoSubtitle(_PluginBase):
             "custom_save_path": "",
             "notify": False,
             "multi_keyword": False,
+            "auto_sync": False,
+            "skip_sync_pattern": "",
         }
 
     # ------------------------------------------------------------------
@@ -1154,5 +1411,7 @@ class AutoSubtitle(_PluginBase):
                 "custom_save_path": self._custom_save_path,
                 "notify": self._notify,
                 "multi_keyword": self._multi_keyword,
+                "auto_sync": self._auto_sync,
+                "skip_sync_pattern": self._skip_sync_pattern,
             }
         )
