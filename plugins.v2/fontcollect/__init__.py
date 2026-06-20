@@ -1,3 +1,4 @@
+import subprocess
 import time
 import traceback
 from pathlib import Path
@@ -10,7 +11,6 @@ from app.modules.qbittorrent.qbittorrent import Qbittorrent
 from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType
-from app.utils.system import SystemUtils
 from qbittorrentapi import TorrentFilesList
 
 
@@ -22,7 +22,7 @@ class FontCollect(_PluginBase):
     # 插件图标
     plugin_icon = "Themeengine_A.png"
     # 插件版本
-    plugin_version = "1.8.2"
+    plugin_version = "1.8.3"
     # 插件作者
     plugin_author = "yubanmeiqin9048"
     # 作者主页
@@ -173,13 +173,32 @@ class FontCollect(_PluginBase):
         save_path: str,
     ):
         """
-        解压下载完成的 Font 文件
+        解压下载完成的 Font 文件，使用 unar 支持 7z/rar/zip 等格式
         """
         font_files: list[str] = [file.name for file in torrent_files if file.id in font_file_ids]
+        extract_dir = Path(self._fontpath)
+        extract_dir.mkdir(parents=True, exist_ok=True)
         for font_file in font_files:
             file_path = Path(save_path) / font_file
-            SystemUtils.unpack_archive(file_path, Path(self._fontpath))
-            logger.info(f"解压 {file_path} 到 {self._fontpath} 成功")
+            try:
+                subprocess.run(
+                    [
+                        "unar",
+                        "-quiet",
+                        "-force-overwrite",
+                        "-output-directory",
+                        extract_dir.as_posix(),
+                        file_path.as_posix(),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                logger.info(f"解压 {file_path} 到 {self._fontpath} 成功")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"解压 {file_path} 失败：{e.stderr.strip() if e.stderr else e}")
+            except FileNotFoundError:
+                logger.error("unar 命令不可用，请确认系统已安装 unar")
 
     def collect(self, torrent_hash: str):
         """
