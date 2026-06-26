@@ -80,7 +80,7 @@ class TorrentRemoverRuff(_PluginBase):
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "2.6.6"
+    plugin_version = "2.6.7"
     # 插件作者
     plugin_author = "jxxghp,yubanmeiqin9048"
     # 作者主页
@@ -765,7 +765,10 @@ class TorrentRemoverRuff(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "自动删种存在风险，如设置不当可能导致数据丢失！建议动作先选择暂停，确定条件正确后再改成删除。",
+                                            "text": (
+                                                "自动删种存在风险，如设置不当可能导致数据丢失！",
+                                                "建议动作先选择暂停，确定条件正确后再改成删除。",
+                                            ),
                                         },
                                     }
                                 ],
@@ -1037,7 +1040,7 @@ class TorrentRemoverRuff(_PluginBase):
             done_on = torrent.completion_on if torrent.completion_on > 0 else torrent.added_on
             return date_now - done_on if done_on > 0 else 0
         # Transmission
-        done_date = torrent.date_done or torrent.date_added
+        done_date = torrent.done_date
         return date_now - int(time.mktime(done_date.timetuple())) if done_date else 0
 
     def old_seeds(self, torrents: Iterable[TorrentType]) -> list[TorrentType]:
@@ -1128,10 +1131,10 @@ class TorrentRemoverRuff(_PluginBase):
             error_string = None
         else:
             # TR字段
-            date_done = torrent.date_done or torrent.date_added
+            date_done = torrent.done_date or torrent.added_date
             size = torrent.size_when_done
             uploaded = torrent.uploaded_ever
-            path = cast(str, torrent.download_dir)
+            path = torrent.download_dir
             trackers = [t.announce for t in torrent.trackers]
             site = torrent.trackers[0].get("sitename") if trackers else ""
             hash_id = torrent.hashString
