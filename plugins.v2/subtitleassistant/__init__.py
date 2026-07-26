@@ -52,7 +52,9 @@ class SubtitleAssistant(_PluginBase):
 
     plugin_name = "字幕助手"
     plugin_desc = "覆盖搜索、匹配、下载、归属、落盘、维护与审计的字幕全生命周期管理。"
-    plugin_icon = "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/SubtitleAssistant.png"
+    plugin_icon = (
+        "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/SubtitleAssistant.png"
+    )
     plugin_version = "1.0.1"
     plugin_author = "yubanmeiqin9048"
     plugin_label = "字幕"
