@@ -93,6 +93,7 @@
     "icon": "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/SubtitleAssistant.png",
     "author": "yubanmeiqin9048",
     "level": 1,
+    "system_version": ">=2.15.1",
     "history": {
       "v1.0.1": "修复 Vue 联邦构建产物未进入发布仓库",
       "v1.0": "初版"
