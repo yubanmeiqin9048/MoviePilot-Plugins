@@ -84,5 +84,17 @@
       "v1.1": "添加自动调轴功能和内封字幕检测",
       "v1.0": "初版"
     }
+  },
+  "SubtitleAssistant": {
+    "name": "字幕助手",
+    "description": "覆盖搜索、匹配、下载、归属、落盘、维护与审计的字幕全生命周期管理。",
+    "labels": "字幕",
+    "version": "1.0",
+    "icon": "https://github.com/yubanmeiqin9048/MoviePilot-Plugins/blob/main/icons/SubtitleAssistant.png",
+    "author": "yubanmeiqin9048",
+    "level": 2,
+    "history": {
+      "v1.0": "初版"
+    }
   }
 }

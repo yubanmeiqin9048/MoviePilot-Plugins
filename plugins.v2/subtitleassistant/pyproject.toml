@@ -1,0 +1,33 @@
+[tool.ty.environment]
+python = "/home/zhang/Documents/MoviePilot/.venv"
+python-version = "3.11"
+python-platform = "linux"
+extra-paths = ["/home/zhang/Documents/MoviePilot"]
+
+[tool.ty.src]
+exclude = [
+    ".docs",
+    ".pytest_cache",
+    "**/__pycache__",
+    "frontend",
+    "tests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    ".docs",
+    ".pytest_cache",
+    "**/__pycache__",
+    "frontend",
+    "tests",
+]
+
+[tool.ruff.lint]
+extend-select = ["B", "W", "PERF", "UP", "I", "SIM"]
+ignore = ["SIM105"]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"
