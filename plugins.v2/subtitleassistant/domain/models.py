@@ -1,10 +1,10 @@
 """字幕助手核心领域模型。"""
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeAlias
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from .enums import (
     AI_ATTRIBUTION_EVIDENCE_CODES,
@@ -13,6 +13,7 @@ from .enums import (
     AiAttributionOutcome,
     AttemptResult,
     AttributionEvidence,
+    CandidateRecognitionStatus,
     FileAttributionMethod,
     FileLocation,
     MediaType,
@@ -28,6 +29,8 @@ from .enums import (
     TranslationType,
     UnmatchedReason,
 )
+
+SourceDetails: TypeAlias = dict[str, JsonValue]
 
 
 def utc_now() -> datetime:
@@ -114,6 +117,13 @@ class SubtitleCandidate(StrictModel):
     uploaded_at: datetime | None = None
     revision: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CandidateRecognition(StrictModel):
+    """人工搜索候选及其对当前目标的识别状态。"""
+
+    candidate: SubtitleCandidate
+    status: CandidateRecognitionStatus
 
 
 class PathMappingSnapshot(StrictModel):
@@ -280,7 +290,7 @@ class SourceRun(StrictModel):
     rejection_summary: dict[str, int] = Field(default_factory=dict)
     duration_ms: int | None = None
     error_summary: str | None = None
-    details: dict[str, Any] = Field(default_factory=dict)
+    details: SourceDetails = Field(default_factory=dict)
 
 
 class CandidateAttempt(StrictModel):
@@ -475,7 +485,7 @@ class SourceStatus(StrictModel):
     last_error_at: datetime | None = None
     last_error_summary: str | None = None
     last_duration_ms: int | None = None
-    details: dict[str, Any] = Field(default_factory=dict)
+    details: SourceDetails = Field(default_factory=dict)
 
 
 # 文档与前端历史代码曾使用 Takeover 命名；保留显式别名不复制模型结构。

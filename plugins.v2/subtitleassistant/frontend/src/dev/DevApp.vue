@@ -4,7 +4,7 @@ import { useTheme } from 'vuetify'
 
 import AppPage from '@/components/AppPage.vue'
 import Config from '@/components/Config.vue'
-import type { HostToast, NonSensitiveConfig, ThemeName } from '@/types'
+import type { HostToast, ThemeName } from '@/types'
 import { createMockApi, type MockMode } from './mockApi'
 
 const { api, state } = createMockApi()
@@ -55,11 +55,6 @@ watch(selectedMode, value => {
   renderKey.value += 1
 })
 
-function saveConfig(config: NonSensitiveConfig): void {
-  state.config = { ...state.config, ...config }
-  hostToast.success('普通配置保存事件已由开发壳接收')
-}
-
 function showHostToast(message: string, color: 'success' | 'info' | 'warning' | 'error'): void {
   notice.value = message
   noticeColor.value = color
@@ -88,7 +83,7 @@ function showHostToast(message: string, color: 'success' | 'info' | 'warning' | 
 
       <AppPage v-if="view === 'workbench'" :key="`app-${renderKey}`" :api="api" plugin-id="SubtitleAssistant" nav-key="main" />
       <div v-else class="config-preview">
-        <Config :key="`config-${renderKey}`" :api="api" :initial-config="state.config" @save="saveConfig" @close="view = 'workbench'" />
+        <Config :key="`config-${renderKey}`" :api="api" :initial-config="state.config" @close="view = 'workbench'" />
       </div>
     </VMain>
 

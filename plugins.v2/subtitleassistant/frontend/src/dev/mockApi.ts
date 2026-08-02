@@ -443,7 +443,10 @@ export function createMockApi() {
       await wait(300)
       if (state.mode === 'error') throw new Error('开发壳模拟服务暂时不可用')
       if (path.includes('/credentials/')) return { success: true, data: { configured: true }, message: '凭据已更新' } as T
-      if (path.includes('/plugin/')) state.config = { ...state.config, ...(payload as Partial<ConfigModel>) }
+      const segments = path.replace(/^\/+/, '').split('/')
+      if (segments.length === 2 && segments[0] === 'plugin') {
+        state.config = { ...state.config, ...(payload as Partial<ConfigModel>) }
+      }
       return { success: true, message: '配置已保存' } as T
     },
     async delete<T = unknown>(path: string, options?: Record<string, unknown>): Promise<T> {
@@ -619,7 +622,7 @@ function mockSearchResponse(target: TargetItem): SearchResponse {
     sources: [
       {
         source: 'moviepilot', status: 'success', default_plans: target.search_plans.moviepilot, executed_queries: ['Example'], matched_query: 'Example', candidate_count: 1, duration_ms: 320, error_summary: null, details: { cache_hit: false },
-        candidates: [{ candidate_key: 'mock-moviepilot', name: '示例字幕候选', file_name: null, source: 'moviepilot', language: 'zh-CN', format: null, package_scope: 'season_pack', season: target.season, episode: null, seasons: target.season == null ? [] : [target.season], episodes: [], translation_type: 'human', hearing_impaired: false, rating: null, votes: null, downloads: null, uploaded_at: null, query: 'Example', source_details: { site_name: '示例站点' } }],
+        candidates: [{ candidate_key: 'mock-moviepilot', recognition_status: 'recognized', name: '示例字幕候选', file_name: null, source: 'moviepilot', language: 'zh-CN', format: null, package_scope: 'season_pack', season: target.season, episode: null, seasons: target.season == null ? [] : [target.season], episodes: [], translation_type: 'human', hearing_impaired: false, rating: null, votes: null, downloads: null, uploaded_at: null, query: 'Example', source_details: { site_name: '示例站点' } }],
       },
       { source: 'opensubtitles', status: 'success', default_plans: target.search_plans.opensubtitles, executed_queries: ['Example Show'], matched_query: null, candidate_count: 0, duration_ms: 410, error_summary: null, details: { cache_hit: true, page_count: 1 }, candidates: [] },
       { source: 'assrt', status: 'success', default_plans: target.search_plans.assrt, executed_queries: [target.media_title], matched_query: null, candidate_count: 0, duration_ms: 280, error_summary: null, details: { cache_hit: false }, candidates: [] },

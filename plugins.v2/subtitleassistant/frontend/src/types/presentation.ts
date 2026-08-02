@@ -195,6 +195,10 @@ export function shortPath(path?: string | null): string {
   return `…/${parts.slice(-2).join('/')}`
 }
 
+export function fullPath(path?: string | null): string {
+  return path || '未记录'
+}
+
 export function displayValue(value: unknown): string {
   if (value === null || value === undefined || value === '') return '未记录'
   if (typeof value === 'boolean') return value ? '是' : '否'

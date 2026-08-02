@@ -19,6 +19,7 @@ export type RecordStatus = 'matched' | 'staged' | 'unmatched'
 export type RecordDeleteMode = 'record_only' | 'record_and_file'
 export const MAX_RECORD_BATCH_SIZE = 100
 export type SubtitleSource = 'moviepilot' | 'opensubtitles' | 'assrt'
+export type CandidateRecognitionStatus = 'recognized' | 'unrecognized'
 export type PackageScope = 'season_pack' | 'episode' | 'unknown'
 export type TranslationType = 'human' | 'unknown' | 'machine' | 'ai'
 export type SourceHealth = 'pending' | 'healthy' | 'limited' | 'error' | 'disabled'
@@ -301,6 +302,7 @@ export type ManualSourceResult = 'success' | 'limited' | 'error' | 'disabled' | 
 
 export interface SubtitleCandidate {
   candidate_key: string
+  recognition_status: CandidateRecognitionStatus
   name: string
   file_name: string | null
   source: SubtitleSource

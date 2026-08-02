@@ -5,9 +5,12 @@ from enum import IntEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing_extensions import TypedDict
 
+from ..application.ports import ManualSourceStatus
 from ..domain.enums import (
     AttributionEvidence,
+    CandidateRecognitionStatus,
     FileAttributionMethod,
     FileLocation,
     MediaType,
@@ -28,6 +31,7 @@ from ..domain.models import (
     CandidateAttributionSnapshot,
     PathMappingSnapshot,
     RetargetHistoryEntry,
+    SourceDetails,
     SourceRun,
     StageTrace,
 )
@@ -39,6 +43,15 @@ class PageSize(IntEnum):
     ITEMS_25 = 25
     ITEMS_50 = 50
     ITEMS_100 = 100
+
+
+class SearchPlanItem(TypedDict):
+    """人工搜索页面展示的一条安全查询计划。"""
+
+    kind: Literal["id", "title", "filename", "fallback"]
+    label: str
+    query: str | None
+    editable: bool
 
 
 class ApiModel(BaseModel):
@@ -246,7 +259,7 @@ class TargetListItem(ApiModel):
     target_file_name: str
     target_path: str
     organized_at: datetime
-    search_plans: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    search_plans: dict[SubtitleSource, list[SearchPlanItem]] = Field(default_factory=dict)
 
 
 class TargetPage(ApiModel):
@@ -271,6 +284,7 @@ class ManualCandidateItem(ApiModel):
     """不含任何下载定位的人工字幕候选。"""
 
     candidate_key: str
+    recognition_status: CandidateRecognitionStatus
     source: SubtitleSource
     name: str
     file_name: str | None = None
@@ -288,21 +302,21 @@ class ManualCandidateItem(ApiModel):
     downloads: int | None = None
     uploaded_at: datetime | None = None
     query: str | None = None
-    source_details: dict[str, Any] = Field(default_factory=dict)
+    source_details: SourceDetails = Field(default_factory=dict)
 
 
 class ManualSourceResult(ApiModel):
     """单个来源的一次人工搜索结果。"""
 
     source: SubtitleSource
-    status: str
-    default_plans: list[dict[str, Any]] = Field(default_factory=list)
+    status: ManualSourceStatus
+    default_plans: list[SearchPlanItem] = Field(default_factory=list)
     executed_queries: list[str] = Field(default_factory=list)
     matched_query: str | None = None
     candidate_count: int = 0
     duration_ms: int | None = None
     error_summary: str | None = None
-    details: dict[str, Any] = Field(default_factory=dict)
+    details: SourceDetails = Field(default_factory=dict)
     candidates: list[ManualCandidateItem] = Field(default_factory=list)
 
 

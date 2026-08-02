@@ -4,12 +4,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from app.core.context import MediaInfo as HostMediaInfo
+
 from ..domain.enums import PackageAttributionStrategy, RecordStatus, SubtitleSource
 from ..domain.models import (
     CandidateAttributionSnapshot,
+    CandidateRecognition,
     FileAttributionEvidence,
     MatchRecord,
     MediaContext,
+    SourceDetails,
     SourceStatus,
     SubtitleCandidate,
     SubtitleTask,
@@ -37,7 +41,7 @@ class SourceSearchResult:
     admitted_count: int = 0
     rejection_summary: dict[str, int] = field(default_factory=dict)
     skip_reason: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+    details: SourceDetails = field(default_factory=dict)
 
 
 ManualSourceStatus = Literal["success", "limited", "error", "disabled", "unconfigured"]
@@ -59,7 +63,7 @@ class ManualSourceSearchResult:
     admitted_count: int = 0
     rejection_summary: dict[str, int] = field(default_factory=dict)
     skip_reason: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+    details: SourceDetails = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -210,9 +214,17 @@ class MediaMatcherPort(Protocol):
         self,
         candidate: SubtitleCandidate,
         context: MediaContext,
-        host_mediainfo: Any,
+        host_mediainfo: HostMediaInfo,
     ) -> SubtitleCandidate | None:
         """使用宿主规则确认候选归属并补充包范围。"""
+
+    def recognize_candidate(
+        self,
+        candidate: SubtitleCandidate,
+        context: MediaContext,
+        host_mediainfo: HostMediaInfo | None,
+    ) -> CandidateRecognition:
+        """使用宿主规则识别人工候选，但不执行自动准入过滤。"""
 
     def candidate_snapshot(
         self,

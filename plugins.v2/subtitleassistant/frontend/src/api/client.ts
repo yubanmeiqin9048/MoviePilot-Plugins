@@ -8,6 +8,7 @@ import type {
   DownloadResponse,
   PageResponse,
   PluginApi,
+  NonSensitiveConfig,
   RecordDetail,
   RecordDeleteMode,
   RecordDeleteSnapshot,
@@ -69,6 +70,16 @@ export function getErrorMessage(error: unknown, fallback: string): string {
   }
   if (error instanceof Error && error.message) return error.message
   return fallback
+}
+
+export async function savePluginConfig(
+  api: PluginApi,
+  pluginId: string,
+  config: NonSensitiveConfig,
+): Promise<StandardResponse> {
+  if (!api.put) throw new Error('当前 MoviePilot 前端不支持插件配置更新')
+  const response = await api.put<StandardResponse>(`plugin/${encodeURIComponent(pluginId)}`, config)
+  return requireSuccess(response, '普通配置保存失败')
 }
 
 function requireSuccess(response: StandardResponse, fallback: string): StandardResponse {

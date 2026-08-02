@@ -4,7 +4,7 @@ import { computed, ref, watch } from 'vue'
 import { getErrorMessage, listTargets } from '@/api/client'
 import EmptyState from '@/components/EmptyState.vue'
 import type { PluginApi, TargetItem } from '@/types'
-import { formatDate, mediaLabel, shortPath } from '@/types/presentation'
+import { formatDate, fullPath, mediaLabel, shortPath } from '@/types/presentation'
 
 const props = withDefaults(defineProps<{
   api: PluginApi
@@ -120,7 +120,8 @@ function choose(item: TargetItem): void {
         </template>
         <VListItemTitle>{{ mediaLabel(item.media_title, item.year, item.season, item.episode) }}</VListItemTitle>
         <VListItemSubtitle>{{ item.target_file_name }}</VListItemSubtitle>
-        <VListItemSubtitle class="target-meta">{{ shortPath(item.target_path) }} · 整理于 {{ formatDate(item.organized_at) }}</VListItemSubtitle>
+        <VListItemSubtitle class="target-meta target-meta--full">{{ fullPath(item.target_path) }} · 整理于 {{ formatDate(item.organized_at) }}</VListItemSubtitle>
+        <VListItemSubtitle class="target-meta target-meta--short">{{ shortPath(item.target_path) }} · 整理于 {{ formatDate(item.organized_at) }}</VListItemSubtitle>
         <template #append><VIcon v-if="selectedId === item.history_id" icon="mdi-check-circle" color="primary" /></template>
       </VListItem>
     </VList>
@@ -143,7 +144,12 @@ function choose(item: TargetItem): void {
 .target-list :deep(.v-list-item) { min-height: 5.25rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .target-list :deep(.v-list-item:last-child) { border-bottom: 0; }
 .target-list :deep(.v-list-item:focus-visible) { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: -2px; }
-.target-meta { margin-top: 0.2rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.target-meta--full { margin-top: 0.2rem; overflow-wrap: anywhere; }
+.target-meta--short { display: none; }
 .target-pagination { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-top: 0.75rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; }
-@media (max-width: 37.5rem) { .target-pagination { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 37.5rem) {
+  .target-meta--full { display: none; }
+  .target-meta--short { display: block; margin-top: 0.2rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .target-pagination { align-items: flex-start; flex-direction: column; }
+}
 </style>

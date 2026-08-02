@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from app.chain.media import MediaChain
+from app.core.context import MediaInfo as HostMediaInfo
 from app.core.context import TorrentInfo
 from app.core.metainfo import MetaInfo, MetaInfoPath
 from app.helper.torrent import TorrentHelper
 
 from ..domain.enums import (
     AttributionEvidence,
+    CandidateRecognitionStatus,
     FileAttributionMethod,
     MediaType,
     PackageAttributionStrategy,
@@ -20,6 +22,7 @@ from ..domain.enums import (
 )
 from ..domain.models import (
     CandidateAttributionSnapshot,
+    CandidateRecognition,
     FileAttributionEvidence,
     MediaContext,
     SubtitleCandidate,
@@ -144,13 +147,11 @@ class MoviePilotMatcher:
             torrent_fields["site"] = candidate.site_id
         return TorrentInfo(**torrent_fields)
 
-    def normalize_candidate(
+    def _enrich_candidate(
         self,
         candidate: SubtitleCandidate,
-        context: MediaContext,
-        host_mediainfo: Any,
-    ) -> SubtitleCandidate | None:
-        """用宿主公共规则确认自动候选，并保留候选自身的完整季集范围。"""
+    ) -> tuple[SubtitleCandidate, list[tuple[str, str, Any]]]:
+        """从候选自身字段与文本补全安全季集和包范围。"""
 
         candidate = candidate.model_copy(deep=True)
         entries = self._candidate_meta_entries(candidate)
@@ -175,6 +176,16 @@ class MoviePilotMatcher:
             candidate.episodes,
             media_types,
         )
+        return candidate, entries
+
+    def _match_candidate(
+        self,
+        candidate: SubtitleCandidate,
+        entries: list[tuple[str, str, Any]],
+        context: MediaContext,
+        host_mediainfo: HostMediaInfo | None,
+    ) -> SubtitleCandidate | None:
+        """用宿主公共规则判断已补全候选是否属于当前目标。"""
 
         season_episodes: dict[int, list[int]] | None = None
         candidate_range_covers_target = False
@@ -215,6 +226,8 @@ class MoviePilotMatcher:
             candidate.exact_id_match = True
             return candidate
 
+        if host_mediainfo is None:
+            return None
         for _label, name, meta in entries:
             torrent = self._torrent_info(candidate, name, context)
             try:
@@ -239,6 +252,37 @@ class MoviePilotMatcher:
             candidate.exact_id_match = False
             return candidate
         return None
+
+    def normalize_candidate(
+        self,
+        candidate: SubtitleCandidate,
+        context: MediaContext,
+        host_mediainfo: HostMediaInfo,
+    ) -> SubtitleCandidate | None:
+        """用宿主公共规则确认自动候选，并保留候选自身的完整季集范围。"""
+
+        enriched, entries = self._enrich_candidate(candidate)
+        return self._match_candidate(enriched, entries, context, host_mediainfo)
+
+    def recognize_candidate(
+        self,
+        candidate: SubtitleCandidate,
+        context: MediaContext,
+        host_mediainfo: HostMediaInfo | None,
+    ) -> CandidateRecognition:
+        """复用自动匹配规则识别人工候选，并始终返回安全候选副本。"""
+
+        enriched, entries = self._enrich_candidate(candidate)
+        normalized = self._match_candidate(enriched, entries, context, host_mediainfo)
+        if normalized is not None:
+            return CandidateRecognition(
+                candidate=normalized,
+                status=CandidateRecognitionStatus.RECOGNIZED,
+            )
+        return CandidateRecognition(
+            candidate=enriched,
+            status=CandidateRecognitionStatus.UNRECOGNIZED,
+        )
 
     def candidate_snapshot(self, candidate: SubtitleCandidate) -> CandidateAttributionSnapshot:
         """只聚合候选自身字段、解析结果与结构化 ID 形成归属快照。"""

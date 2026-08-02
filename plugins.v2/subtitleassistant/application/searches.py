@@ -10,19 +10,26 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from app.chain.media import MediaChain
 from app.core.cache import AsyncMemoryBackend
 from app.core.context import MediaInfo as HostMediaInfo
+from app.db.models.transferhistory import TransferHistory
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
 from app.schemas import FileItem
 from app.schemas.types import MediaType as HostMediaType
 
-from ..domain.enums import MediaType, SubtitleSource
-from ..domain.models import MediaContext, SubtitleCandidate, new_id
-from .ports import CandidateHandle, ManualSourceSearchResult, SubtitleSourcePort
+from ..domain.enums import CandidateRecognitionStatus, MediaType, SubtitleSource
+from ..domain.models import CandidateRecognition, MediaContext, SourceDetails, new_id
+from .ports import (
+    CandidateHandle,
+    ManualSourceSearchResult,
+    ManualSourceStatus,
+    MediaMatcherPort,
+    SubtitleSourcePort,
+)
 
 SEARCH_SESSION_REGION = "subtitleassistant_manual_search"
 SEARCH_SESSION_TTL_SECONDS = 30 * 60
@@ -48,8 +55,8 @@ class SearchTarget:
     history_id: int
     context: MediaContext
     transferred_at: datetime
-    target_item: Any
-    host_mediainfo: Any | None = None
+    target_item: FileItem
+    host_mediainfo: HostMediaInfo | None = None
 
 
 @dataclass(slots=True)
@@ -67,14 +74,14 @@ class ManualSourceView:
     """不包含下载句柄的人工来源搜索响应。"""
 
     source: SubtitleSource
-    status: str
-    candidates: list[SubtitleCandidate] = field(default_factory=list)
+    status: ManualSourceStatus
+    candidates: list[CandidateRecognition] = field(default_factory=list)
     default_queries: list[str] = field(default_factory=list)
     executed_queries: list[str] = field(default_factory=list)
     matched_query: str | None = None
     duration_ms: int | None = None
     error_summary: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+    details: SourceDetails = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -93,6 +100,7 @@ class SessionCandidate:
     session_id: str
     target: SearchTarget
     handle: CandidateHandle
+    recognition_status: CandidateRecognitionStatus
     actual_query: str | None = None
 
 
@@ -105,14 +113,48 @@ class ManualSearchSession:
     candidates: dict[str, SessionCandidate]
 
 
-def _parse_number(value: Any) -> int | None:
+class ManualSearchCachePort(Protocol):
+    """人工搜索会话使用的最小异步缓存端口。"""
+
+    async def get(self, key: str, region: str | None = None) -> object:
+        """读取一个未经信任的缓存值。"""
+
+    async def set(
+        self,
+        key: str,
+        value: object,
+        ttl: int | None = None,
+        region: str | None = None,
+    ) -> None:
+        """保存一个人工搜索会话。"""
+
+    async def clear(self, region: str | None = None) -> None:
+        """清除指定缓存区域。"""
+
+
+class TransferHistoryPort(Protocol):
+    """整理历史查询使用的最小宿主端口。"""
+
+    async def async_list_by_page(
+        self,
+        page: int,
+        count: int,
+        status: bool,
+    ) -> list[TransferHistory]:
+        """分页读取整理历史。"""
+
+    async def async_get(self, historyid: int) -> TransferHistory | None:
+        """按 ID 读取一条整理历史。"""
+
+
+def _parse_number(value: object) -> int | None:
     """从整理历史季集字段中提取首个整数。"""
 
     match = re.search(r"\d+", str(value or ""))
     return int(match.group()) if match else None
 
 
-def _parse_history_time(value: Any) -> datetime:
+def _parse_history_time(value: object) -> datetime:
     """把 MoviePilot 本地时间字符串转换为 UTC 时间。"""
 
     try:
@@ -127,16 +169,16 @@ def _parse_history_time(value: Any) -> datetime:
 class TargetQueryService:
     """通过 MoviePilot 整理历史查询可用的本地单文件目标。"""
 
-    def __init__(self, history_oper: Any | None = None, batch_size: int = 100) -> None:
+    def __init__(self, history_oper: TransferHistoryPort | None = None, batch_size: int = 100) -> None:
         """创建目标查询服务并允许测试替换整理历史操作器。"""
 
         self._history_oper = history_oper or TransferHistoryOper()
         self._batch_size = batch_size
 
-    async def _histories(self) -> list[Any]:
+    async def _histories(self) -> list[TransferHistory]:
         """分页读取全部成功整理历史。"""
 
-        result: list[Any] = []
+        result: list[TransferHistory] = []
         page = 1
         while True:
             batch = await self._history_oper.async_list_by_page(
@@ -152,7 +194,7 @@ class TargetQueryService:
             page += 1
         return result
 
-    async def _to_target(self, history: Any) -> SearchTarget | None:
+    async def _to_target(self, history: TransferHistory) -> SearchTarget | None:
         """校验整理历史并还原安全目标上下文。
 
         整理历史是人工搜索的元数据来源，目标视频即使已经被移走也不影响
@@ -296,7 +338,7 @@ class TargetQueryService:
         return await self._to_target(history) if history is not None else None
 
 
-async def _default_media_resolver(context: MediaContext) -> Any | None:
+async def _default_media_resolver(context: MediaContext) -> HostMediaInfo | None:
     """使用 MoviePilot 公共媒体能力按 TMDB ID 补充媒体信息。"""
 
     if context.tmdb_id is None:
@@ -316,13 +358,15 @@ class ManualSearchService:
         self,
         targets: TargetQueryService,
         sources: dict[SubtitleSource, SubtitleSourcePort],
-        cache: Any | None = None,
-        media_resolver: Callable[[MediaContext], Awaitable[Any | None]] | None = None,
+        matcher: MediaMatcherPort,
+        cache: ManualSearchCachePort | None = None,
+        media_resolver: Callable[[MediaContext], Awaitable[HostMediaInfo | None]] | None = None,
     ) -> None:
         """创建人工搜索服务。"""
 
         self._targets = targets
         self._sources = sources
+        self._matcher = matcher
         self._cache = cache or AsyncMemoryBackend(
             cache_type="ttl",
             maxsize=256,
@@ -439,17 +483,45 @@ class ManualSearchService:
                 runs.append(result)
         for run in runs:
             self._log_source_result(history_id, run)
+        recognitions_by_run: list[list[CandidateRecognition]] = []
+        handles_by_run: list[list[CandidateHandle]] = []
+        for run in runs:
+            recognitions: list[CandidateRecognition] = []
+            handles: list[CandidateHandle] = []
+            for handle in run.candidates:
+                try:
+                    recognition = self._matcher.recognize_candidate(
+                        handle.candidate,
+                        target.context,
+                        getattr(target, "host_mediainfo", None),
+                    )
+                except Exception:  # noqa: BLE001 - 单候选异常必须降级且保留会话
+                    recognition = CandidateRecognition(
+                        candidate=handle.candidate.model_copy(deep=True),
+                        status=CandidateRecognitionStatus.UNRECOGNIZED,
+                    )
+                    logger.warning(f"人工字幕搜索候选 {handle.candidate.stable_key} 识别异常，已按未识别候选保留")
+                recognitions.append(recognition)
+                handles.append(CandidateHandle(candidate=recognition.candidate, opaque=handle.opaque))
+            recognitions_by_run.append(recognitions)
+            handles_by_run.append(handles)
         session_id = new_id() if any(run.candidates for run in runs) else None
         if session_id:
             candidates: dict[str, SessionCandidate] = {}
-            for run in runs:
-                for handle in run.candidates:
+            for run, recognitions, handles in zip(
+                runs,
+                recognitions_by_run,
+                handles_by_run,
+                strict=True,
+            ):
+                for recognition, handle in zip(recognitions, handles, strict=True):
                     candidates.setdefault(
                         handle.candidate.stable_key,
                         SessionCandidate(
                             session_id=session_id,
                             target=target,
                             handle=handle,
+                            recognition_status=recognition.status,
                             actual_query=run.matched_query,
                         ),
                     )
@@ -468,7 +540,7 @@ class ManualSearchService:
             ManualSourceView(
                 source=run.source,
                 status=run.status,
-                candidates=[item.candidate for item in run.candidates],
+                candidates=recognitions,
                 default_queries=run.default_queries,
                 executed_queries=run.executed_queries,
                 matched_query=run.matched_query,
@@ -476,7 +548,7 @@ class ManualSearchService:
                 error_summary=run.error_summary,
                 details=dict(run.details),
             )
-            for run in runs
+            for run, recognitions in zip(runs, recognitions_by_run, strict=True)
         ]
         candidate_count = sum(len(item.candidates) for item in runs)
         if session_id:

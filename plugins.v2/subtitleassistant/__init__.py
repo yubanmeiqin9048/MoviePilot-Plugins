@@ -55,7 +55,7 @@ class SubtitleAssistant(_PluginBase):
     plugin_icon = (
         "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/SubtitleAssistant.png"
     )
-    plugin_version = "1.0.1"
+    plugin_version = "1.1"
     plugin_author = "yubanmeiqin9048"
     plugin_label = "字幕"
     plugin_config_prefix = "subtitleassistant_"
@@ -138,11 +138,12 @@ class SubtitleAssistant(_PluginBase):
         # AI 接管适配器只持有当前配置读取器，不保存任务结果；每个批次由适配器
         # 再次检查插件开关与 MoviePilot 总开关，避免把初始化时状态固化进任务。
         ai_adapter = AiAttributionAdapter(config=lambda: self.config)
+        matcher = MoviePilotMatcher()
         coordinator = TaskCoordinator(
             store=store,
             filesystem=filesystem,
             archive=ArchiveExtractor(),
-            matcher=MoviePilotMatcher(),
+            matcher=matcher,
             sources=sources,
             config=self.config,
             inventory=inventory,
@@ -154,7 +155,7 @@ class SubtitleAssistant(_PluginBase):
         self.inventory = inventory
         self.coordinator = coordinator
         self.targets = targets
-        self.manual_search = ManualSearchService(targets=targets, sources=sources)
+        self.manual_search = ManualSearchService(targets=targets, sources=sources, matcher=matcher)
         self.retargeting = RetargetService(
             store=store,
             filesystem=filesystem,

@@ -50,6 +50,13 @@ class SubtitleSource(StrEnum):
     ASSRT = "assrt"
 
 
+class CandidateRecognitionStatus(StrEnum):
+    """人工候选对当前整理历史目标的识别状态。"""
+
+    RECOGNIZED = "recognized"
+    UNRECOGNIZED = "unrecognized"
+
+
 class PackageScope(StrEnum):
     """字幕候选覆盖范围。"""
 

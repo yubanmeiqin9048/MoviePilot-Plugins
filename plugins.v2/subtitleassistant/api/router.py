@@ -22,9 +22,10 @@ from ..application.record_deletion import (
     RecordDeletionService,
 )
 from ..application.retargeting import RetargetMapping
+from ..application.searches import SearchTarget
 from ..application.tasks import TaskWorkItem
 from ..domain.enums import FileLocation, RecordStatus, SubtitleSource, TaskStatus
-from ..domain.models import MatchRecord, SubtitleTask
+from ..domain.models import CandidateRecognition, MatchRecord, SubtitleTask
 from ..domain.query import assrt_title_queries
 from .schemas import (
     BatchRecordDeletePreflightItem,
@@ -51,6 +52,7 @@ from .schemas import (
     RecordPage,
     RetargetPreviewResponse,
     RetargetRequest,
+    SearchPlanItem,
     SourceStatusItem,
     TargetListItem,
     TargetPage,
@@ -375,14 +377,14 @@ class ApiController:
         )
 
     @staticmethod
-    def _target_item(target: Any) -> TargetListItem:
+    def _target_item(target: SearchTarget) -> TargetListItem:
         """把整理历史目标转换为前端安全模型。"""
 
         context = target.context
         assrt_first, assrt_second = assrt_title_queries(context)
         media_id = context.imdb_id or (str(context.tmdb_id) if context.tmdb_id else None)
-        plans = {
-            "moviepilot": [
+        plans: dict[SubtitleSource, list[SearchPlanItem]] = {
+            SubtitleSource.MOVIEPILOT: [
                 {
                     "kind": "title",
                     "label": "英文标题关键词（搜索时生成）",
@@ -390,7 +392,7 @@ class ApiController:
                     "editable": False,
                 }
             ],
-            "opensubtitles": [
+            SubtitleSource.OPENSUBTITLES: [
                 {"kind": "id", "label": "媒体 ID", "query": media_id, "editable": False},
                 {
                     "kind": "title",
@@ -399,7 +401,7 @@ class ApiController:
                     "editable": bool(context.english_title),
                 },
             ],
-            "assrt": [
+            SubtitleSource.ASSRT: [
                 {"kind": "title", "label": "主标题", "query": assrt_first, "editable": True},
                 {"kind": "fallback", "label": "英文名/原名", "query": assrt_second, "editable": True},
             ],
@@ -420,10 +422,10 @@ class ApiController:
         )
 
     @staticmethod
-    def _manual_default_plans(source: SubtitleSource, queries: list[str]) -> list[dict[str, Any]]:
+    def _manual_default_plans(source: SubtitleSource, queries: list[str]) -> list[SearchPlanItem]:
         """把来源实际默认查询转换为前端可编辑方案。"""
 
-        plans: list[dict[str, Any]] = []
+        plans: list[SearchPlanItem] = []
         for index, query in enumerate(queries):
             if source is SubtitleSource.MOVIEPILOT:
                 kind, label, editable = "title", f"英文关键词 {index + 1}", True
@@ -446,9 +448,10 @@ class ApiController:
         return plans
 
     @staticmethod
-    def _candidate_item(candidate: Any, query: str | None) -> ManualCandidateItem:
+    def _candidate_item(recognition: CandidateRecognition, query: str | None) -> ManualCandidateItem:
         """把领域候选转换为不含下载定位的人工搜索 DTO。"""
 
+        candidate = recognition.candidate
         allowed = {
             SubtitleSource.MOVIEPILOT: {"site_name", "description"},
             SubtitleSource.OPENSUBTITLES: {"release", "media_id"},
@@ -463,6 +466,7 @@ class ApiController:
             details["revision"] = candidate.revision
         return ManualCandidateItem(
             candidate_key=candidate.stable_key,
+            recognition_status=recognition.status,
             source=candidate.source,
             name=candidate.name,
             file_name=candidate.file_name,
