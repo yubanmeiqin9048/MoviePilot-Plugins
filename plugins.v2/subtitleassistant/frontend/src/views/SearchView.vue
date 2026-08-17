@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, inject, ref } from 'vue'
 
 import { downloadCandidate, getErrorMessage, searchSubtitles } from '@/api/client'
 import EmptyState from '@/components/EmptyState.vue'
 import StateChip from '@/components/StateChip.vue'
-import TargetSelector from '@/components/TargetSelector.vue'
+import TargetPickerDialog from '@/components/TargetPickerDialog.vue'
 import type {
   HostToast,
   PluginApi,
@@ -36,6 +36,7 @@ const toast = inject<HostToast | null>('moviepilot:toast', null)
 
 const sourceOrder: SubtitleSource[] = ['moviepilot', 'opensubtitles', 'assrt']
 const target = ref<TargetItem | null>(null)
+const pickerOpen = ref(false)
 const keywords = ref<Record<SubtitleSource, string>>({ moviepilot: '', opensubtitles: '', assrt: '' })
 const response = ref<SearchResponse | null>(null)
 const searchedConditions = ref('')
@@ -78,6 +79,10 @@ const currentConditions = computed(() => JSON.stringify({
   keywords: sourceOrder.map(source => cleanKeyword(keywords.value[source])),
 }))
 const resultsStale = computed(() => Boolean(response.value && searchedConditions.value !== currentConditions.value))
+const searchButtonLabel = computed(() => {
+  if (!response.value) return '搜索字幕'
+  return resultsStale.value ? '按新条件搜索' : '重新搜索'
+})
 
 async function search(): Promise<void> {
   if (!target.value) {
@@ -132,10 +137,11 @@ async function download(candidate: SubtitleCandidate): Promise<void> {
   }
 }
 
-function changeTarget(): void {
+function applyTarget(next: TargetItem): void {
+  if (target.value?.history_id === next.history_id) return
   searchRequestId += 1
   loading.value = false
-  target.value = null
+  target.value = next
   response.value = null
   searchedConditions.value = ''
   recognitionFilter.value = 'all'
@@ -244,185 +250,183 @@ function copyPlan(source: SubtitleSource, query: string | null, editable: boolea
     <header class="view-header">
       <div>
         <h2 id="search-view-title">字幕搜索</h2>
-        <p>{{ target ? '确认来源执行结果，在统一候选流中判断并下载。' : '先从 MoviePilot 整理历史中确认要补字幕的目标。' }}</p>
+        <p>选定整理历史目标后跨来源搜索，并在统一候选流中判断与下载。</p>
       </div>
+      <VBtn
+        v-if="target"
+        class="header-search-button"
+        color="primary"
+        prepend-icon="mdi-magnify"
+        :loading="loading"
+        @click="search"
+      >
+        {{ searchButtonLabel }}
+      </VBtn>
     </header>
 
-    <section v-if="!target" class="target-discovery" aria-labelledby="target-picker-title">
-      <div class="section-heading">
-        <div>
-          <h3 id="target-picker-title">选择整理历史目标</h3>
-          <p>按媒体名称、目标文件或路径查找最近整理记录。</p>
+    <VAlert v-if="resultsStale" type="warning" variant="tonal" density="compact" class="search-feedback">
+      搜索条件已变化。当前候选仍来自上一次搜索；重新搜索后才能下载。
+    </VAlert>
+
+    <section class="target-panel" :class="{ 'target-panel--empty': !target }" aria-labelledby="target-panel-title">
+      <h3 id="target-panel-title" class="sr-only">搜索目标</h3>
+
+      <div v-if="!target" class="target-empty">
+        <span class="target-badge target-badge--empty" aria-hidden="true"><VIcon icon="mdi-crosshairs-question" size="26" /></span>
+        <div class="target-empty-copy">
+          <strong>先确定要补字幕的目标</strong>
+          <span>从 MoviePilot 整理历史中选择一条记录，插件会据此生成各来源的默认查询。</span>
+        </div>
+        <VBtn color="primary" prepend-icon="mdi-format-list-bulleted" @click="pickerOpen = true">选择目标</VBtn>
+      </div>
+
+      <div v-else class="target-summary">
+        <div class="target-summary-main">
+          <span class="target-badge" aria-hidden="true">
+            <VIcon :icon="target.media_type === 'movie' ? 'mdi-movie-outline' : 'mdi-television-classic'" size="24" />
+          </span>
+          <div class="target-identity">
+            <strong>{{ mediaLabel(target.media_title, target.year, target.season, target.episode) }}</strong>
+            <span class="target-meta">
+              <VChip size="x-small" variant="tonal" label>{{ mediaTypeLabels[target.media_type] }}</VChip>
+              <em :title="target.target_file_name">{{ target.target_file_name }}</em>
+            </span>
+            <small class="target-path target-path--full">{{ fullPath(target.target_path) }}</small>
+            <small class="target-path target-path--short">{{ shortPath(target.target_path) }}</small>
+          </div>
+        </div>
+        <div class="target-actions">
+          <VBtn variant="text" size="small" prepend-icon="mdi-swap-horizontal" @click="pickerOpen = true">更换目标</VBtn>
         </div>
       </div>
-      <TargetSelector v-model="target" :api="props.api" :plugin-id="props.pluginId" />
-      <VAlert v-if="searchError" type="error" variant="tonal" density="compact" class="search-feedback">
-        {{ searchError }}
-      </VAlert>
-    </section>
 
-    <template v-else>
-      <VAlert v-if="resultsStale" type="warning" variant="tonal" density="compact" class="stale-alert">
-        搜索条件已变化。当前候选仍来自上一次搜索；重新搜索后才能下载。
-      </VAlert>
-
-      <section class="execution-overview" aria-label="搜索执行总览">
-        <div class="target-overview">
-          <div class="target-overview-main">
-            <VIcon :icon="target.media_type === 'movie' ? 'mdi-movie-outline' : 'mdi-television-classic'" size="24" aria-hidden="true" />
-            <div>
-              <strong>{{ mediaLabel(target.media_title, target.year, target.season, target.episode) }}</strong>
-              <span>{{ mediaTypeLabels[target.media_type] }} · {{ target.target_file_name }}</span>
-              <small class="target-path target-path--full">{{ fullPath(target.target_path) }}</small>
-              <small class="target-path target-path--short">{{ shortPath(target.target_path) }}</small>
+      <VExpansionPanels v-if="target" v-model="keywordPanel" multiple variant="accordion" class="keyword-panel">
+        <VExpansionPanel>
+          <VExpansionPanelTitle>
+            <div class="keyword-panel-title">
+              <span><VIcon icon="mdi-tune-variant" size="18" />来源关键词</span>
+              <small>可选，留空使用默认查询</small>
             </div>
-          </div>
-          <div class="target-actions">
-            <VBtn variant="text" prepend-icon="mdi-swap-horizontal" @click="changeTarget">更换目标</VBtn>
-            <VBtn class="target-search-button" color="primary" prepend-icon="mdi-magnify" :loading="loading" @click="search">
-              {{ response ? (resultsStale ? '按新条件搜索' : '重新搜索') : '搜索字幕' }}
-            </VBtn>
-          </div>
-        </div>
-
-        <VExpansionPanels v-model="keywordPanel" multiple variant="accordion" class="keyword-panel">
-          <VExpansionPanel>
-            <VExpansionPanelTitle>
-              <div class="keyword-panel-title">
-                <span><VIcon icon="mdi-tune-variant" size="18" />来源关键词</span>
-                <small>可选，留空使用默认查询</small>
-              </div>
-            </VExpansionPanelTitle>
-            <VExpansionPanelText>
-              <p class="control-note">填写后只覆盖对应来源的搜索文本，不改变其他来源的默认查询计划。</p>
-              <div class="keyword-grid">
-                <div v-for="source in sourceOrder" :key="source" class="keyword-block">
-                  <VTextField
-                    :model-value="keywords[source]"
-                    :label="sourceLabels[source]"
-                    placeholder="可选，自定义搜索词"
-                    clearable
-                    hide-details="auto"
-                    density="compact"
-                    @update:model-value="setKeyword(source, $event)"
-                  />
-                  <div v-if="plansForSource(source).length" class="default-plan">
-                    <span>默认</span>
-                    <VChip
-                      v-for="(plan, index) in plansForSource(source)"
-                      :key="`${source}-${plan.kind}-${index}`"
-                      size="x-small"
-                      variant="tonal"
-                      label
-                      :class="{ 'default-plan--editable': plan.editable }"
-                      :clickable="plan.editable"
-                      @click="copyPlan(source, plan.query, plan.editable)"
-                    >
-                      {{ plan.label }}{{ plan.query ? ` · ${plan.query}` : '' }}
-                    </VChip>
-                  </div>
+          </VExpansionPanelTitle>
+          <VExpansionPanelText>
+            <p class="control-note">填写后只覆盖对应来源的搜索文本，不改变其他来源的默认查询计划。</p>
+            <div class="keyword-grid">
+              <div v-for="source in sourceOrder" :key="source" class="keyword-block">
+                <VTextField
+                  :model-value="keywords[source]"
+                  :label="sourceLabels[source]"
+                  placeholder="可选，自定义搜索词"
+                  clearable
+                  hide-details="auto"
+                  density="compact"
+                  @update:model-value="setKeyword(source, $event)"
+                />
+                <div v-if="plansForSource(source).length" class="default-plan">
+                  <span>默认</span>
+                  <VChip
+                    v-for="(plan, index) in plansForSource(source)"
+                    :key="`${source}-${plan.kind}-${index}`"
+                    size="x-small"
+                    variant="tonal"
+                    label
+                    :class="{ 'default-plan--editable': plan.editable }"
+                    :clickable="plan.editable"
+                    @click="copyPlan(source, plan.query, plan.editable)"
+                  >
+                    {{ plan.label }}{{ plan.query ? ` · ${plan.query}` : '' }}
+                  </VChip>
                 </div>
               </div>
-            </VExpansionPanelText>
-          </VExpansionPanel>
-        </VExpansionPanels>
-
-        <section class="source-execution" aria-labelledby="source-execution-title">
-          <div class="source-execution-heading">
-            <div>
-              <h3 id="source-execution-title">本次来源</h3>
-              <p>只读执行结论，不影响候选筛选。</p>
             </div>
-          </div>
-          <div v-if="loading" class="source-placeholder" role="status">
-            <VProgressCircular indeterminate color="primary" size="18" width="2" />
-            <span>正在查询全部可用字幕源…</span>
-          </div>
-          <div v-else-if="groups.length" class="execution-list">
-            <article v-for="group in groups" :key="group.source" class="execution-row">
-              <div class="execution-source">
-                <StateChip :state="sourceGroupState(group)" size="x-small" />
-                <strong>{{ sourceLabels[group.source] }}</strong>
-              </div>
-              <span>{{ group.candidate_count }} 个候选 · {{ formatDuration(group.duration_ms) }}</span>
-              <small :class="{ 'error-text': group.status === 'error' }">{{ searchExecutionSummary(group) }}</small>
-            </article>
-          </div>
-          <div v-else class="source-placeholder" role="status">
-            <VIcon icon="mdi-source-branch" size="20" aria-hidden="true" />
-            <span>搜索后在这里查看 MoviePilot、OpenSubtitles 和 ASSRT 的执行结论。</span>
-          </div>
-        </section>
-      </section>
+          </VExpansionPanelText>
+        </VExpansionPanel>
+      </VExpansionPanels>
 
-      <VAlert v-if="searchError" type="error" variant="tonal" density="compact" class="search-feedback">
-        {{ searchError }}
-      </VAlert>
-      <VAlert v-if="notice" type="info" variant="tonal" density="compact" closable class="search-feedback" @click:close="notice = ''">
-        {{ notice }}
-      </VAlert>
-
-      <section class="candidate-filter-band" aria-labelledby="candidate-filter-title">
-        <div class="candidate-filter-heading">
-          <h3 id="candidate-filter-title">筛选候选</h3>
-          <span>当前显示 {{ visibleCandidates.length }} / {{ orderedCandidates.length }}</span>
+      <div v-if="target" class="source-strip" aria-label="本次来源执行结果">
+        <div v-if="loading" class="source-placeholder" role="status">
+          <VProgressCircular indeterminate color="primary" size="16" width="2" />
+          <span>正在查询全部可用字幕源…</span>
         </div>
-        <div class="filter-controls">
-          <div class="recognition-filter">
-            <span>识别状态</span>
-            <VBtnToggle v-model="recognitionFilter" mandatory color="primary" variant="outlined" density="compact" aria-label="按识别状态筛选候选">
-              <VBtn value="all">全部 {{ orderedCandidates.length }}</VBtn>
-              <VBtn value="recognized">已识别 {{ recognizedCandidates.length }}</VBtn>
-              <VBtn value="unrecognized">未识别 {{ unrecognizedCandidates.length }}</VBtn>
-            </VBtnToggle>
-          </div>
-          <VSelect v-model="sourceFilter" class="source-filter" label="字幕源" :items="sourceFilterItems" density="compact" hide-details />
+        <template v-else-if="groups.length">
+          <article v-for="group in groups" :key="group.source" class="source-cell">
+            <div class="source-cell-head">
+              <strong>{{ sourceLabels[group.source] }}</strong>
+              <StateChip :state="sourceGroupState(group)" size="x-small" />
+            </div>
+            <p class="source-cell-metric">{{ group.candidate_count }} 个候选 · {{ formatDuration(group.duration_ms) }}</p>
+            <small :class="{ 'error-text': group.status === 'error' }" :title="searchExecutionSummary(group)">{{ searchExecutionSummary(group) }}</small>
+          </article>
+        </template>
+        <div v-else class="source-placeholder" role="status">
+          <VIcon icon="mdi-source-branch" size="18" aria-hidden="true" />
+          <span>搜索后在这里查看 MoviePilot、OpenSubtitles 和 ASSRT 的执行结论。</span>
         </div>
-      </section>
+      </div>
+    </section>
 
-      <section class="candidate-results" aria-labelledby="candidate-results-title">
-        <div class="results-heading">
-          <div>
-            <h3 id="candidate-results-title">候选结果</h3>
-            <p v-if="response">已识别候选稳定排列在前；未识别候选仍可下载。</p>
-            <p v-else>跨来源候选将在这里统一展示。</p>
-          </div>
+    <VAlert v-if="searchError" type="error" variant="tonal" density="compact" class="search-feedback">
+      {{ searchError }}
+    </VAlert>
+    <VAlert v-if="notice" type="info" variant="tonal" density="compact" closable class="search-feedback" @click:close="notice = ''">
+      {{ notice }}
+    </VAlert>
+
+    <section class="candidate-results" aria-labelledby="candidate-results-title">
+      <div class="results-heading">
+        <div class="results-title">
+          <h3 id="candidate-results-title">候选结果</h3>
+          <p v-if="orderedCandidates.length">显示 {{ visibleCandidates.length }} / {{ orderedCandidates.length }} 条 · 已识别候选排列在前</p>
+          <p v-else-if="response">本次搜索没有可下载候选</p>
+          <p v-else>跨来源候选将在这里统一展示</p>
         </div>
+        <div v-if="orderedCandidates.length" class="results-filters">
+          <VBtnToggle v-model="recognitionFilter" mandatory color="primary" variant="outlined" density="compact" class="recognition-filter" aria-label="按识别状态筛选候选">
+            <VBtn value="all">全部 {{ orderedCandidates.length }}</VBtn>
+            <VBtn value="recognized">已识别 {{ recognizedCandidates.length }}</VBtn>
+            <VBtn value="unrecognized">未识别 {{ unrecognizedCandidates.length }}</VBtn>
+          </VBtnToggle>
+          <VSelect v-model="sourceFilter" class="source-filter" label="字幕源" :items="sourceFilterItems" variant="outlined" density="compact" hide-details />
+        </div>
+      </div>
 
-        <VSkeletonLoader v-if="loading" type="list-item-three-line@6" class="results-loading" />
-        <EmptyState v-else-if="!response" icon="mdi-text-search" title="等待搜索" message="确认目标后开始搜索，结果将按固定来源顺序汇总。" />
-        <EmptyState v-else-if="!orderedCandidates.length" icon="mdi-file-search-outline" title="没有候选结果" message="本次所有来源均未返回可下载字幕，请查看来源状态或调整搜索关键词。" />
-        <EmptyState v-else-if="!visibleCandidates.length" icon="mdi-filter-off-outline" title="当前筛选没有候选" message="切换筛选条件可继续查看本次搜索的全部结果。" />
-        <div v-else class="candidate-table-wrap" aria-live="polite">
-          <table class="candidate-table">
-            <thead>
-              <tr>
-                <th>识别</th>
-                <th>候选</th>
-                <th>来源</th>
-                <th>范围</th>
-                <th>语言 / 格式</th>
-                <th><span class="sr-only">操作</span></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="candidate in visibleCandidates" :key="candidate.candidate_key">
-                <td data-label="识别状态" class="candidate-recognition"><StateChip :state="candidateRecognitionState(candidate)" size="x-small" /></td>
-                <td data-label="候选" class="candidate-name">
-                  <strong class="candidate-value">{{ candidate.name }}</strong>
-                  <span class="candidate-secondary">{{ candidate.file_name || '文件名未提供' }}</span>
-                  <small class="candidate-note">{{ sourceDetails(candidate) || (candidate.query ? `查询：${candidate.query}` : '无额外来源摘要') }}</small>
-                </td>
-                <td data-label="来源" class="candidate-source"><strong class="candidate-value">{{ sourceLabels[candidate.source] }}</strong></td>
-                <td data-label="范围" class="candidate-range">
-                  <strong class="candidate-value">{{ candidateRange(candidate) }}</strong>
-                  <small class="candidate-note">{{ packageLabels[candidate.package_scope] }}</small>
-                </td>
-                <td data-label="语言 / 格式" class="candidate-language">
-                  <strong class="candidate-value">{{ candidate.language || '未标记' }}</strong>
-                  <small class="candidate-note">{{ candidate.format && candidate.format.toUpperCase() !== 'UNKNOWN' ? candidate.format.toUpperCase() : '未标记' }} · {{ translationLabels[candidate.translation_type] }}{{ candidate.hearing_impaired ? ' · SDH/CC' : '' }}</small>
-                </td>
-                <td data-label="操作" class="candidate-action">
+      <VSkeletonLoader v-if="loading" type="table-heading, table-row-divider@6" class="results-loading" />
+      <EmptyState v-else-if="!target" icon="mdi-crosshairs-question" title="等待选择目标" message="先在上方选择整理历史目标，插件会据此生成各来源的默认查询。" />
+      <EmptyState v-else-if="!response" icon="mdi-text-search" title="等待搜索" message="按当前目标和关键词开始搜索，结果将按固定来源顺序汇总。">
+        <template #actions><VBtn color="primary" variant="tonal" prepend-icon="mdi-magnify" :loading="loading" @click="search">搜索字幕</VBtn></template>
+      </EmptyState>
+      <EmptyState v-else-if="!orderedCandidates.length" icon="mdi-file-search-outline" title="没有候选结果" message="本次所有来源均未返回可下载字幕，请查看来源状态或调整搜索关键词。" />
+      <EmptyState v-else-if="!visibleCandidates.length" icon="mdi-filter-off-outline" title="当前筛选没有候选" message="切换筛选条件可继续查看本次搜索的全部结果。" />
+      <div v-else class="candidate-table-wrap" aria-live="polite">
+        <table class="candidate-table">
+          <thead>
+            <tr>
+              <th>识别</th>
+              <th>候选</th>
+              <th>来源</th>
+              <th>范围</th>
+              <th>语言 / 格式</th>
+              <th><span class="sr-only">操作</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="candidate in visibleCandidates" :key="candidate.candidate_key">
+              <td data-label="识别状态" class="candidate-recognition"><StateChip :state="candidateRecognitionState(candidate)" size="x-small" /></td>
+              <td data-label="候选" class="candidate-name">
+                <strong class="candidate-value">{{ candidate.name }}</strong>
+                <span class="candidate-secondary">{{ candidate.file_name || '文件名未提供' }}</span>
+                <small class="candidate-note">{{ sourceDetails(candidate) || (candidate.query ? `查询：${candidate.query}` : '无额外来源摘要') }}</small>
+              </td>
+              <td data-label="来源" class="candidate-source"><strong class="candidate-value">{{ sourceLabels[candidate.source] }}</strong></td>
+              <td data-label="范围" class="candidate-range">
+                <strong class="candidate-value">{{ candidateRange(candidate) }}</strong>
+                <small class="candidate-note">{{ packageLabels[candidate.package_scope] }}</small>
+              </td>
+              <td data-label="语言 / 格式" class="candidate-language">
+                <strong class="candidate-value">{{ candidate.language || '未标记' }}</strong>
+                <small class="candidate-note">{{ candidate.format && candidate.format.toUpperCase() !== 'UNKNOWN' ? candidate.format.toUpperCase() : '未标记' }} · {{ translationLabels[candidate.translation_type] }}{{ candidate.hearing_impaired ? ' · SDH/CC' : '' }}</small>
+              </td>
+              <td data-label="操作" class="candidate-action">
+                <div class="candidate-action-inner">
                   <p v-if="candidateTargetMismatch(candidate)" class="candidate-warning">
                     <VIcon icon="mdi-alert-outline" size="15" color="warning" aria-hidden="true" />与当前目标集不同
                   </p>
@@ -441,100 +445,144 @@ function copyPlan(source: SubtitleSource, query: string | null, editable: boolea
                   >
                     下载
                   </VBtn>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </template>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <TargetPickerDialog
+      v-model="pickerOpen"
+      :api="props.api"
+      :plugin-id="props.pluginId"
+      :current="target"
+      @select="applyTarget"
+    />
   </section>
 </template>
 
 <style scoped>
-.view-shell { min-width: 0; }
-.view-header { margin-bottom: 1rem; }
-.view-header h2, .section-heading h3, .source-execution-heading h3, .candidate-filter-heading h3, .results-heading h3 { margin: 0; color: rgb(var(--v-theme-on-surface)); font-size: 0.9375rem; font-weight: 650; letter-spacing: 0; }
-.view-header p, .section-heading p, .source-execution-heading p, .results-heading p { margin: 0.25rem 0 0; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; line-height: 1.5; }
-.target-discovery { width: min(100%, 54rem); margin: 2.5rem auto 0; padding: 1rem; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; background: rgba(var(--v-theme-surface), 0.55); }
-.section-heading { margin-bottom: 1rem; }
-.stale-alert, .search-feedback { margin-bottom: 0.75rem; }
-.execution-overview { display: flex; flex-direction: column; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; background: rgba(var(--v-theme-surface), 0.55); }
-.target-overview { display: flex; min-width: 0; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 1rem; padding: 0.9rem 1rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
-.target-overview-main { display: flex; min-width: 0; align-items: center; gap: 0.65rem; }
-.target-overview-main > div { min-width: 0; }
-.target-overview-main strong, .target-overview-main span, .target-overview-main small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.target-overview-main strong { font-size: 0.875rem; }
-.target-overview-main span, .target-overview-main small { margin-top: 0.18rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.7rem; }
-.target-overview-main .target-path--full { display: block; white-space: normal; overflow-wrap: anywhere; line-height: 1.45; }
-.target-overview-main .target-path--short { display: none; }
-.target-actions { display: flex; align-items: center; justify-content: flex-end; gap: 0.4rem; }
-.target-search-button { width: fit-content; min-width: 0; padding-inline: 0.9rem; }
-.keyword-panel { border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
-.keyword-panel :deep(.v-expansion-panel-title) { min-height: 3rem; padding: 0.65rem 0.8rem; }
-.keyword-panel :deep(.v-expansion-panel-text__wrapper) { padding: 0 0.8rem 0.8rem; }
+.search-view {
+  --panel-border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  --panel-surface: rgba(var(--v-theme-surface), 0.55);
+  --panel-radius: 0.5rem;
+  --muted: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+  min-width: 0;
+}
+.view-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+.view-header h2 { margin: 0; color: rgb(var(--v-theme-on-surface)); font-size: 1rem; font-weight: 650; letter-spacing: 0; }
+.view-header p { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.8125rem; line-height: 1.5; }
+.header-search-button { flex: 0 0 auto; }
+.search-feedback { margin-bottom: 0.75rem; }
+.target-panel { overflow: hidden; border: var(--panel-border); border-radius: var(--panel-radius); background: var(--panel-surface); }
+.target-panel--empty { border-style: dashed; background: rgba(var(--v-theme-surface), 0.35); }
+.target-empty { display: flex; align-items: center; gap: 1rem; padding: 1.5rem 1.25rem; }
+.target-empty-copy { display: grid; min-width: 0; flex: 1 1 auto; gap: 0.2rem; }
+.target-empty-copy strong { font-size: 0.9375rem; font-weight: 650; }
+.target-empty-copy span { color: var(--muted); font-size: 0.8125rem; line-height: 1.5; }
+.target-summary { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 1rem 1.15rem; }
+.target-summary-main { display: flex; min-width: 0; flex: 1 1 auto; align-items: center; gap: 0.85rem; }
+.target-badge { display: inline-flex; width: 2.75rem; height: 2.75rem; flex: 0 0 auto; align-items: center; justify-content: center; border-radius: 0.5rem; color: rgb(var(--v-theme-primary)); background: rgba(var(--v-theme-primary), 0.12); }
+.target-badge--empty { color: var(--muted); background: rgba(var(--v-theme-on-surface), 0.06); }
+.target-identity { display: grid; min-width: 0; flex: 1 1 auto; gap: 0.25rem; }
+.target-identity strong { min-width: 0; overflow: hidden; font-size: 0.9375rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.target-meta { display: flex; min-width: 0; align-items: center; gap: 0.4rem; }
+.target-meta em { min-width: 0; overflow: hidden; color: var(--muted); font-size: 0.75rem; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.target-path { color: var(--muted); font-size: 0.7rem; line-height: 1.45; }
+.target-path--full { overflow-wrap: anywhere; }
+.target-path--short { display: none; }
+.target-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 0.35rem; }
+.keyword-panel { border-top: var(--panel-border); border-radius: 0; }
+.keyword-panel :deep(.v-expansion-panel) { background: transparent; }
+.keyword-panel :deep(.v-expansion-panel-title) { min-height: 2.85rem; padding: 0.6rem 1.15rem; }
+.keyword-panel :deep(.v-expansion-panel-text__wrapper) { padding: 0 1.15rem 0.9rem; }
 .keyword-panel-title { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 1rem; padding-right: 0.5rem; }
 .keyword-panel-title span { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.8125rem; font-weight: 650; }
-.keyword-panel-title small, .control-note { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; }
+.keyword-panel-title small, .control-note { color: var(--muted); font-size: 0.6875rem; }
 .control-note { margin: 0 0 0.75rem; line-height: 1.5; }
-.keyword-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.65rem; }
+.keyword-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
 .keyword-block { min-width: 0; }
-.default-plan { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.35rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; line-height: 1.4; }
+.default-plan { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; color: var(--muted); font-size: 0.6875rem; line-height: 1.4; }
 .default-plan--editable { cursor: pointer; }
-.source-execution { min-width: 0; }
-.source-execution-heading { display: flex; min-height: 2.85rem; align-items: center; padding: 0.45rem 0.8rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
-.source-placeholder { display: flex; min-height: 6.5rem; align-items: center; justify-content: center; gap: 0.5rem; padding: 0.75rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; text-align: center; }
-.execution-row { display: grid; min-height: 3.15rem; grid-template-columns: minmax(9rem, 0.7fr) 7rem minmax(0, 1fr); align-items: center; gap: 0.6rem; padding: 0.5rem 0.8rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
-.execution-row:first-child { border-top: 0; }
-.execution-source { display: inline-flex; min-width: 0; align-items: center; gap: 0.4rem; }
-.execution-source strong, .execution-row > span { font-size: 0.75rem; }
-.execution-row > span { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); }
-.execution-row small { min-width: 0; overflow: hidden; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; text-overflow: ellipsis; white-space: nowrap; }
+.source-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: var(--panel-border); background: rgba(var(--v-theme-on-surface), 0.02); }
+.source-cell { display: grid; min-width: 0; align-content: start; gap: 0.3rem; padding: 0.75rem 1.15rem; }
+.source-cell + .source-cell { border-left: var(--panel-border); }
+.source-cell-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.source-cell-head strong { min-width: 0; overflow: hidden; font-size: 0.75rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.source-cell-metric { margin: 0; color: rgb(var(--v-theme-on-surface)); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.source-cell small { min-width: 0; overflow: hidden; color: var(--muted); font-size: 0.6875rem; text-overflow: ellipsis; white-space: nowrap; }
+.source-placeholder { display: flex; min-height: 3.25rem; align-items: center; justify-content: center; gap: 0.5rem; grid-column: 1 / -1; padding: 0.75rem 1.15rem; color: var(--muted); font-size: 0.75rem; text-align: center; }
 .error-text { color: rgb(var(--v-theme-error)) !important; }
-.candidate-filter-band { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 0.75rem; padding: 0.7rem 0.8rem; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; background: rgba(var(--v-theme-surface), 0.55); }
-.candidate-filter-heading span { display: block; margin-top: 0.18rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; }
-.filter-controls { display: grid; width: min(100%, 33rem); grid-template-columns: minmax(19rem, 1fr) minmax(10rem, 0.55fr); align-items: end; gap: 0.5rem; }
-.recognition-filter { display: grid; gap: 0.2rem; }
-.recognition-filter > span { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; }
-.recognition-filter :deep(.v-btn-toggle) { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.recognition-filter :deep(.v-btn) { min-width: 0; letter-spacing: 0; }
-.candidate-results { margin-top: 0.75rem; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; background: rgba(var(--v-theme-surface), 0.55); }
-.results-heading { padding: 0.8rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
+.candidate-results { margin-top: 0.75rem; border: var(--panel-border); border-radius: var(--panel-radius); background: var(--panel-surface); }
+.results-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.7rem 1.15rem; border-bottom: var(--panel-border); }
+.results-title { min-width: 0; }
+.results-title h3 { margin: 0; color: rgb(var(--v-theme-on-surface)); font-size: 0.875rem; font-weight: 650; letter-spacing: 0; }
+.results-title p { margin: 0.2rem 0 0; color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.results-filters { display: flex; flex: 0 0 auto; align-items: center; gap: 0.5rem; }
+.recognition-filter :deep(.v-btn-toggle) { height: 2.5rem; }
+.recognition-filter :deep(.v-btn) { min-width: 0; height: 2.5rem; padding-inline: 0.7rem; font-size: 0.75rem; letter-spacing: 0; }
+.source-filter { width: 12rem; }
 .results-loading { min-height: 20rem; }
 .candidate-table-wrap { min-width: 0; }
-.candidate-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 0.75rem; }
-.candidate-table th { padding: 0.55rem 0.7rem; background: rgba(var(--v-theme-on-surface), 0.035); color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; font-weight: 650; text-align: left; }
+.candidate-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 0.75rem; }
+.candidate-table th {
+  position: sticky;
+  z-index: 2;
+  inset-block-start: 0;
+  padding: 0.6rem 0.9rem;
+  border-bottom: var(--panel-border);
+  color: var(--muted);
+  font-size: 0.6875rem;
+  font-weight: 650;
+  text-align: left;
+  background-color: rgb(var(--v-theme-surface));
+  background-image: linear-gradient(rgba(var(--v-theme-on-surface), 0.04), rgba(var(--v-theme-on-surface), 0.04));
+}
 .candidate-table th:nth-child(1) { width: 6.25rem; }
 .candidate-table th:nth-child(2) { width: 33%; }
 .candidate-table th:nth-child(3) { width: 10%; }
 .candidate-table th:nth-child(4) { width: 12%; }
 .candidate-table th:nth-child(5) { width: 16%; }
 .candidate-table th:last-child { width: 9.5rem; }
-.candidate-table td { padding: 0.7rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); vertical-align: top; overflow-wrap: anywhere; }
+.candidate-table td { padding: 0.8rem 0.9rem; border-bottom: var(--panel-border); vertical-align: top; overflow-wrap: anywhere; }
+.candidate-table tbody tr:last-child td { border-bottom: 0; }
+.candidate-table tbody tr:last-child td:first-child { border-end-start-radius: var(--panel-radius); }
+.candidate-table tbody tr:last-child td:last-child { border-end-end-radius: var(--panel-radius); }
+.candidate-table tbody tr { transition: background-color 160ms ease; }
+.candidate-table tbody tr:hover { background: rgba(var(--v-theme-primary), 0.05); }
 .candidate-table .candidate-value, .candidate-table .candidate-secondary, .candidate-table .candidate-note { display: block; }
 .candidate-table td strong { color: rgb(var(--v-theme-on-surface)); font-size: 0.75rem; font-weight: 650; }
-.candidate-table .candidate-secondary, .candidate-table .candidate-note { margin-top: 0.16rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; line-height: 1.4; }
-.candidate-name strong { font-size: 0.8125rem; }
-.candidate-action { display: grid; gap: 0.45rem; }
-.candidate-warning { display: flex; align-items: flex-start; gap: 0.25rem; margin: 0; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; line-height: 1.4; }
+.candidate-table .candidate-secondary, .candidate-table .candidate-note { margin-top: 0.18rem; color: var(--muted); font-size: 0.6875rem; line-height: 1.45; }
+.candidate-name strong { font-size: 0.8125rem; line-height: 1.4; }
+.candidate-action-inner { display: grid; gap: 0.45rem; }
+.candidate-warning { display: flex; align-items: flex-start; gap: 0.25rem; margin: 0; color: var(--muted); font-size: 0.6875rem; line-height: 1.4; }
 .download-error { margin: 0; font-size: 0.6875rem; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-@media (max-width: 959px) {
-  .filter-controls { width: min(100%, 28rem); grid-template-columns: minmax(16rem, 1fr) minmax(9rem, 0.55fr); }
+@media (max-width: 75rem) {
+  .results-heading { align-items: stretch; flex-direction: column; gap: 0.6rem; }
+  .results-filters { justify-content: space-between; }
+  .recognition-filter { flex: 1 1 auto; }
+  .recognition-filter :deep(.v-btn-toggle) { display: flex; width: 100%; }
+  .recognition-filter :deep(.v-btn) { flex: 1 1 0; }
 }
-@media (max-width: 800px) {
+@media (max-width: 59.99rem) {
+  .source-strip { grid-template-columns: 1fr; }
+  .source-cell + .source-cell { border-top: var(--panel-border); border-left: 0; }
+  .source-cell small { white-space: normal; }
+}
+@media (max-width: 50rem) {
   .view-header p { display: none; }
-  .target-discovery { margin-top: 1rem; padding: 0.75rem; }
-  .target-overview { flex-direction: column; align-items: stretch; gap: 0.6rem; }
-  .target-overview-main { align-items: flex-start; }
-  .target-overview-main .target-path--full { display: none; }
-  .target-overview-main .target-path--short { display: block; }
-  .target-actions { justify-content: stretch; }
-  .target-search-button { flex: 1; }
   .keyword-grid { grid-template-columns: 1fr; }
-  .candidate-filter-band { align-items: stretch; flex-direction: column; }
-  .filter-controls { width: 100%; grid-template-columns: 1fr; }
-  .recognition-filter :deep(.v-btn) { padding-inline: 0.3rem; font-size: 0.6875rem; }
+  .target-empty { align-items: flex-start; flex-direction: column; gap: 0.75rem; padding: 1.15rem; }
+  .target-summary { align-items: stretch; flex-direction: column; gap: 0.6rem; padding: 0.9rem 1rem; }
+  .target-summary-main { align-items: flex-start; }
+  .target-path--full { display: none; }
+  .target-path--short { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .target-actions { justify-content: flex-end; }
+  .results-filters { align-items: stretch; flex-direction: column; }
+  .source-filter { width: 100%; }
   .candidate-table-wrap { padding: 0.7rem; }
   .candidate-table thead { display: none; }
   .candidate-table, .candidate-table tbody { display: block; width: 100%; }
@@ -545,13 +593,14 @@ function copyPlan(source: SubtitleSource, query: string | null, editable: boolea
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 0.7rem 0.9rem;
     padding: 0.9rem;
-    border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+    border: var(--panel-border);
     border-radius: 0.45rem;
     background: rgba(var(--v-theme-surface), 0.58);
   }
-  .candidate-table td { display: block; min-width: 0; padding: 0; border: 0; }
-  .candidate-table td::before { display: block; margin-bottom: 0.22rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); content: attr(data-label); font-size: 0.625rem; line-height: 1.2; }
-  .candidate-table .candidate-recognition { display: flex; grid-column: 1 / -1; align-items: center; justify-content: space-between; padding-bottom: 0.7rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
+  .candidate-table tbody tr:hover { background: rgba(var(--v-theme-surface), 0.58); }
+  .candidate-table td, .candidate-table tbody tr:last-child td { display: block; min-width: 0; padding: 0; border: 0; }
+  .candidate-table td::before { display: block; margin-bottom: 0.22rem; color: var(--muted); content: attr(data-label); font-size: 0.625rem; line-height: 1.2; }
+  .candidate-table .candidate-recognition { display: flex; grid-column: 1 / -1; align-items: center; justify-content: space-between; padding-bottom: 0.7rem; border-bottom: var(--panel-border); }
   .candidate-table .candidate-recognition::before { margin: 0; }
   .candidate-table .candidate-recognition :deep([class~="v-chip"]) { display: inline-flex; width: auto; max-width: 100%; }
   .candidate-table .candidate-name { grid-column: 1 / -1; padding-top: 0.05rem; }
@@ -559,16 +608,13 @@ function copyPlan(source: SubtitleSource, query: string | null, editable: boolea
   .candidate-table .candidate-source,
   .candidate-table .candidate-range,
   .candidate-table .candidate-language { min-width: 0; }
-  .candidate-table .candidate-action { grid-column: 1 / -1; margin-top: 0.05rem; padding-top: 0.7rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
-  .candidate-table .candidate-action::before { display: none; }
-  .candidate-download-button { width: 100%; min-height: 2.75rem; }
+  .candidate-table .candidate-action { grid-column: 1 / -1; margin-top: 0.05rem; padding-top: 0.7rem; border-top: var(--panel-border); }
+  .candidate-table .candidate-action::before { display: none; }  .candidate-download-button { width: 100%; min-height: 2.75rem; }
 }
-@media (max-width: 420px) {
-  .target-actions { align-items: stretch; flex-direction: column-reverse; }
-  .target-actions :deep(.v-btn), .target-search-button { width: 100%; }
+@media (max-width: 26rem) {
+  .view-header { align-items: stretch; flex-direction: column; gap: 0.6rem; }
+  .header-search-button { width: 100%; }
   .keyword-panel-title { align-items: flex-start; flex-direction: column; gap: 0.2rem; }
-  .execution-row { grid-template-columns: minmax(0, 1fr) auto; }
-  .execution-row small { grid-column: 1 / -1; white-space: normal; }
 }
 @media (prefers-reduced-motion: reduce) {
   .search-view *, .search-view *::before, .search-view *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
