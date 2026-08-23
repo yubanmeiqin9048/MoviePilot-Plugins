@@ -1,8 +1,8 @@
 [tool.ty.environment]
 python = "/home/zhang/Documents/MoviePilot/.venv"
-python-version = "3.11"
+python-version = "3.14"
 python-platform = "linux"
-extra-paths = ["/home/zhang/Documents/MoviePilot"]
+extra-paths = ["..", "/home/zhang/Documents/MoviePilot"]
 
 [tool.ty.src]
 exclude = [
@@ -28,6 +28,13 @@ extend-exclude = [
 extend-select = ["B", "W", "PERF", "UP", "I", "SIM"]
 ignore = ["SIM105"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
 [tool.ruff.format]
 quote-style = "double"
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]

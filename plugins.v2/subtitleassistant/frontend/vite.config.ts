@@ -8,6 +8,8 @@ const runtimeProcess = (globalThis as typeof globalThis & {
 const devOrigin = runtimeProcess?.env?.SUBTITLE_ASSISTANT_DEV_ORIGIN || 'http://localhost:5173'
 
 export default defineConfig(({ command }) => ({
+  // node_modules is shared with the main worktree; keep Vite's mutable cache local.
+  cacheDir: '.vite',
   plugins: [
     vue(),
     federation({

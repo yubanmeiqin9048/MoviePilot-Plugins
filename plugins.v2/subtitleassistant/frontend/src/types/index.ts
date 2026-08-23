@@ -20,6 +20,8 @@ export type RecordDeleteMode = 'record_only' | 'record_and_file'
 export const MAX_RECORD_BATCH_SIZE = 100
 export type SubtitleSource = 'moviepilot' | 'opensubtitles' | 'assrt'
 export type CandidateRecognitionStatus = 'recognized' | 'unrecognized'
+export type CandidateRecognitionFilter = 'all' | CandidateRecognitionStatus
+export type CandidateSourceFilter = 'all' | SubtitleSource
 export type PackageScope = 'season_pack' | 'episode' | 'unknown'
 export type TranslationType = 'human' | 'unknown' | 'machine' | 'ai'
 export type SourceHealth = 'pending' | 'healthy' | 'limited' | 'error' | 'disabled'
@@ -205,6 +207,29 @@ export interface PageResponse<T> {
   page_size: 25 | 50 | 100
 }
 
+export interface RawHistoryPage {
+  items: HistoryRow[]
+  page: number
+  page_size: 25 | 50 | 100
+}
+
+export interface HistoryRow {
+  [key: string]: unknown
+  id?: string | number | null
+  status?: boolean | string | number | null
+  dest?: string | null
+  dest_storage?: string | null
+  dest_fileitem?: Record<string, unknown> | null
+  title?: string | null
+  year?: string | number | null
+  type?: string | null
+  seasons?: string | number | null
+  episodes?: string | number | null
+  tmdbid?: string | number | null
+  imdbid?: string | null
+  date?: string | null
+}
+
 export interface RecordListItem {
   id: string
   subtitle_file_name: string
@@ -296,6 +321,11 @@ export interface SearchRequest {
   moviepilot_keyword?: string | null
   opensubtitles_keyword?: string | null
   assrt_keyword?: string | null
+}
+
+export interface CandidateSourceFilterOption {
+  title: string
+  value: CandidateSourceFilter
 }
 
 export type ManualSourceResult = 'success' | 'limited' | 'error' | 'disabled' | 'unconfigured'

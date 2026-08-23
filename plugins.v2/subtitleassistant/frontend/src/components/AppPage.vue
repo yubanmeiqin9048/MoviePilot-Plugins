@@ -7,19 +7,22 @@ import SearchView from '@/views/SearchView.vue'
 import SourcesView from '@/views/SourcesView.vue'
 import TasksView from '@/views/TasksView.vue'
 
+type WorkbenchView = 'tasks' | 'records' | 'search' | 'sources'
+
 const props = withDefaults(defineProps<{
   api: PluginApi
   pluginId: string
   navKey?: string
+  initialView?: WorkbenchView
 }>(), {
   navKey: 'main',
+  initialView: 'tasks',
 })
 
 const emit = defineEmits<{ action: [] }>()
-type WorkbenchView = 'tasks' | 'records' | 'search' | 'sources'
 const SCROLL_MEMORY_SETTLE_MS = 600
 
-const activeView = ref<WorkbenchView>('tasks')
+const activeView = ref<WorkbenchView>(props.initialView)
 const workbenchElement = ref<HTMLElement | null>(null)
 const workbenchHeight = ref<number | null>(null)
 const viewScrollTop: Record<WorkbenchView, number> = {
@@ -225,10 +228,12 @@ onBeforeUnmount(() => {
 .subtitleassistant-workbench {
   box-sizing: border-box;
   width: 100%;
+  max-width: 100%;
   min-width: 0;
   margin: 0;
   padding: 1rem 1.25rem 2rem;
   color: rgb(var(--v-theme-on-surface));
+  overflow-x: clip;
 }
 
 .workbench-heading {
@@ -302,12 +307,14 @@ onBeforeUnmount(() => {
     block-size: 100%;
     min-height: 0;
     padding-top: 0.75rem;
+    max-width: 100%;
   }
 
   .workbench-view {
     block-size: 100%;
     min-block-size: 0;
     min-inline-size: 0;
+    max-inline-size: 100%;
     overflow: hidden;
   }
 

@@ -9,15 +9,16 @@ import {
   MAX_RECORD_BATCH_SIZE,
   type BatchRetargetPreviewItem,
   type BatchRetargetResponse,
+  type HistoryRow,
   type PluginApi,
   type RecordListItem,
   type TargetItem,
 } from '@/types'
-import { mediaLabel, shortPath } from '@/types/presentation'
+import { historyId, mediaLabel, shortPath } from '@/types/presentation'
 
 interface BatchRow {
   record: RecordListItem
-  target: TargetItem | null
+  target: HistoryRow | TargetItem | null
   preview: BatchRetargetPreviewItem | null
   completed: boolean
   error: string
@@ -59,7 +60,7 @@ const activeIndex = computed(() => {
 const executable = computed(() => Boolean(
   !inputError.value
   && pendingRows.value.length
-  && pendingRows.value.every(row => row.target && row.preview?.executable)
+  && pendingRows.value.every(row => row.target && historyId(row.target) != null && row.preview?.executable)
   && !previewing.value
   && !saving.value,
 ))
@@ -106,7 +107,7 @@ async function previewAll(options: { preserveGeneralError?: boolean } = {}): Pro
     const response = await previewBatchRetargetRecords(
       props.api,
       props.pluginId,
-      active.map(row => ({ record_id: row.record.id, target_history_id: row.target?.history_id ?? null })),
+      active.map(row => ({ record_id: row.record.id, target_history_id: historyId(row.target) })),
     )
     if (requestId !== previewRequest) return
     const byId = new Map(response.items.map(item => [item.record_id, item]))
@@ -145,7 +146,7 @@ function moveActive(delta: -1 | 1): void {
   if (next) activeId.value = next.record.id
 }
 
-function updateTarget(recordId: string, target: TargetItem | null): void {
+function updateTarget(recordId: string, target: HistoryRow | null): void {
   rows.value = rows.value.map(row => row.record.id === recordId
     ? { ...row, target, preview: null, error: '', executionError: '' }
     : row)
@@ -171,15 +172,17 @@ function removeRow(row: BatchRow): void {
 
 async function submit(): Promise<void> {
   if (!executable.value) return
+  const targetHistoryIds = pendingRows.value.map(row => historyId(row.target))
+  if (targetHistoryIds.some(historyIdValue => historyIdValue == null)) return
   saving.value = true
   generalError.value = ''
   try {
     const result = await retargetBatchRecords(
       props.api,
       props.pluginId,
-      pendingRows.value.map(row => ({
+      pendingRows.value.map((row, index) => ({
         record_id: row.record.id,
-        target_history_id: row.target!.history_id,
+        target_history_id: targetHistoryIds[index]!,
       })),
     )
     const byId = new Map(result.items.map(item => [item.record_id, item]))
@@ -357,8 +360,8 @@ function handleDialogUpdate(open: boolean): void {
               :model-value="activeRow.target"
               :api="api"
               :plugin-id="pluginId"
-              label="整理历史目标"
-              hint="系统仅按精确媒体身份和季集自动建议；可以手动修改。"
+              label="MoviePilot 整理历史"
+              hint="系统仅在选择后按精确媒体身份和季集验证；可以手动修改。"
               :disabled="saving || activeRow.completed"
               compact
               @update:model-value="updateTarget(activeRow.record.id, $event)"

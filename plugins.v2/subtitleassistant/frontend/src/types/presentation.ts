@@ -3,16 +3,20 @@ import type {
   AttributionEvidence,
   FileLocation,
   FileAttributionMethod,
+  HistoryRow,
   MediaType,
+  ManualSourceResult,
   PackageScope,
   PackageAttributionStrategy,
   RecordStatus,
+  SearchPlanItem,
   SourceHealth,
   SourceRunStatus,
   SubtitleSource,
   TaskStage,
   TaskStatus,
   TaskTrigger,
+  TargetItem,
   TranslationType,
   UnmatchedReason,
 } from '@/types'
@@ -22,6 +26,8 @@ export interface StatePresentation {
   icon: string
   color: 'default' | 'primary' | 'success' | 'info' | 'warning' | 'error'
 }
+
+type HistoryRecord = HistoryRow | TargetItem
 
 export const taskStates: Record<TaskStatus, StatePresentation> = {
   queued: { label: '等待中', icon: 'mdi-clock-outline', color: 'info' },
@@ -66,6 +72,12 @@ export const sourceLabels: Record<SubtitleSource, string> = {
   moviepilot: 'MoviePilot 站点源',
   opensubtitles: 'OpenSubtitles',
   assrt: 'ASSRT',
+}
+
+export const subtitleSourceOrder: SubtitleSource[] = ['moviepilot', 'opensubtitles', 'assrt']
+
+export function formatSearchPlan(plan: SearchPlanItem): string {
+  return [plan.label, plan.query].filter(Boolean).join(' · ')
 }
 
 export const packageLabels: Record<PackageScope, string> = {
@@ -130,6 +142,15 @@ export const sourceRunLabels: Record<SourceRunStatus, string> = {
   unconfigured: '未配置',
 }
 
+export function manualSourceState(status: ManualSourceResult, candidateCount: number): StatePresentation {
+  if (status === 'success' && candidateCount > 0) return { label: '已返回', icon: 'mdi-check-circle-outline', color: 'success' }
+  if (status === 'success') return { label: '无结果', icon: 'mdi-file-search-outline', color: 'default' }
+  if (status === 'limited') return { label: '受限', icon: 'mdi-timer-alert-outline', color: 'warning' }
+  if (status === 'disabled') return { label: '已禁用', icon: 'mdi-minus-circle-outline', color: 'default' }
+  if (status === 'unconfigured') return { label: '未配置', icon: 'mdi-cog-off-outline', color: 'default' }
+  return { label: '异常', icon: 'mdi-alert-circle-outline', color: 'error' }
+}
+
 export const attemptLabels: Record<AttemptResult, string> = {
   success: '落盘成功',
   download_failed: '下载失败',
@@ -147,6 +168,88 @@ export function formatDate(value?: string | null): string {
   if (!value) return '未记录'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN')
+}
+
+function historyText(value: unknown): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null
+  const text = String(value).trim()
+  return text || null
+}
+
+function historyNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value !== 'string' || !value.trim()) return null
+  const parsed = Number(value)
+  if (Number.isFinite(parsed)) return parsed
+  const match = value.match(/\d+/)
+  return match ? Number(match[0]) : null
+}
+
+export function historyId(item: HistoryRecord | null | undefined): string | number | null {
+  if (!item) return null
+  const raw = item as HistoryRow
+  const value = raw.id ?? raw['history_id']
+  return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) ? value : null
+}
+
+export function sameHistoryId(
+  left: HistoryRecord | null | undefined,
+  right: HistoryRecord | null | undefined,
+): boolean {
+  const leftId = historyId(left)
+  const rightId = historyId(right)
+  return leftId != null && rightId != null && String(leftId) === String(rightId)
+}
+
+export function historyTitle(item: HistoryRecord): string {
+  const raw = item as HistoryRow
+  return historyText(raw.title ?? raw['media_title']) || '未识别媒体'
+}
+
+export function historyYear(item: HistoryRecord): number | null {
+  return historyNumber(item.year)
+}
+
+export function historyMediaType(item: HistoryRecord): MediaType {
+  const raw = item as HistoryRow
+  const value = historyText(raw.type ?? raw['media_type'])?.toLowerCase() || ''
+  if (value === 'movie' || value.includes('电影')) return 'movie'
+  if (value === 'tv' || value === 'show' || value.includes('电视')) return 'tv'
+  return 'unknown'
+}
+
+export function historySeason(item: HistoryRecord): number | null {
+  const raw = item as HistoryRow
+  return historyNumber(raw.seasons ?? raw['season'])
+}
+
+export function historyEpisode(item: HistoryRecord): number | null {
+  const raw = item as HistoryRow
+  return historyNumber(raw.episodes ?? raw['episode'])
+}
+
+export function historyPath(item: HistoryRecord): string {
+  const raw = item as HistoryRow
+  return historyText(raw.dest ?? raw['target_path']) || ''
+}
+
+export function historyFileName(item: HistoryRecord): string {
+  const fileItem = (item as HistoryRow).dest_fileitem
+  if (fileItem && typeof fileItem === 'object') {
+    const name = historyText(fileItem.name)
+    if (name) return name
+  }
+  const path = historyPath(item)
+  return path.split(/[\\/]/).filter(Boolean).pop() || '未记录文件名'
+}
+
+export function historyDate(item: HistoryRecord): string | null {
+  const raw = item as HistoryRow
+  return historyText(raw.date ?? raw['organized_at'])
+}
+
+export function historyLabel(item: HistoryRecord): string {
+  return mediaLabel(historyTitle(item), historyYear(item), historySeason(item), historyEpisode(item))
 }
 
 export function formatDuration(milliseconds?: number | null): string {

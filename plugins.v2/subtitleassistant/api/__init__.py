@@ -1,1 +1,5 @@
-"""字幕助手插件 API 层。"""
+"""HTTP adapter 能力。"""
+
+from .router import ApiController
+
+__all__ = ["ApiController"]

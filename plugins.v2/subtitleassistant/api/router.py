@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any, Literal, Protocol
 
 from fastapi import Body, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
 from app.db.models.user import User
@@ -16,18 +19,9 @@ from app.db.user_oper import (
 )
 from app.schemas import Response
 
-from ..application.record_deletion import (
-    BatchDeleteRecordConfirmation,
-    DeleteRecordConfirmation,
-    RecordDeletionService,
-)
-from ..application.retargeting import RetargetMapping
-from ..application.searches import SearchTarget
-from ..application.tasks import TaskWorkItem
-from ..domain.enums import FileLocation, RecordStatus, SubtitleSource, TaskStatus
-from ..domain.models import CandidateRecognition, MatchRecord, SubtitleTask
-from ..domain.query import assrt_title_queries
-from .schemas import (
+from ..record import RecordCatalog, RecordMaintenance
+from ..schemas.http.page import PageSize
+from ..schemas.http.record import (
     BatchRecordDeletePreflightItem,
     BatchRecordDeleteRequest,
     BatchRecordDeleteResponse,
@@ -38,78 +32,98 @@ from .schemas import (
     BatchRetargetResponse,
     BatchRetargetResultItem,
     BatchRetargetSubmitRequest,
-    CredentialUpdate,
-    ManualCandidateItem,
-    ManualDownloadRequest,
-    ManualDownloadResponse,
-    ManualSearchRequest,
-    ManualSearchResponse,
-    ManualSourceResult,
-    PageSize,
     RecordDeleteRequest,
     RecordDetail,
     RecordListItem,
     RecordPage,
     RetargetPreviewResponse,
     RetargetRequest,
-    SearchPlanItem,
-    SourceStatusItem,
-    TargetListItem,
-    TargetPage,
-    TaskDetail,
-    TaskListItem,
-    TaskPage,
 )
+from ..schemas.http.search import (
+    ManualDownloadRequest,
+    ManualDownloadResponse,
+    ManualSearchRequest,
+    ManualSearchResponse,
+)
+from ..schemas.http.source import CredentialUpdate, SourceStatusItem
+from ..schemas.http.target import TargetPage
+from ..schemas.http.task import TaskDetail, TaskListItem, TaskPage
+from ..schemas.record import (
+    BatchDeleteRecordConfirmation,
+    DeleteMode,
+    DeleteRecordConfirmation,
+    FileLocation,
+    MatchRecord,
+    RecordStatus,
+    RetargetMapping,
+)
+from ..schemas.source import SubtitleSource
+from ..schemas.task import SubtitleTask, TaskStatus
+from ..search import ManualSearch
+from ..source import SourceAdministration
+from ..target import TargetCatalog
+from ..task import TaskOperations
 
 CredentialSource = Literal["opensubtitles", "assrt"]
+
+
+class _RecordPathResolver(Protocol):
+    """HTTP 投影记录路径所需的最小文件能力。"""
+
+    async def plugin_file_path(self, relative_path: str) -> Path:
+        """解析插件数据目录中的字幕相对路径。"""
 
 
 class ApiController:
     """把应用服务结果转换为固定插件 API 契约。"""
 
-    def __init__(self, plugin: Any) -> None:
-        """创建绑定到当前插件实例的 API 控制器。"""
+    def __init__(
+        self,
+        *,
+        tasks: TaskOperations,
+        records: RecordCatalog,
+        maintenance: RecordMaintenance,
+        filesystem: _RecordPathResolver,
+        targets: TargetCatalog,
+        search: ManualSearch,
+        sources: SourceAdministration,
+        update_credentials: Callable[[SubtitleSource, dict[str, str]], Awaitable[bool]],
+        clear_credentials: Callable[[SubtitleSource], Awaitable[bool]],
+    ) -> None:
+        """创建仅依赖能力 facade 与文件路径 adapter 的 HTTP 控制器。"""
 
-        self._plugin = plugin
-        self._record_deletion: RecordDeletionService | None = None
-
-    def _get_record_deletion_service(self) -> RecordDeletionService:
-        """按当前插件运行态懒加载匹配记录删除服务。"""
-
-        if self._record_deletion is None:
-            self._record_deletion = RecordDeletionService(
-                store=self._plugin.store,
-                filesystem=self._plugin.filesystem,
-                inventory=self._plugin.inventory,
-                mutation_lock=getattr(self._plugin, "record_mutation_lock", None),
-            )
-        return self._record_deletion
+        self._tasks = tasks
+        self._records = records
+        self._maintenance = maintenance
+        self._filesystem = filesystem
+        self._targets = targets
+        self._search = search
+        self._sources = sources
+        self._update_credentials = update_credentials
+        self._clear_credentials = clear_credentials
 
     async def _current_record_file_path(self, record: MatchRecord) -> str:
         """返回记录当前字幕文件的完整服务端路径。"""
 
         if record.location is FileLocation.MEDIA_DIRECTORY:
-            return record.path
-        resolver = getattr(self._plugin.filesystem, "plugin_file_path", None)
-        if not callable(resolver):
-            return record.path
+            return str(record.path)
         try:
-            return str(await resolver(record.path))
+            return str(await self._filesystem.plugin_file_path(str(record.path)))
         except (OSError, ValueError):
             # 历史损坏记录仍应能列出并由后端安全拒绝文件操作；此时保留原值
             # 供用户定位数据问题，不尝试自行拼接未经校验的路径。
-            return record.path
+            return str(record.path)
 
     async def _record_list_item(self, record: MatchRecord) -> RecordListItem:
         """把记录转换为包含完整当前文件路径的列表模型。"""
 
-        item = RecordListItem.model_validate(record)
+        item = RecordListItem.model_validate(record.model_dump(mode="json", include=set(RecordListItem.model_fields)))
         return item.model_copy(update={"current_file_path": await self._current_record_file_path(record)})
 
     async def _record_detail(self, record: MatchRecord) -> RecordDetail:
         """把记录转换为包含完整当前文件路径的详情模型。"""
 
-        detail = RecordDetail.model_validate(record)
+        detail = RecordDetail.model_validate(record.model_dump(mode="json", include=set(RecordDetail.model_fields)))
         return detail.model_copy(update={"current_file_path": await self._current_record_file_path(record)})
 
     @staticmethod
@@ -185,7 +199,7 @@ class ApiController:
     ) -> TaskPage:
         """分页查询字幕任务安全摘要。"""
 
-        tasks = await self._plugin.store.list_tasks()
+        tasks = await self._tasks.list_tasks()
         if status is not None:
             tasks = [task for task in tasks if task.status is status]
         query = (search or "").strip().casefold()
@@ -194,7 +208,10 @@ class ApiController:
         tasks.sort(key=self._task_sort_key)
         total = len(tasks)
         start = (page - 1) * page_size
-        items = [TaskListItem.model_validate(task) for task in tasks[start : start + page_size]]
+        items = [
+            TaskListItem.model_validate(task.model_dump(mode="json", include=set(TaskListItem.model_fields)))
+            for task in tasks[start : start + page_size]
+        ]
         return TaskPage(items=items, total=total, page=page, page_size=page_size)
 
     async def get_task(
@@ -204,10 +221,10 @@ class ApiController:
     ) -> TaskDetail:
         """查询单个字幕任务详情。"""
 
-        task = await self._plugin.store.get_task(task_id)
+        task = await self._tasks.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
-        return TaskDetail.model_validate(task)
+        return TaskDetail.model_validate(task.model_dump(mode="json", include=set(TaskDetail.model_fields)))
 
     async def delete_task(
         self,
@@ -216,12 +233,12 @@ class ApiController:
     ) -> Response:
         """删除一个终态任务历史。"""
 
-        task = await self._plugin.store.get_task(task_id)
+        task = await self._tasks.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         if not task.is_terminal:
             raise HTTPException(status_code=409, detail="运行中的任务不能删除")
-        await self._plugin.store.delete_task(task_id)
+        await self._tasks.delete_task(task_id)
         return Response(success=True, message="任务记录已删除")
 
     async def list_records(
@@ -234,7 +251,7 @@ class ApiController:
     ) -> RecordPage:
         """分页查询字幕匹配记录。"""
 
-        records = await self._plugin.store.list_records()
+        records = await self._records.list_records()
         if status is not None:
             records = [record for record in records if record.status is status]
         query = (search or "").strip().casefold()
@@ -258,7 +275,7 @@ class ApiController:
     ) -> RecordDetail:
         """查询单个字幕匹配记录详情。"""
 
-        record = await self._plugin.store.get_record(record_id)
+        record = await self._records.get(record_id)
         if record is None:
             raise HTTPException(status_code=404, detail="匹配记录不存在")
         return await self._record_detail(record)
@@ -277,13 +294,13 @@ class ApiController:
             except ValidationError as exc:
                 raise HTTPException(status_code=422, detail=exc.errors()) from exc
         try:
-            result = await self._get_record_deletion_service().delete(
+            result = await self._records.delete(
                 record_id,
                 DeleteRecordConfirmation(
-                    delete_mode=payload.delete_mode,
+                    delete_mode=DeleteMode(payload.delete_mode),
                     expected_status=payload.expected_status,
                     expected_location=payload.expected_location,
-                    expected_path=payload.expected_path,
+                    expected_path=Path(payload.expected_path),
                     expected_updated_at=payload.expected_updated_at,
                 ),
             )
@@ -321,21 +338,21 @@ class ApiController:
         """整批预检后按请求顺序删除多条匹配记录。"""
 
         try:
-            result = await self._get_record_deletion_service().delete_batch(
+            result = await self._records.delete_batch(
                 [
                     BatchDeleteRecordConfirmation(
                         record_id=item.record_id,
                         confirmation=DeleteRecordConfirmation(
-                            delete_mode=payload.delete_mode,
+                            delete_mode=DeleteMode(payload.delete_mode),
                             expected_status=item.expected_status,
                             expected_location=item.expected_location,
-                            expected_path=item.expected_path,
+                            expected_path=Path(item.expected_path),
                             expected_updated_at=item.expected_updated_at,
                         ),
                     )
                     for item in payload.items
                 ],
-                payload.delete_mode,
+                DeleteMode(payload.delete_mode),
             )
         except asyncio.CancelledError:
             raise
@@ -367,7 +384,7 @@ class ApiController:
             items=[
                 BatchRecordDeleteResultItem(
                     record_id=item.record_id,
-                    status=item.status,
+                    status=item.status.value,
                     error_code=item.error_code,
                     message=item.message,
                     consistency_risk=item.consistency_risk,
@@ -377,129 +394,30 @@ class ApiController:
         )
 
     @staticmethod
-    def _target_item(target: SearchTarget) -> TargetListItem:
-        """把整理历史目标转换为前端安全模型。"""
+    def _raw_history_item(history: object) -> dict[str, Any]:
+        """把宿主整理历史行编码为不丢字段的 JSON 对象。"""
 
-        context = target.context
-        assrt_first, assrt_second = assrt_title_queries(context)
-        media_id = context.imdb_id or (str(context.tmdb_id) if context.tmdb_id else None)
-        plans: dict[SubtitleSource, list[SearchPlanItem]] = {
-            SubtitleSource.MOVIEPILOT: [
-                {
-                    "kind": "title",
-                    "label": "英文标题关键词（搜索时生成）",
-                    "query": None,
-                    "editable": False,
-                }
-            ],
-            SubtitleSource.OPENSUBTITLES: [
-                {"kind": "id", "label": "媒体 ID", "query": media_id, "editable": False},
-                {
-                    "kind": "title",
-                    "label": "英文标题" if context.english_title else "英文标题（搜索时补充）",
-                    "query": context.english_title,
-                    "editable": bool(context.english_title),
-                },
-            ],
-            SubtitleSource.ASSRT: [
-                {"kind": "title", "label": "主标题", "query": assrt_first, "editable": True},
-                {"kind": "fallback", "label": "英文名/原名", "query": assrt_second, "editable": True},
-            ],
-        }
-        return TargetListItem(
-            history_id=target.history_id,
-            media_title=context.title,
-            year=context.year,
-            media_type=context.media_type,
-            season=context.season,
-            episode=context.episode,
-            tmdb_id=context.tmdb_id,
-            imdb_id=context.imdb_id,
-            target_file_name=context.target_file_name,
-            target_path=context.target_path,
-            organized_at=target.transferred_at,
-            search_plans=plans,
-        )
-
-    @staticmethod
-    def _manual_default_plans(source: SubtitleSource, queries: list[str]) -> list[SearchPlanItem]:
-        """把来源实际默认查询转换为前端可编辑方案。"""
-
-        plans: list[SearchPlanItem] = []
-        for index, query in enumerate(queries):
-            if source is SubtitleSource.MOVIEPILOT:
-                kind, label, editable = "title", f"英文关键词 {index + 1}", True
-            elif source is SubtitleSource.OPENSUBTITLES and query.startswith(("IMDb ID:", "TMDB ID:")):
-                kind, label, editable = "id", "媒体 ID", False
-            elif source is SubtitleSource.OPENSUBTITLES:
-                kind, label, editable = "title", "英文标题", True
-            elif index == 0:
-                kind, label, editable = "title", "中文标题", True
-            else:
-                kind, label, editable = "fallback", "英文标题/原名", True
-            plans.append(
-                {
-                    "kind": kind,
-                    "label": label,
-                    "query": query,
-                    "editable": editable,
-                }
-            )
-        return plans
-
-    @staticmethod
-    def _candidate_item(recognition: CandidateRecognition, query: str | None) -> ManualCandidateItem:
-        """把领域候选转换为不含下载定位的人工搜索 DTO。"""
-
-        candidate = recognition.candidate
-        allowed = {
-            SubtitleSource.MOVIEPILOT: {"site_name", "description"},
-            SubtitleSource.OPENSUBTITLES: {"release", "media_id"},
-            SubtitleSource.ASSRT: {"videoname", "native_name"},
-        }[candidate.source]
-        details = {key: value for key, value in candidate.metadata.items() if key in allowed}
-        if candidate.source is SubtitleSource.MOVIEPILOT:
-            details["site_priority"] = candidate.site_priority
-        elif candidate.source is SubtitleSource.OPENSUBTITLES:
-            details["trusted"] = candidate.trusted
-        elif candidate.source is SubtitleSource.ASSRT:
-            details["revision"] = candidate.revision
-        return ManualCandidateItem(
-            candidate_key=candidate.stable_key,
-            recognition_status=recognition.status,
-            source=candidate.source,
-            name=candidate.name,
-            file_name=candidate.file_name,
-            language=candidate.language or None,
-            format=candidate.format or None,
-            package_scope=candidate.package_scope,
-            season=candidate.season,
-            episode=candidate.episode,
-            seasons=list(candidate.seasons),
-            episodes=list(candidate.episodes),
-            translation_type=candidate.translation_type,
-            hearing_impaired=candidate.hearing_impaired,
-            rating=candidate.score,
-            votes=candidate.votes,
-            downloads=candidate.download_count,
-            uploaded_at=candidate.uploaded_at,
-            query=query,
-            source_details=details,
-        )
+        if isinstance(history, Mapping):
+            values = dict(history)
+        else:
+            try:
+                values = {key: value for key, value in vars(history).items() if not key.startswith("_")}
+            except TypeError:
+                values = {}
+        encoded = jsonable_encoder(values)
+        return encoded if isinstance(encoded, dict) else {}
 
     async def list_targets(
         self,
         page: int = Query(default=1, ge=1),
         page_size: PageSize = Query(default=PageSize.ITEMS_25),  # noqa: B008 - FastAPI 查询参数注入
-        search: str | None = Query(default=None),
         _: User = Depends(get_current_active_manage_user_async),  # noqa: B008 - FastAPI 依赖注入
     ) -> TargetPage:
-        """分页查询可供人工搜索和改配的整理目标。"""
+        """透传 MoviePilot 当前页整理历史供人工搜索和改配选择。"""
 
-        result = await self._plugin.targets.list_targets(page=page, page_size=int(page_size), search=search)
+        result = await self._targets.list_targets(page=page, page_size=int(page_size))
         return TargetPage(
-            items=[self._target_item(item) for item in result.items],
-            total=result.total,
+            items=[self._raw_history_item(item) for item in result.items],
             page=result.page,
             page_size=page_size,
         )
@@ -512,7 +430,7 @@ class ApiController:
         """并发执行三源人工字幕搜索。"""
 
         try:
-            result = await self._plugin.manual_search.search(
+            result = await self._search.search(
                 int(payload.target_history_id),
                 {
                     SubtitleSource.MOVIEPILOT: payload.moviepilot_keyword,
@@ -522,23 +440,11 @@ class ApiController:
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        target = self._target_item(result.target)
-        sources = [
-            ManualSourceResult(
-                source=run.source,
-                status=run.status,
-                default_plans=self._manual_default_plans(run.source, run.default_queries),
-                executed_queries=run.executed_queries,
-                matched_query=run.matched_query,
-                candidate_count=len(run.candidates),
-                duration_ms=run.duration_ms,
-                error_summary=run.error_summary,
-                details=dict(run.details),
-                candidates=[self._candidate_item(item, run.matched_query) for item in run.candidates],
-            )
-            for run in result.sources
-        ]
-        return ManualSearchResponse(session_id=result.session_id, target=target, sources=sources)
+        return ManualSearchResponse(
+            session_id=result.session_id,
+            target=self._search.target_item(result.target),
+            sources=[self._search.source_item(run) for run in result.sources],
+        )
 
     async def download_search_candidate(
         self,
@@ -546,28 +452,41 @@ class ApiController:
         payload: ManualDownloadRequest,
         _: User = Depends(get_current_active_manage_user_async),  # noqa: B008 - FastAPI 依赖注入
     ) -> ManualDownloadResponse:
-        """把人工选定候选提交到现有单 worker。"""
+        """把人工选定候选交给人工搜索应用服务并映射稳定结果。"""
 
-        candidate = await self._plugin.manual_search.get_candidate(session_id, payload.candidate_key)
-        if candidate is None:
-            raise HTTPException(status_code=404, detail="搜索会话已过期或候选不存在")
-        task_id, reused = await self._plugin.coordinator.enqueue_manual(
-            TaskWorkItem(
-                context=candidate.target.context,
-                target=candidate.target.target_item,
-                host_mediainfo=candidate.target.host_mediainfo,
-                manual_handle=candidate.handle,
-                manual_session_id=session_id,
-                actual_search_query=candidate.actual_query,
-                target_history_id=candidate.target.history_id,
+        try:
+            result = await self._search.submit(session_id, payload.candidate_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="人工字幕任务提交失败") from exc
+        if result.status == "session_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "manual_search_session_expired",
+                    "message": "搜索会话已失效，请重新搜索",
+                },
             )
-        )
-        if task_id is None:
+        if result.status == "candidate_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "manual_search_candidate_unavailable",
+                    "message": "当前候选不可用，请选择其他候选",
+                },
+            )
+        if result.status == "rejected":
             raise HTTPException(status_code=409, detail="插件当前不接受新任务")
-        task = await self._plugin.store.get_task(task_id)
-        if task is None:
+        if result.status != "success" or result.task is None:
             raise HTTPException(status_code=500, detail="人工字幕任务创建失败")
-        return ManualDownloadResponse(task_id=task_id, reused=reused, task=TaskListItem.model_validate(task))
+        return ManualDownloadResponse(
+            task_id=result.task.id,
+            reused=result.reused,
+            task=TaskListItem.model_validate(
+                result.task.model_dump(mode="json", include=set(TaskListItem.model_fields))
+            ),
+        )
 
     async def preview_retarget_record(
         self,
@@ -577,9 +496,9 @@ class ApiController:
     ) -> RetargetPreviewResponse:
         """按当前路径映射预览改配结果。"""
 
-        result = await self._plugin.retargeting.preview(record_id, int(payload.target_history_id))
+        result = await self._maintenance.preview(record_id, int(payload.target_history_id))
         if result.success and result.preview is not None:
-            return RetargetPreviewResponse.model_validate(result.preview)
+            return self._retarget_preview_response(result.preview)
         status = 404 if result.error_code in {"record_not_found", "target_not_found"} else 409
         raise HTTPException(
             status_code=status,
@@ -597,7 +516,7 @@ class ApiController:
     ) -> RecordDetail:
         """把现有匹配记录改配到新的整理目标。"""
 
-        result = await self._plugin.retargeting.retarget(record_id, int(payload.target_history_id))
+        result = await self._maintenance.retarget(record_id, int(payload.target_history_id))
         if result.success and result.record is not None:
             return await self._record_detail(result.record)
         status = 404 if result.error_code in {"record_not_found", "target_not_found"} else 409
@@ -628,14 +547,27 @@ class ApiController:
                     record_id=item.record_id,
                     current_subtitle_path=item.current_subtitle_path,
                     target_history_id=item.target_history_id,
-                    target=self._target_item(item.target) if item.target is not None else None,
-                    preview=RetargetPreviewResponse.model_validate(item.preview) if item.preview is not None else None,
+                    target=self._search.target_item(item.target) if item.target is not None else None,
+                    preview=self._retarget_preview_response(item.preview) if item.preview is not None else None,
                     executable=item.executable,
                     error_code=item.error_code,
                     message=item.message,
                 )
                 for item in result.items
             ],
+        )
+
+    @staticmethod
+    def _retarget_preview_response(preview: Any) -> RetargetPreviewResponse:
+        """将领域路径明确投影为既有 HTTP 字符串字段。"""
+
+        return RetargetPreviewResponse(
+            target_history_id=preview.target_history_id,
+            history_target_path=str(preview.history_target_path),
+            target_path=str(preview.target_path),
+            final_subtitle_path=str(preview.final_subtitle_path),
+            directory_available=preview.directory_available,
+            directory_error=preview.directory_error,
         )
 
     async def preview_batch_retarget_records(
@@ -645,7 +577,7 @@ class ApiController:
     ) -> BatchRetargetPreviewResponse:
         """自动建议目标并预检一批匹配记录改配。"""
 
-        result = await self._plugin.retargeting.preview_batch(
+        result = await self._maintenance.preview_batch(
             [
                 RetargetMapping(
                     record_id=item.record_id,
@@ -663,7 +595,7 @@ class ApiController:
     ) -> BatchRetargetResponse:
         """整体预检后逐条独立执行一批匹配记录改配。"""
 
-        result = await self._plugin.retargeting.retarget_batch(
+        result = await self._maintenance.retarget_batch(
             [
                 RetargetMapping(
                     record_id=item.record_id,
@@ -712,8 +644,14 @@ class ApiController:
     ) -> list[SourceStatusItem]:
         """读取三个字幕源的最近状态，不主动发起请求。"""
 
-        statuses = {item.source: item for item in await self._plugin.store.list_source_statuses()}
-        return [SourceStatusItem.model_validate(statuses[source]) for source in SubtitleSource if source in statuses]
+        statuses = {item.source: item for item in await self._sources.statuses()}
+        return [
+            SourceStatusItem.model_validate(
+                statuses[source].model_dump(mode="json", include=set(SourceStatusItem.model_fields))
+            )
+            for source in SubtitleSource
+            if source in statuses
+        ]
 
     async def refresh_sources(
         self,
@@ -722,7 +660,7 @@ class ApiController:
         """并发刷新三个字幕源状态。"""
 
         try:
-            await self._plugin.coordinator.refresh_sources(manual=True)
+            await self._tasks.refresh_sources(manual=True)
         except asyncio.CancelledError:
             return Response(success=False, message="字幕源状态刷新已中断")
         except Exception:  # noqa: BLE001 - 来源刷新必须收敛运行时失败
@@ -738,13 +676,10 @@ class ApiController:
         """增量写入外部字幕源长期凭据且不回显秘密。"""
 
         values = payload.cleaned()
-        allowed_fields = {
-            "opensubtitles": {"api_key", "username", "password"},
-            "assrt": {"token"},
-        }[source]
-        if set(values) - allowed_fields:
-            raise HTTPException(status_code=422, detail="请求包含不属于该字幕源的凭据字段")
-        configured = await self._plugin.update_source_credentials(SubtitleSource(source), values)
+        try:
+            configured = await self._update_credentials(SubtitleSource(source), values)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return Response(success=True, message="凭据已更新", data={"configured": configured})
 
     async def clear_credentials(
@@ -754,7 +689,7 @@ class ApiController:
     ) -> Response:
         """删除外部字幕源凭据并立即关闭对应来源。"""
 
-        success = await self._plugin.clear_source_credentials(SubtitleSource(source))
+        success = await self._clear_credentials(SubtitleSource(source))
         if not success:
             return Response(success=False, message="凭据已删除，但来源开关保存失败")
         return Response(success=True, message="字幕源凭据已清除", data={"configured": False})

@@ -14,6 +14,7 @@ import type {
   RecordDeleteSnapshot,
   RecordListItem,
   RecordStatus,
+  RawHistoryPage,
   SourceStatusItem,
   SearchRequest,
   SearchResponse,
@@ -62,6 +63,17 @@ function responseMessage(payload: unknown): string | null {
   return null
 }
 
+function responseCode(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null
+  const record = payload as Record<string, unknown>
+  if (typeof record.code === 'string' && record.code) return record.code
+  if (record.detail && typeof record.detail === 'object' && !Array.isArray(record.detail)) {
+    const detail = record.detail as Record<string, unknown>
+    if (typeof detail.code === 'string' && detail.code) return detail.code
+  }
+  return null
+}
+
 export function getErrorMessage(error: unknown, fallback: string): string {
   if (error && typeof error === 'object') {
     const response = (error as { response?: { data?: unknown } }).response
@@ -70,6 +82,12 @@ export function getErrorMessage(error: unknown, fallback: string): string {
   }
   if (error instanceof Error && error.message) return error.message
   return fallback
+}
+
+export function getErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null
+  const response = (error as { response?: { data?: unknown } }).response
+  return responseCode(response?.data)
 }
 
 export async function savePluginConfig(
@@ -185,13 +203,12 @@ export async function clearCredentials(
 export function listTargets(
   api: PluginApi,
   pluginId: string,
-  options: { page: number; pageSize: 25 | 50 | 100; search?: string },
-): Promise<PageResponse<TargetItem>> {
+  options: { page: number; pageSize: 25 | 50 | 100 },
+): Promise<RawHistoryPage> {
   return api.get(pluginPath(pluginId, 'targets'), {
     params: compactParams({
       page: options.page,
       page_size: options.pageSize,
-      search: options.search?.trim(),
     }),
   })
 }

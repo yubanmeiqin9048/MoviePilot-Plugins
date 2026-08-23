@@ -4,6 +4,7 @@ import {
   type BatchRetargetPreviewResponse,
   type BatchRetargetResponse,
   type ConfigModel,
+  type HistoryRow,
   type PluginApi,
   type RecordDeleteMode,
   type RecordDetail,
@@ -16,10 +17,56 @@ import {
 } from '@/types'
 import { reactive } from 'vue'
 
-export type MockMode = 'normal' | 'empty' | 'error'
+export type MockMode =
+  | 'normal'
+  | 'search-empty'
+  | 'targets-empty'
+  | 'targets-error'
+  | 'search-error'
+  | 'filter-recognition-empty'
+  | 'filter-source-empty'
+  | 'conditions-stale'
+  | 'search-loading'
+  | 'target-change-cleanup'
+  | 'download-submitting'
+  | 'empty'
+  | 'error'
+  | 'download-reused'
+  | 'download-failed'
+  | 'download-session-expired'
+  | 'download-candidate-unavailable'
+  | 'download-rejected'
+
+export interface MockScenarioOption {
+  title: string
+  value: MockMode
+  description: string
+}
+
+export const mockScenarioOptions: MockScenarioOption[] = [
+  { value: 'normal', title: '正常：混合候选与来源部分完成', description: '已识别、未识别和范围冲突候选；来源同时覆盖成功、无结果和部分完成。' },
+  { value: 'search-empty', title: '搜索：三源全部无结果', description: '三源搜索完成但没有候选，保留调整关键词和重新搜索恢复动作。' },
+  { value: 'targets-empty', title: '目标：整理历史为空', description: '目标接口返回空列表，目标区显示空态和刷新动作。' },
+  { value: 'targets-error', title: '目标：目标列表加载失败', description: '仅目标列表请求失败，来源和候选区不显示误导性错误。' },
+  { value: 'search-error', title: '搜索：请求失败', description: '目标可正常选择，显式搜索请求失败且旧候选不会恢复。' },
+  { value: 'filter-recognition-empty', title: '筛选：识别状态无结果', description: '结果仅含未识别候选，切换到“已识别”即可验收筛选空态。' },
+  { value: 'filter-source-empty', title: '筛选：字幕源无结果', description: '结果只来自 MoviePilot，切换到无候选来源即可验收筛选空态。' },
+  { value: 'conditions-stale', title: '条件变化：旧候选只读', description: '编辑关键词后旧候选仍可读但不能下载，主操作变为按新条件搜索。' },
+  { value: 'search-loading', title: '搜索中：清空并等待新响应', description: '搜索请求延迟 1.5 秒，用于观察清空旧候选、骨架和来源进度。' },
+  { value: 'target-change-cleanup', title: '更换目标：确认并清理状态', description: '正常结果下更换目标，确认后观察候选、筛选、通知和旧条件清理。' },
+  { value: 'download-submitting', title: '提交中：仅锁定当前候选', description: '提交请求延迟 1.2 秒，当前按钮显示提交中，其他候选仍可操作。' },
+  { value: 'download-reused', title: '提交成功：任务复用', description: '返回 reused: true，当前候选显示已有处理中任务已复用。' },
+  { value: 'download-failed', title: '提交失败：普通错误', description: '点击 MoviePilot 站点源的“示例字幕候选”触发普通错误，其他候选不被连带阻塞。' },
+  { value: 'download-session-expired', title: '提交失败：会话失效', description: '返回 manual_search_session_expired，页面保留目标和关键词并要求重新搜索。' },
+  { value: 'download-candidate-unavailable', title: '提交失败：候选不可用', description: '点击 MoviePilot 站点源的“示例字幕候选”触发候选不可用，仅当前候选显示局部错误。' },
+  { value: 'download-rejected', title: '提交失败：协调器拒绝', description: '返回 409 协调器拒绝，候选仍可按普通错误恢复。' },
+  { value: 'empty', title: '兼容：全部 API 空数据', description: '所有列表和搜索响应返回空数据，保留旧开发链接兼容性。' },
+  { value: 'error', title: '兼容：全部 API 请求错误', description: '所有 mock API 请求失败，保留旧开发链接兼容性。' },
+]
 
 export interface MockState {
   mode: MockMode
+  search_round: number
   config: ConfigModel
   tasks: TaskListItem[]
   taskDetails: Record<string, TaskDetail>
@@ -283,6 +330,7 @@ function seedState(): MockState {
 
   return {
     mode: 'normal',
+    search_round: 0,
     config: {
       plugin_id: 'SubtitleAssistant', enabled: true, moviepilot_enabled: true, opensubtitles_enabled: false, assrt_enabled: true,
       opensubtitles_configured: false, assrt_configured: true, allow_machine_translation: false, ai_attribution_takeover_enabled: false, host_ai_enabled: true, max_candidate_attempts: 3,
@@ -298,33 +346,98 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds))
 }
 
+function rawHistoryRows(targets: TargetItem[]): HistoryRow[] {
+  return targets.map(target => ({
+    id: target.history_id,
+    status: true,
+    dest: target.target_path,
+    dest_storage: 'local',
+    dest_fileitem: {
+      path: target.target_path,
+      storage: 'local',
+      type: 'file',
+      name: target.target_file_name,
+    },
+    title: target.media_title,
+    year: target.year,
+    type: target.media_type === 'movie' ? '电影' : target.media_type === 'tv' ? '电视剧' : '未知',
+    seasons: target.season == null ? null : `S${String(target.season).padStart(2, '0')}`,
+    episodes: target.episode == null ? null : `E${String(target.episode).padStart(2, '0')}`,
+    tmdbid: target.tmdb_id,
+    imdbid: target.imdb_id,
+    date: target.organized_at,
+  }))
+}
+
+function rawHistoryPage(items: HistoryRow[], options?: Record<string, unknown>): { items: HistoryRow[]; page: number; page_size: 25 | 50 | 100 } {
+  const params = (options?.params || {}) as Record<string, unknown>
+  const requestedPage = Math.max(1, Number(params.page) || 1)
+  const requestedSize = [25, 50, 100].includes(Number(params.page_size)) ? Number(params.page_size) as 25 | 50 | 100 : 25
+  const start = (requestedPage - 1) * requestedSize
+  return { items: clone(items.slice(start, start + requestedSize)), page: requestedPage, page_size: requestedSize }
+}
+
 export function createMockApi() {
   const state = reactiveState(seedState())
   const api: PluginApi = {
     async get<T = unknown>(path: string, options?: Record<string, unknown>): Promise<T> {
       await wait(state.mode === 'error' ? 120 : 240)
       if (state.mode === 'error') throw new Error('开发壳模拟服务暂时不可用')
+      if (path.endsWith('/targets') && state.mode === 'targets-error') {
+        throw new Error('开发壳模拟目标列表加载失败，请重试')
+      }
       if (path.includes('/tasks/')) return clone(state.taskDetails[path.split('/').pop() || '']) as T
       if (path.endsWith('/tasks')) return page(state.mode === 'empty' ? [] : state.tasks, options) as T
       if (path.includes('/records/')) return clone(state.recordDetails[path.split('/').pop() || '']) as T
       if (path.endsWith('/records')) return page(state.mode === 'empty' ? [] : state.records, options) as T
-      if (path.endsWith('/targets')) return page(state.mode === 'empty' ? [] : state.targets, options) as T
+      if (path.endsWith('/targets')) {
+        const noTargets = state.mode === 'empty' || state.mode === 'targets-empty'
+        return rawHistoryPage(noTargets ? [] : rawHistoryRows(state.targets), options) as T
+      }
       if (path.endsWith('/sources/status')) return clone(state.mode === 'empty' ? [] : state.sources) as T
       if (path.includes('/plugin/form/')) return { render_mode: 'vue', model: clone(state.config) } as T
       return {} as T
     },
     async post<T = unknown>(path: string, payload?: unknown): Promise<T> {
-      await wait(300)
+      const isSearch = path.endsWith('/searches')
+      const isDownload = path.includes('/searches/') && path.endsWith('/downloads')
+      await wait(isSearch && state.mode === 'search-loading' ? 1500 : isDownload && state.mode === 'download-submitting' ? 1200 : 300)
       if (state.mode === 'error') throw new Error('开发壳模拟服务暂时不可用')
       if (path.endsWith('/sources/refresh')) return { success: true, message: '字幕源状态已刷新' } as T
       if (path.endsWith('/searches')) {
+        if (state.mode === 'search-error') throw new Error('开发壳模拟搜索请求失败，请重新搜索')
         const targetId = (payload as { target_history_id?: string | number } | undefined)?.target_history_id
         const target = state.targets.find(item => String(item.history_id) === String(targetId))
         if (!target) throw new Error('整理历史目标不存在')
-        return mockSearchResponse(target) as T
+        state.search_round += 1
+        const variant = state.mode === 'search-empty'
+          ? 'empty'
+          : state.mode === 'filter-recognition-empty'
+            ? 'recognition-empty'
+            : state.mode === 'filter-source-empty'
+              ? 'source-empty'
+              : ['conditions-stale', 'search-loading'].includes(state.mode) && state.search_round > 1
+                ? 'refreshed'
+              : 'normal'
+        return mockSearchResponse(target, variant) as T
       }
       if (path.includes('/searches/') && path.endsWith('/downloads')) {
-        return { task_id: state.tasks[0].id, reused: false, task: clone(state.tasks[0]) } as T
+        if (state.mode === 'download-session-expired') {
+          throw mockHttpError(404, {
+            code: 'manual_search_session_expired',
+            message: '搜索会话已失效，请重新搜索',
+          })
+        }
+        const candidateKey = (payload as { candidate_key?: string } | undefined)?.candidate_key
+        if (state.mode === 'download-candidate-unavailable' && candidateKey === 'mock-moviepilot') {
+          throw mockHttpError(404, {
+            code: 'manual_search_candidate_unavailable',
+            message: '当前候选不可用，请选择其他候选',
+          })
+        }
+        if (state.mode === 'download-rejected') throw mockHttpError(409, '插件当前不接受新任务')
+        if (state.mode === 'download-failed' && candidateKey === 'mock-moviepilot') throw mockHttpError(500, '人工字幕任务提交失败')
+        return { task_id: state.tasks[0].id, reused: state.mode === 'download-reused', task: clone(state.tasks[0]) } as T
       }
       if (path.endsWith('/records/batch-retarget-preview')) {
         const mappings = ((payload as { items?: Array<{ record_id: string; target_history_id?: string | number | null }> } | undefined)?.items || [])
@@ -520,9 +633,13 @@ function matchesDeleteSnapshot(
     && record.updated_at === snapshot.expected_updated_at
 }
 
-function mockHttpError(status: number, message: string): Error & { response: { status: number; data: { detail: string } } } {
-  const error = new Error(message) as Error & { response: { status: number; data: { detail: string } } }
-  error.response = { status, data: { detail: message } }
+function mockHttpError(
+  status: number,
+  detail: string | { code: string; message: string },
+): Error & { response: { status: number; data: { detail: typeof detail } } } {
+  const message = typeof detail === 'string' ? detail : detail.message
+  const error = new Error(message) as Error & { response: { status: number; data: { detail: typeof detail } } }
+  error.response = { status, data: { detail } }
   return error
 }
 
@@ -615,19 +732,83 @@ function applyMockRetarget(record: RecordDetail, target: TargetItem, preview: Re
   }
 }
 
-function mockSearchResponse(target: TargetItem): SearchResponse {
-  return {
+type SearchMockVariant = 'normal' | 'empty' | 'recognition-empty' | 'source-empty' | 'refreshed'
+
+function mockSearchResponse(target: TargetItem, variant: SearchMockVariant = 'normal'): SearchResponse {
+  const response: SearchResponse = {
     session_id: 'mock-search-session',
     target: clone(target),
     sources: [
       {
-        source: 'moviepilot', status: 'success', default_plans: target.search_plans.moviepilot, executed_queries: ['Example'], matched_query: 'Example', candidate_count: 1, duration_ms: 320, error_summary: null, details: { cache_hit: false },
+        source: 'moviepilot', status: 'success', default_plans: target.search_plans.moviepilot, executed_queries: ['Example', 'Example Show'], matched_query: 'Example Show', candidate_count: 1, duration_ms: 320, error_summary: null, details: { cache: [{ query: 'Example', state: 'miss', hit: false, stored: true, stored_at: null, ttl_seconds: 600 }, { query: 'Example Show', state: 'miss', hit: false, stored: true, stored_at: null, ttl_seconds: 600 }], pagination: [{ query: 'Example', pages_fetched: 1, complete: true, failed_page: null, cached: false }, { query: 'Example Show', pages_fetched: 1, complete: true, failed_page: null, cached: false }] },
         candidates: [{ candidate_key: 'mock-moviepilot', recognition_status: 'recognized', name: '示例字幕候选', file_name: null, source: 'moviepilot', language: 'zh-CN', format: null, package_scope: 'season_pack', season: target.season, episode: null, seasons: target.season == null ? [] : [target.season], episodes: [], translation_type: 'human', hearing_impaired: false, rating: null, votes: null, downloads: null, uploaded_at: null, query: 'Example', source_details: { site_name: '示例站点' } }],
       },
-      { source: 'opensubtitles', status: 'success', default_plans: target.search_plans.opensubtitles, executed_queries: ['Example Show'], matched_query: null, candidate_count: 0, duration_ms: 410, error_summary: null, details: { cache_hit: true, page_count: 1 }, candidates: [] },
-      { source: 'assrt', status: 'success', default_plans: target.search_plans.assrt, executed_queries: [target.media_title], matched_query: null, candidate_count: 0, duration_ms: 280, error_summary: null, details: { cache_hit: false }, candidates: [] },
+      { source: 'opensubtitles', status: 'limited', default_plans: target.search_plans.opensubtitles, executed_queries: ['Example Show'], matched_query: null, candidate_count: 0, duration_ms: 410, error_summary: '来源分页未完整返回，已保留当前可用结果。', details: { cache: [{ query: 'Example Show', state: 'hit', hit: true, stored: false, stored_at: iso(120_000), ttl_seconds: 1800 }], pagination: [{ query: 'Example Show', pages_fetched: 1, complete: false, failed_page: 2, cached: true }] }, candidates: [] },
+      { source: 'assrt', status: 'success', default_plans: target.search_plans.assrt, executed_queries: [target.media_title], matched_query: null, candidate_count: 1, duration_ms: 280, error_summary: null, details: { cache: [{ query: target.media_title, state: 'miss', hit: false, stored: true, stored_at: null, ttl_seconds: 1800 }], pagination: [{ query: target.media_title, pages_fetched: 1, complete: true, failed_page: null, cached: false }] }, candidates: [{ candidate_key: 'mock-assrt-unrecognized', recognition_status: 'unrecognized', name: '范围冲突示例候选', file_name: 'Example.Show.S01E04.zh-Hans.srt', source: 'assrt', language: 'en', format: 'SRT', package_scope: 'episode', season: target.season, episode: target.episode == null ? null : target.episode + 1, seasons: target.season == null ? [] : [target.season], episodes: target.episode == null ? [] : [target.episode + 1], translation_type: 'unknown', hearing_impaired: false, rating: null, votes: null, downloads: null, uploaded_at: null, query: target.media_title, source_details: { native_name: '开发壳范围冲突候选' } }] },
     ],
   }
+
+  if (variant === 'empty') {
+    return {
+      session_id: null,
+      target: response.target,
+      sources: response.sources.map(source => ({
+        ...source,
+        status: 'success',
+        matched_query: null,
+        candidate_count: 0,
+        error_summary: null,
+        candidates: [],
+      })),
+    }
+  }
+
+  if (variant === 'recognition-empty') {
+    return {
+      ...response,
+      sources: response.sources.map(source => ({
+        ...source,
+        candidates: source.candidates.map(candidate => ({ ...candidate, recognition_status: 'unrecognized' as const })),
+      })),
+    }
+  }
+
+  if (variant === 'source-empty') {
+    return {
+      ...response,
+      sources: response.sources.map(source => source.source === 'moviepilot'
+        ? source
+        : {
+            ...source,
+            status: source.source === 'opensubtitles' ? 'success' : source.status,
+            matched_query: null,
+            candidate_count: 0,
+            error_summary: source.source === 'opensubtitles' ? null : source.error_summary,
+            candidates: [],
+          },
+      ),
+    }
+  }
+
+  if (variant === 'refreshed') {
+    return {
+      ...response,
+      session_id: 'mock-search-session-refreshed',
+      sources: response.sources.map(source => ({
+        ...source,
+        executed_queries: source.executed_queries.map(query => `${query} · 新条件`),
+        matched_query: source.matched_query ? `${source.matched_query} · 新条件` : null,
+        candidates: source.candidates.map(candidate => ({
+          ...candidate,
+          candidate_key: `${candidate.candidate_key}-refreshed`,
+          name: `${candidate.name}（新条件）`,
+          query: candidate.query ? `${candidate.query} · 新条件` : candidate.query,
+        })),
+      })),
+    }
+  }
+
+  return response
 }
 
 function clone<T>(value: T): T {
