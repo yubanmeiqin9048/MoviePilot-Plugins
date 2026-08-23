@@ -1,6 +1,6 @@
 [tool.ty.environment]
 python = "/home/zhang/Documents/MoviePilot/.venv"
-python-version = "3.14"
+python-version = "3.12"
 python-platform = "linux"
 extra-paths = ["..", "/home/zhang/Documents/MoviePilot"]
 
@@ -15,7 +15,7 @@ exclude = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 extend-exclude = [
     ".docs",
     ".pytest_cache",

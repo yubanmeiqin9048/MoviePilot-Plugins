@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal, TypeVar
+from typing import Annotated, Literal
 
 from pydantic import BeforeValidator, Field
 
@@ -17,10 +17,8 @@ from .page import PageSize
 
 __all__ = ["TargetListItem", "TargetPage"]
 
-_EnumType = TypeVar("_EnumType", bound=Enum)
 
-
-def _enum_parser(enum_type: type[_EnumType]) -> Callable[[object], object]:
+def _enum_parser[EnumType: Enum](enum_type: type[EnumType]) -> Callable[[object], object]:
     """把 HTTP JSON 中的枚举值显式解析为对应枚举。"""
 
     def parse(value: object) -> object:

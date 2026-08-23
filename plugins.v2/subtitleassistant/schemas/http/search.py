@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Literal, TypeAlias, TypeVar
+from typing import Annotated, Literal
 
 from pydantic import BeforeValidator, Field, JsonValue
 
@@ -31,12 +31,11 @@ __all__ = [
     "SearchPlanItem",
 ]
 
-_EnumType = TypeVar("_EnumType", bound=Enum)
 _ManualSearchStatus = Literal["success", "limited", "error", "disabled", "unconfigured"]
-SourceDetails: TypeAlias = dict[str, JsonValue]
+type SourceDetails = dict[str, JsonValue]
 
 
-def _enum_parser(enum_type: type[_EnumType]) -> Callable[[object], object]:
+def _enum_parser[EnumType: Enum](enum_type: type[EnumType]) -> Callable[[object], object]:
     """把 HTTP JSON 中的枚举值显式解析为对应枚举。"""
 
     def parse(value: object) -> object:

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 from pydantic import Field, JsonValue
 
@@ -83,7 +83,7 @@ class CacheTraceState(StrEnum):
     INVALID = "invalid"
 
 
-SourceDetails: TypeAlias = dict[str, JsonValue]
+type SourceDetails = dict[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
