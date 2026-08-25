@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Protocol
 
 from app.db.models.transferhistory import TransferHistory
-from app.db.transferhistory_oper import TransferHistoryOper
 from app.schemas.types import MediaType as HostMediaType
+from app.utils.jieba import cut as jieba_cut
 
 from ..schemas.attribution import CandidateMatchContext
 from ..schemas.config import PluginConfig
@@ -27,6 +27,7 @@ class TransferHistoryPage:
     items: list[TransferHistory]
     page: int
     page_size: int
+    total: int
 
 
 class TransferHistoryPort(Protocol):
@@ -35,8 +36,120 @@ class TransferHistoryPort(Protocol):
     async def async_list_by_page(self, page: int, count: int, status: bool | None = None) -> list[TransferHistory]:
         """分页读取整理历史。"""
 
+    async def async_list_by_title(
+        self,
+        title: str,
+        page: int,
+        count: int,
+        status: bool | None = None,
+        wildcard: bool = False,
+    ) -> list[TransferHistory]:
+        """按宿主历史搜索语义分页读取整理历史。"""
+
+    async def async_count(self, status: bool | None = None) -> int:
+        """统计整理历史数量。"""
+
+    async def async_count_by_title(
+        self,
+        title: str,
+        status: bool | None = None,
+        wildcard: bool = False,
+    ) -> int:
+        """按宿主历史搜索语义统计整理历史数量。"""
+
     async def async_get(self, historyid: int) -> TransferHistory | None:
         """按编号读取整理历史。"""
+
+
+class _TransferHistoryAdapter:
+    """直接调用宿主整理历史模型的默认端口实现。
+
+    不走 ``TransferHistoryOper``：宿主该操作器的 ``async_list_by_title``
+    与 ``async_count_by_title`` 签名中没有 ``wildcard``，无法表达通配符查询。
+    宿主自身的 ``history/transfer`` 端点同样绕开操作器直连模型。
+    """
+
+    async def async_list_by_page(
+        self,
+        page: int,
+        count: int,
+        status: bool | None = None,
+    ) -> list[TransferHistory]:
+        """按宿主模型分页读取整理历史。"""
+
+        return await TransferHistory.async_list_by_page(None, page=page, count=count, status=status)
+
+    async def async_list_by_title(
+        self,
+        title: str,
+        page: int = 1,
+        count: int = 30,
+        status: bool | None = None,
+        wildcard: bool = False,
+    ) -> list[TransferHistory]:
+        """按宿主模型实现支持通配符的标题、源路径和目标路径查询。"""
+
+        return await TransferHistory.async_list_by_title(
+            None,
+            title=title,
+            page=page,
+            count=count,
+            status=status,
+            wildcard=wildcard,
+        )
+
+    async def async_count(self, status: bool | None = None) -> int:
+        """按宿主模型统计整理历史数量。"""
+
+        return int(await TransferHistory.async_count(None, status=status) or 0)
+
+    async def async_count_by_title(
+        self,
+        title: str,
+        status: bool | None = None,
+        wildcard: bool = False,
+    ) -> int:
+        """按宿主模型统计支持通配符的历史查询结果。"""
+
+        return int(
+            await TransferHistory.async_count_by_title(
+                None,
+                title=title,
+                status=status,
+                wildcard=wildcard,
+            )
+            or 0
+        )
+
+    async def async_get(self, historyid: int) -> TransferHistory | None:
+        """按宿主模型读取单条整理历史。"""
+
+        return await TransferHistory.async_get(None, historyid)
+
+
+def _glob_to_like(pattern: str) -> str:
+    """把 MoviePilot 历史搜索使用的 glob 通配符转换为 SQL LIKE。
+
+    与宿主 ``app/api/endpoints/history.py`` 的同名私有函数保持一致。
+    """
+
+    escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped.replace("*", "%").replace("?", "_")
+
+
+def _history_search_query(value: str | None) -> tuple[str | None, bool | None, bool]:
+    """生成宿主历史查询的搜索文本、状态过滤和通配符标记。"""
+
+    query = (value or "").strip()
+    if not query:
+        return None, None, False
+    if query == "成功":
+        return None, True, False
+    if query == "失败":
+        return None, False, False
+    if "*" in query or "?" in query:
+        return _glob_to_like(query), None, True
+    return "%".join(jieba_cut(query, HMM=False)), None, False
 
 
 def _parse_number(value: object) -> int | None:
@@ -69,7 +182,7 @@ class TargetCatalogService:
     ) -> None:
         """创建目标目录服务。"""
 
-        self._history_oper = history_oper or TransferHistoryOper()
+        self._history_oper = history_oper or _TransferHistoryAdapter()
         self._batch_size = batch_size
         self._config_provider = config_provider or PluginConfig
 
@@ -163,11 +276,35 @@ class TargetCatalogService:
             ),
         )
 
-    async def list_targets(self, page: int = 1, page_size: int = 25) -> TransferHistoryPage:
-        """原样返回宿主整理历史当前页，不附加状态过滤。"""
+    async def list_targets(
+        self,
+        page: int = 1,
+        page_size: int = 25,
+        search: str | None = None,
+    ) -> TransferHistoryPage:
+        """按宿主历史语义查询并返回当前页原始整理历史。"""
 
-        items = await self._history_oper.async_list_by_page(page=page, count=page_size)
-        return TransferHistoryPage(items=items, page=page, page_size=page_size)
+        query, status, wildcard = _history_search_query(search)
+        if query is None:
+            if status is None:
+                items = await self._history_oper.async_list_by_page(page=page, count=page_size)
+            else:
+                items = await self._history_oper.async_list_by_page(page=page, count=page_size, status=status)
+            total = await self._history_oper.async_count(status=status)
+        else:
+            items = await self._history_oper.async_list_by_title(
+                title=query,
+                page=page,
+                count=page_size,
+                status=status,
+                wildcard=wildcard,
+            )
+            total = await self._history_oper.async_count_by_title(
+                title=query,
+                status=status,
+                wildcard=wildcard,
+            )
+        return TransferHistoryPage(items=items, page=page, page_size=page_size, total=int(total or 0))
 
     async def list_all_targets(self) -> Sequence[SearchTarget]:
         """返回按最新整理时间去重的有效历史目标。"""

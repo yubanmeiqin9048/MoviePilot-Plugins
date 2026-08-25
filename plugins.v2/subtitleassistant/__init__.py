@@ -21,7 +21,7 @@ class SubtitleAssistant(_PluginBase):
     plugin_icon = (
         "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/SubtitleAssistant.png"
     )
-    plugin_version = "1.2.1"
+    plugin_version = "1.3"
     plugin_author = "yubanmeiqin9048"
     plugin_label = "字幕"
     plugin_config_prefix = "subtitleassistant_"

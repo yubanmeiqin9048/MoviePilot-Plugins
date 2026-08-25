@@ -369,12 +369,36 @@ function rawHistoryRows(targets: TargetItem[]): HistoryRow[] {
   }))
 }
 
-function rawHistoryPage(items: HistoryRow[], options?: Record<string, unknown>): { items: HistoryRow[]; page: number; page_size: 25 | 50 | 100 } {
+function historyMatchesSearch(item: HistoryRow, search: string): boolean {
+  const fields = [item.title, item.src, item.dest]
+    .filter((value): value is string => typeof value === 'string')
+  if (search === '成功') return item.status === true
+  if (search === '失败') return item.status === false
+  if (search.includes('*') || search.includes('?')) {
+    const pattern = search
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replaceAll('*', '.*')
+      .replaceAll('?', '.')
+    const regex = new RegExp(`^${pattern}$`, 'i')
+    return fields.some(value => regex.test(value))
+  }
+  const normalizedSearch = search.toLocaleLowerCase()
+  return fields.some(value => value.toLocaleLowerCase().includes(normalizedSearch))
+}
+
+function rawHistoryPage(items: HistoryRow[], options?: Record<string, unknown>): { items: HistoryRow[]; page: number; page_size: 25 | 50 | 100; total: number } {
   const params = (options?.params || {}) as Record<string, unknown>
+  const search = typeof params.search === 'string' ? params.search.trim() : ''
+  const filtered = search ? items.filter(item => historyMatchesSearch(item, search)) : items
   const requestedPage = Math.max(1, Number(params.page) || 1)
   const requestedSize = [25, 50, 100].includes(Number(params.page_size)) ? Number(params.page_size) as 25 | 50 | 100 : 25
   const start = (requestedPage - 1) * requestedSize
-  return { items: clone(items.slice(start, start + requestedSize)), page: requestedPage, page_size: requestedSize }
+  return {
+    items: clone(filtered.slice(start, start + requestedSize)),
+    page: requestedPage,
+    page_size: requestedSize,
+    total: filtered.length,
+  }
 }
 
 export function createMockApi() {

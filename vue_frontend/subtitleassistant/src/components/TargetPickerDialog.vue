@@ -82,6 +82,7 @@ function confirm(): void {
           :show-heading="false"
           searchable
           compact
+          fill-height
         />
       </VCardText>
 
@@ -114,8 +115,8 @@ function confirm(): void {
 .picker-title span, .picker-title small { display: block; }
 .picker-title span { font-size: 1rem; font-weight: 650; }
 .picker-title small { margin-top: 0.25rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; font-weight: 400; line-height: 1.5; }
-.picker-content { flex: 1 1 auto; padding: 1rem 1.25rem; }
-.picker-alert { margin-bottom: 0.75rem; }
+.picker-content { display: flex; min-block-size: 0; flex: 1 1 auto; flex-direction: column; overflow: hidden !important; padding: 1rem 1.25rem; }
+.picker-alert { flex: 0 0 auto; margin-bottom: 0.75rem; }
 .picker-actions { flex: 0 0 auto; padding: 0.75rem 1.25rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .picker-choice { min-width: 0; overflow: hidden; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 37.5rem) {

@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 
 import { getErrorMessage, listTargets } from '@/api/client'
 import EmptyState from '@/components/EmptyState.vue'
+import { useDebouncedValue } from '@/composables/useDebouncedValue'
 import type { HistoryRow, PluginApi, TargetItem } from '@/types'
 import {
   formatDate,
@@ -24,6 +25,8 @@ const props = withDefaults(defineProps<{
   hint?: string
   disabled?: boolean
   compact?: boolean
+  /** 由外层容器给定高度：搜索与分页固定，仅候选列表滚动。 */
+  fillHeight?: boolean
   showHeading?: boolean
   searchable?: boolean
   searchPlaceholder?: string
@@ -33,9 +36,10 @@ const props = withDefaults(defineProps<{
   hint: '显示 MoviePilot 当前页整理历史；选中后才验证是否可用于字幕操作。',
   disabled: false,
   compact: false,
+  fillHeight: false,
   showHeading: true,
   searchable: false,
-  searchPlaceholder: '搜索标题、文件名或路径',
+  searchPlaceholder: '搜索（支持 * ? 通配符）',
 })
 
 const emit = defineEmits<{ 'update:modelValue': [value: HistoryRow | null] }>()
@@ -45,21 +49,21 @@ const error = ref('')
 const page = ref(1)
 const pageSize = 25
 const canNext = ref(false)
+const total = ref(0)
 const searchInput = ref('')
+const search = useDebouncedValue(searchInput)
 let requestId = 0
 
-const normalizedSearch = computed(() => searchInput.value.trim().toLocaleLowerCase())
-const visibleItems = computed(() => {
-  const query = normalizedSearch.value
-  if (!query) return items.value
-  return items.value.filter(item => [historyLabel(item), historyFileName(item), historyPath(item)]
-    .some(value => value.toLocaleLowerCase().includes(query)))
-})
+const normalizedSearch = computed(() => search.value.trim())
 const resultSummary = computed(() => normalizedSearch.value
-  ? `第 ${page.value} 页 · 显示 ${visibleItems.value.length} / ${items.value.length} 条`
+  ? `第 ${page.value} 页 · 显示 ${items.value.length} / ${total.value} 条`
   : `第 ${page.value} 页 · ${items.value.length} 条`)
 
 watch(page, () => void load())
+watch(search, () => {
+  if (page.value !== 1) page.value = 1
+  else void load()
+})
 watch(() => historyId(props.modelValue), selectedHistoryId => {
   if (selectedHistoryId == null) return
   if (!items.value.some(item => sameHistoryId(item, props.modelValue))) void load()
@@ -71,15 +75,24 @@ async function load(): Promise<void> {
   loading.value = true
   error.value = ''
   try {
-    const response = await listTargets(props.api, props.pluginId, { page: page.value, pageSize })
+    const response = await listTargets(props.api, props.pluginId, {
+      page: page.value,
+      pageSize,
+      search: search.value,
+    })
     if (current !== requestId) return
     items.value = Array.isArray(response?.items) ? response.items : []
-    canNext.value = items.value.length >= pageSize
+    total.value = Number.isFinite(response?.total) ? response.total : items.value.length
+    canNext.value = page.value * pageSize < total.value
   } catch (requestError) {
     if (current === requestId) error.value = getErrorMessage(requestError, '目标视频加载失败')
   } finally {
     if (current === requestId) loading.value = false
   }
+}
+
+function updateSearch(value: string | null): void {
+  searchInput.value = value || ''
 }
 
 function choose(item: HistoryRow): void {
@@ -105,7 +118,7 @@ function goNext(): void {
 <template>
   <section
     class="target-selector"
-    :class="{ 'target-selector--compact': compact }"
+    :class="{ 'target-selector--compact': compact, 'target-selector--fill': fillHeight }"
     aria-label="MoviePilot 整理历史选择"
     :aria-busy="loading"
   >
@@ -115,7 +128,7 @@ function goNext(): void {
     </template>
     <VTextField
       v-if="searchable"
-      v-model="searchInput"
+      :model-value="searchInput"
       class="target-search"
       :label="label ? `搜索 ${label}` : '搜索整理历史'"
       :placeholder="searchPlaceholder"
@@ -123,6 +136,8 @@ function goNext(): void {
       clearable
       hide-details
       density="compact"
+      @update:model-value="updateSearch"
+      @click:clear="updateSearch('')"
     />
     <VAlert v-if="error" type="error" variant="tonal" density="compact" class="target-error">
       {{ error }}
@@ -133,18 +148,18 @@ function goNext(): void {
       <span>正在加载整理历史目标…</span>
     </div>
     <VSkeletonLoader v-if="loading" type="list-item-three-line@4" aria-hidden="true" />
-    <EmptyState v-else-if="!items.length && !error" icon="mdi-filmstrip-off" title="没有整理历史" message="MoviePilot 当前页没有返回整理历史。">
+    <EmptyState v-else-if="!items.length && !error && !normalizedSearch" icon="mdi-filmstrip-off" title="没有整理历史" message="MoviePilot 当前页没有返回整理历史。">
       <template #actions>
         <VBtn variant="tonal" size="small" prepend-icon="mdi-refresh" :disabled="disabled" @click="load">刷新目标</VBtn>
       </template>
     </EmptyState>
-    <EmptyState v-else-if="items.length > 0 && !visibleItems.length" icon="mdi-filter-off-outline" title="没有符合条件的整理历史" message="调整搜索内容后再试。">
+    <EmptyState v-else-if="normalizedSearch && !items.length && !error" icon="mdi-filter-off-outline" title="没有符合条件的整理历史" message="调整搜索内容后再试。">
       <template #actions>
-        <VBtn variant="tonal" size="small" prepend-icon="mdi-filter-remove-outline" @click="searchInput = ''">清除搜索</VBtn>
+        <VBtn variant="tonal" size="small" prepend-icon="mdi-filter-remove-outline" @click="updateSearch('')">清除搜索</VBtn>
       </template>
     </EmptyState>
     <VList
-      v-else-if="visibleItems.length"
+      v-else-if="items.length"
       class="target-list"
       lines="three"
       select-strategy="single-independent"
@@ -152,7 +167,7 @@ function goNext(): void {
       :aria-label="`${label}候选`"
     >
       <VListItem
-        v-for="(item, index) in visibleItems"
+        v-for="(item, index) in items"
         :key="itemKey(item, index)"
         :active="sameHistoryId(item, props.modelValue)"
         :disabled="disabled || historyId(item) == null"
@@ -201,6 +216,24 @@ function goNext(): void {
 .target-meta--short { display: none; }
 .target-pagination { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-top: 0.75rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; }
 .target-pagination__actions { display: flex; gap: 0.125rem; }
+
+/* 填充模式：本组件既是外层弹窗的伸缩项，也是内部的伸缩容器。
+   搜索、错误、加载与分页固定，候选列表是唯一滚动面。 */
+.target-selector--fill { display: flex; min-block-size: 0; flex: 1 1 auto; flex-direction: column; }
+.target-selector--fill .target-search,
+.target-selector--fill .target-error,
+.target-selector--fill .target-loading,
+.target-selector--fill .target-pagination { flex: 0 0 auto; }
+.target-selector--fill > :deep(.v-skeleton-loader) { min-block-size: 0; flex: 1 1 auto; overflow: hidden; }
+.target-selector--fill :deep(.empty-state) { min-block-size: 0; flex: 1 1 auto; }
+.target-selector--fill .target-list {
+  min-block-size: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(var(--v-theme-on-surface), 0.25) transparent;
+}
 @media (max-width: 37.5rem) {
   .target-meta--full { display: none; }
   .target-meta--short { display: block; margin-top: 0.2rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

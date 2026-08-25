@@ -411,15 +411,17 @@ class ApiController:
         self,
         page: int = Query(default=1, ge=1),
         page_size: PageSize = Query(default=PageSize.ITEMS_25),  # noqa: B008 - FastAPI 查询参数注入
+        search: str | None = Query(default=None, max_length=512),
         _: User = Depends(get_current_active_manage_user_async),  # noqa: B008 - FastAPI 依赖注入
     ) -> TargetPage:
-        """透传 MoviePilot 当前页整理历史供人工搜索和改配选择。"""
+        """按 MoviePilot 历史搜索语义返回人工搜索和改配选择目标。"""
 
-        result = await self._targets.list_targets(page=page, page_size=int(page_size))
+        result = await self._targets.list_targets(page=page, page_size=int(page_size), search=search)
         return TargetPage(
             items=[self._raw_history_item(item) for item in result.items],
             page=result.page,
             page_size=page_size,
+            total=result.total,
         )
 
     async def search_subtitles(
@@ -545,7 +547,9 @@ class ApiController:
             items=[
                 BatchRetargetPreviewItem(
                     record_id=item.record_id,
-                    current_subtitle_path=item.current_subtitle_path,
+                    current_subtitle_path=(
+                        str(item.current_subtitle_path) if item.current_subtitle_path is not None else None
+                    ),
                     target_history_id=item.target_history_id,
                     target=self._search.target_item(item.target) if item.target is not None else None,
                     preview=self._retarget_preview_response(item.preview) if item.preview is not None else None,

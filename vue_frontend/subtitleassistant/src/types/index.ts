@@ -211,6 +211,7 @@ export interface RawHistoryPage {
   items: HistoryRow[]
   page: number
   page_size: 25 | 50 | 100
+  total: number
 }
 
 export interface HistoryRow {

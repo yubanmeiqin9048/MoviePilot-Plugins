@@ -127,3 +127,4 @@ class TargetPage(ApiModel):
     items: list[dict[str, object]]
     page: int
     page_size: _PageSize
+    total: int

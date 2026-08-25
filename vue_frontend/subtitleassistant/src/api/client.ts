@@ -203,12 +203,13 @@ export async function clearCredentials(
 export function listTargets(
   api: PluginApi,
   pluginId: string,
-  options: { page: number; pageSize: 25 | 50 | 100 },
+  options: { page: number; pageSize: 25 | 50 | 100; search?: string | null },
 ): Promise<RawHistoryPage> {
   return api.get(pluginPath(pluginId, 'targets'), {
     params: compactParams({
       page: options.page,
       page_size: options.pageSize,
+      search: options.search?.trim(),
     }),
   })
 }
