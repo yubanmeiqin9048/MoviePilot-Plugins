@@ -46,7 +46,7 @@ class TranslationType(StrEnum):
 class SubtitleCandidate(StrictModel):
     """不含下载定位和敏感字段的统一字幕候选。"""
 
-    stable_key: str
+    candidate_key: str = Field(min_length=1)
     source: SubtitleSource
     name: str
     file_name: str | None = None

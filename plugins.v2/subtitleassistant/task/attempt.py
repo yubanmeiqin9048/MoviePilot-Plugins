@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Protocol, cast
 
 from anyio import Path as AsyncPath
 
@@ -17,7 +17,6 @@ from ..attribution import CandidateRecognizer, FileAttributor
 from ..record import RecordCommitter
 from ..schemas.attribution import (
     AttributionEvidence,
-    CandidateAttributionSnapshot,
     FileAttributionEvidence,
     FileAttributionMethod,
     FileAttributionRequest,
@@ -29,6 +28,7 @@ from ..schemas.config import PluginConfig
 from ..schemas.event import SubtitleWrittenOperation
 from ..schemas.file import ExtractedSubtitle
 from ..schemas.record import (
+    CommittedFileFact,
     FileLocation,
     MatchRecord,
     RecordStatus,
@@ -36,40 +36,55 @@ from ..schemas.record import (
 from ..schemas.source import CandidateHandle, DownloadedAsset, SubtitleSource
 from ..schemas.target import (
     MediaType,
+    PathMappingSnapshot,
     SubtitleTarget,
 )
 from ..schemas.task import (
     AttemptResult,
-    CandidateAttempt,
     CandidateAttemptReasonCode,
-    SubtitleTask,
-    TaskStage,
+)
+from ..schemas.task import (
+    _CandidateAttemptRetention as FailureResultRetention,
 )
 from ..source import CandidatePool
 
 
-class FailureResultRetention(StrEnum):
-    """定义候选失败时下载结果的处理方式。"""
-
-    PRESERVE = "preserve"
-    DISCARD = "discard"
-
-
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class AttributedSubtitle:
-    """运行期物理字幕文件及其持久化归属证据。"""
+    """运行期物理字幕文件及其归属证据。"""
 
     extracted: ExtractedSubtitle
     evidence: FileAttributionEvidence
 
 
 @dataclass(frozen=True, slots=True)
-class CandidateAttemptResult:
-    """候选尝试返回的唯一结构化结论。"""
+class CandidateAttemptRequest:
+    """候选尝试所需的冻结输入，不持有任务或人工会话实体。"""
 
-    records: list[MatchRecord]
-    attempt: CandidateAttempt
+    task_id: str
+    handle: CandidateHandle
+    target: SubtitleTarget
+    operation: SubtitleWrittenOperation
+    retention: FailureResultRetention
+    package_attribution_strategy: PackageAttributionStrategy
+    attempt_number: int
+    target_history_id: int | None = None
+    history_target_path: Path | None = None
+    matched_path_mapping: PathMappingSnapshot | None = None
+    target_file_exists: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateAttemptResult:
+    """候选尝试返回的唯一业务结论。"""
+
+    records: tuple[MatchRecord, ...]
+    result: AttemptResult
     reason_code: CandidateAttemptReasonCode | None = None
+    error_summary: str | None = None
+    committed_media_records: tuple[MatchRecord, ...] = ()
+    committed_files: tuple[CommittedFileFact, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,24 +92,18 @@ class _CandidateWriteResult:
     """单个候选字幕写入的结构化结果。"""
 
     record: MatchRecord | None = None
+    committed_file: CommittedFileFact | None = None
     error_summary: str | None = None
     reason_code: CandidateAttemptReasonCode | None = None
 
 
-class _CandidateFileMetrics(TypedDict):
-    """一次候选文件归属处理的完整计数指标。"""
+class _AttemptPhase(StrEnum):
+    """候选流水线的内部阶段，仅用于失败归类与阶段文案。"""
 
-    extracted_count: int
-    current_target_count: int
-    same_media_other_episode_count: int
-    ambiguous_count: int
-    other_media_count: int
-    ai_attempt_count: int
-    ai_accepted_count: int
-    ai_rejected_count: int
-    ai_error_count: int
-    ai_over_limit_count: int
-    ai_reason_summary: dict[str, int]
+    DOWNLOAD = "download"
+    EXTRACT = "extract"
+    MATCH = "match"
+    WRITE = "write"
 
 
 class CandidateAttemptFileSystemPort(Protocol):
@@ -126,18 +135,22 @@ class CandidateAttemptSourcePort(Protocol):
         """下载候选到指定临时目录。"""
 
 
-_ATTEMPT_RESULT_BY_STAGE: Mapping[TaskStage, AttemptResult] = {
-    TaskStage.DOWNLOAD: AttemptResult.DOWNLOAD_FAILED,
-    TaskStage.EXTRACT: AttemptResult.EXTRACT_FAILED,
-    TaskStage.MATCH: AttemptResult.NO_MATCH,
-    TaskStage.AI_ATTRIBUTION: AttemptResult.NO_MATCH,
-    TaskStage.WRITE: AttemptResult.WRITE_FAILED,
+_PHASE_RESULTS: Mapping[_AttemptPhase, AttemptResult] = {
+    _AttemptPhase.DOWNLOAD: AttemptResult.DOWNLOAD_FAILED,
+    _AttemptPhase.EXTRACT: AttemptResult.EXTRACT_FAILED,
+    _AttemptPhase.MATCH: AttemptResult.NO_MATCH,
+    _AttemptPhase.WRITE: AttemptResult.WRITE_FAILED,
 }
 
+_PHASE_NAMES: Mapping[_AttemptPhase, str] = {
+    _AttemptPhase.DOWNLOAD: "候选下载",
+    _AttemptPhase.EXTRACT: "下载结果解包",
+    _AttemptPhase.MATCH: "字幕匹配",
+    _AttemptPhase.WRITE: "字幕落盘",
+}
 
-StageCallback = Callable[[TaskStage], Awaitable[None]]
 CandidateLabel = Callable[[SubtitleCandidate], str]
-TaskLabel = Callable[[SubtitleTask], str]
+TaskLabel = Callable[[str], str]
 
 
 class CandidateAttemptService:
@@ -173,53 +186,28 @@ class CandidateAttemptService:
         self.sources = sources
         self.config = config
         self.inventory = inventory
-        self._task_label = task_label or (lambda task: f"任务 {task.id}")
+        self._task_label = task_label or (lambda task_id: f"任务 {task_id}")
         self._candidate_label = candidate_label or (lambda candidate: f"候选“{candidate.name}”")
 
-    async def attempt(
-        self,
-        task: SubtitleTask,
-        context: SubtitleTarget,
-        handle: CandidateHandle,
-        retention: FailureResultRetention,
-        *,
-        on_stage: StageCallback,
-    ) -> CandidateAttemptResult:
-        """执行单个候选的下载、解包、归属和落盘并返回结论。"""
+    async def attempt(self, request: CandidateAttemptRequest) -> CandidateAttemptResult:
+        """执行单个候选的下载、解包、归属和落盘并返回业务结论。"""
 
+        context = request.target
+        handle = request.handle
+        retention = request.retention
         candidate = handle.candidate
-        snapshot = self.matcher.candidate_snapshot(candidate)
-        task.candidate_attribution_snapshot = snapshot
         attempt_result = AttemptResult.NO_MATCH
         error_summary: str | None = None
-        active_stage = TaskStage.DOWNLOAD
-        metrics: _CandidateFileMetrics = {
-            "extracted_count": 0,
-            "current_target_count": 0,
-            "same_media_other_episode_count": 0,
-            "ambiguous_count": 0,
-            "other_media_count": 0,
-            "ai_attempt_count": 0,
-            "ai_accepted_count": 0,
-            "ai_rejected_count": 0,
-            "ai_error_count": 0,
-            "ai_over_limit_count": 0,
-            "ai_reason_summary": {},
-        }
-        written_count = 0
-        staged_count = 0
-        unmatched_count = 0
+        active_phase = _AttemptPhase.DOWNLOAD
         selected_results: list[AttributedSubtitle] = []
         additional: list[AttributedSubtitle] = []
+        extracted_files: list[ExtractedSubtitle] = []
+        written_records: list[MatchRecord] = []
+        committed_files: list[CommittedFileFact] = []
+        preserved_records: list[MatchRecord] = []
+        warnings: list[str] = []
         first_write_failure_seen = False
         write_reason_code: CandidateAttemptReasonCode | None = None
-
-        async def announce_stage(stage: TaskStage) -> None:
-            """先记录候选当前阶段，再交给协调器处理阶段快照。"""
-
-            nonlocal active_stage
-            active_stage = stage
-            await on_stage(stage)
 
         def result_reason_code(
             reason_code: CandidateAttemptReasonCode | None,
@@ -235,49 +223,26 @@ class CandidateAttemptService:
         def conclude(
             records: Sequence[MatchRecord],
             reason_code: CandidateAttemptReasonCode | None,
+            committed: Sequence[CommittedFileFact] = (),
         ) -> CandidateAttemptResult:
-            """构造审计记录与稳定原因码，不修改任务审计列表。"""
+            """把业务记录、终态原因与已提交文件收敛为候选结论。"""
 
-            attempt = CandidateAttempt(
-                candidate_key=candidate.stable_key,
-                source=candidate.source,
-                package_scope=candidate.package_scope,
-                language=candidate.language,
-                format=candidate.format,
-                translation_type=candidate.translation_type,
-                hearing_impaired=candidate.hearing_impaired,
-                attribution_strategy=task.package_attribution_strategy,
-                candidate_snapshot=snapshot,
-                extracted_count=metrics["extracted_count"],
-                current_target_count=metrics["current_target_count"],
-                same_media_other_episode_count=metrics["same_media_other_episode_count"],
-                ambiguous_count=metrics["ambiguous_count"],
-                other_media_count=metrics["other_media_count"],
-                written_count=written_count,
-                staged_count=staged_count,
-                unmatched_count=unmatched_count,
-                result=attempt_result,
-                error_summary=error_summary,
-                ai_attempt_count=metrics["ai_attempt_count"],
-                ai_accepted_count=metrics["ai_accepted_count"],
-                ai_rejected_count=metrics["ai_rejected_count"],
-                ai_error_count=metrics["ai_error_count"],
-                ai_over_limit_count=metrics["ai_over_limit_count"],
-                ai_reason_summary=metrics["ai_reason_summary"],
-            )
             return CandidateAttemptResult(
-                records=list(records),
-                attempt=attempt,
+                records=(*records, *preserved_records),
+                result=attempt_result,
                 reason_code=result_reason_code(reason_code),
+                error_summary=error_summary,
+                committed_media_records=tuple(records),
+                committed_files=tuple(committed),
+                warnings=tuple(warnings),
             )
 
-        task_dir = await self.filesystem.make_task_directory(task.id)
-        candidate_dir = task_dir / f"candidate-{len(task.candidate_attempts) + 1}"
+        task_dir = await self.filesystem.make_task_directory(request.task_id)
+        candidate_dir = task_dir / f"candidate-{request.attempt_number}"
         await AsyncPath(candidate_dir).mkdir(parents=True, exist_ok=True)
         try:
-            await announce_stage(TaskStage.DOWNLOAD)
-            logger_message = f"{self._task_label(task)}开始下载{self._candidate_label(candidate)}"
-            logger.info(logger_message)
+            active_phase = _AttemptPhase.DOWNLOAD
+            logger.info(f"{self._task_label(request.task_id)}开始下载{self._candidate_label(candidate)}")
             downloader = getattr(self._source_downloader, "download", None)
             if callable(downloader):
                 asset = await downloader(handle, candidate_dir)
@@ -290,7 +255,7 @@ class CandidateAttemptService:
                 else:
                     raise TypeError("来源下载能力未装配")
             logger.info(
-                f"{self._task_label(task)}已下载{self._candidate_label(candidate)}，得到文件“{asset.file_name}”"
+                f"{self._task_label(request.task_id)}已下载{self._candidate_label(candidate)}，得到文件“{asset.file_name}”"
             )
             asset_extension = asset.path.suffix.lower().lstrip(".")
             archive_extensions = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "cab", "iso"}
@@ -312,51 +277,55 @@ class CandidateAttemptService:
                         unmatched_reason=UnmatchedReason.UNSUPPORTED_FORMAT,
                     ),
                 )
+                extracted_files.append(unsupported.extracted)
                 record = await self._save_plugin_result(
-                    task,
+                    request,
                     context,
                     candidate,
                     unsupported,
-                    snapshot,
                     bind_target=True,
                 )
-                unmatched_count = 1
+                preserved_records.append(record)
                 attempt_result = AttemptResult.NO_MATCH
                 error_summary = "字幕格式未知或不受宿主支持，文件已保存为未匹配"
                 logger.warning(
-                    f"{self._task_label(task)}下载的文件“{asset.file_name}”格式不受宿主支持，"
+                    f"{self._task_label(request.task_id)}下载的文件“{asset.file_name}”格式不受宿主支持，"
                     f"已保存为未匹配记录 {record.id}"
                 )
                 return conclude([], CandidateAttemptReasonCode.UNSUPPORTED_FORMAT)
 
-            await announce_stage(TaskStage.EXTRACT)
-            extracted = await self.archive.extract(asset, candidate_dir / "extracted", set(self.config.format_priority))
-            if not extracted:
+            active_phase = _AttemptPhase.EXTRACT
+            extracted_files = await self.archive.extract(
+                asset,
+                candidate_dir / "extracted",
+                set(self.config.format_priority),
+            )
+            if not extracted_files:
                 attempt_result = AttemptResult.NO_MATCH
                 error_summary = "候选包没有允许格式字幕"
                 return conclude([], None)
             logger.info(
-                f"{self._task_label(task)}已从{self._candidate_label(candidate)}中取得 "
-                f"{len(extracted)} 个受支持的字幕文件"
+                f"{self._task_label(request.task_id)}已从{self._candidate_label(candidate)}中取得 "
+                f"{len(extracted_files)} 个受支持的字幕文件"
             )
-            await announce_stage(TaskStage.MATCH)
-            selected_results, additional, snapshot, metrics = await self._candidate_files(
-                task,
+            active_phase = _AttemptPhase.MATCH
+            selected_results, additional = await self._candidate_files(
+                request,
                 context,
                 handle,
-                extracted,
-                on_stage=announce_stage,
+                extracted_files,
             )
             if not selected_results:
                 attempt_result = AttemptResult.NO_MATCH
                 if retention is FailureResultRetention.PRESERVE:
-                    staged_count, unmatched_count = await self._save_additional_results(
-                        task,
+                    saved, save_warnings = await self._save_additional_results(
+                        request,
                         context,
                         candidate,
                         additional,
-                        snapshot,
                     )
+                    preserved_records.extend(saved)
+                    warnings.extend(save_warnings)
                     error_summary = "候选包未找到当前目标字幕，其他有效结果已保留"
                 else:
                     error_summary = "候选包未找到当前目标字幕"
@@ -364,30 +333,29 @@ class CandidateAttemptService:
 
             if retention is FailureResultRetention.PRESERVE:
                 directory_available, directory_error = await self.filesystem.target_directory_status(
-                    Path(task.target_path)
+                    context.target_path
                 )
                 if not directory_available:
-                    staged_count, unmatched_count = await self._save_additional_results(
-                        task,
+                    saved, save_warnings = await self._save_additional_results(
+                        request,
                         context,
                         candidate,
                         selected_results + additional,
-                        snapshot,
                     )
+                    preserved_records.extend(saved)
+                    warnings.extend(save_warnings)
                     attempt_result = AttemptResult.WRITE_FAILED
                     error_summary = f"目标目录不可用：{directory_error or '无法写入'}，下载结果已保留"
                     return conclude([], CandidateAttemptReasonCode.TARGET_DIRECTORY_UNAVAILABLE)
 
-            await announce_stage(TaskStage.WRITE)
-            written_records: list[MatchRecord] = []
+            active_phase = _AttemptPhase.WRITE
             write_errors: list[str] = []
             for selected in selected_results:
                 write_result = await self._write_candidate_file(
-                    task,
+                    request,
                     context,
                     candidate,
                     selected,
-                    snapshot,
                 )
                 record = write_result.record
                 if record is None:
@@ -398,127 +366,120 @@ class CandidateAttemptService:
                         write_reason_code = write_result.reason_code
                     continue
                 written_records.append(record)
-                task.final_subtitle_path = record.final_subtitle_path
+                if write_result.committed_file is None:
+                    raise AssertionError("已提交媒体字幕缺少文件事实")
+                committed_files.append(write_result.committed_file)
                 logger.info(
-                    f"{self._task_label(task)}已将字幕"
+                    f"{self._task_label(request.task_id)}已将字幕"
                     f"“{selected.extracted.logical_source_path}”写入“{record.final_subtitle_path}”，"
                     f"匹配记录为 {record.id}"
                 )
-            written_count = len(written_records)
             if not written_records:
                 attempt_result = AttemptResult.WRITE_FAILED
                 error_summary = write_errors[0] if write_errors else "没有形成已匹配记录"
                 if retention is FailureResultRetention.PRESERVE:
-                    staged_count, unmatched_count = await self._save_additional_results(
-                        task,
+                    saved, save_warnings = await self._save_additional_results(
+                        request,
                         context,
                         candidate,
                         selected_results + additional,
-                        snapshot,
                     )
+                    preserved_records.extend(saved)
+                    warnings.extend(save_warnings)
                     error_summary += "，下载结果已保留"
                 return conclude([], write_reason_code)
             if write_errors:
-                task.warning_count += len(write_errors)
-                task.warning_summaries.extend(f"部分字幕文件落盘失败：{error}" for error in write_errors)
                 error_summary = f"部分字幕文件落盘失败：{'；'.join(write_errors)}"
-            await announce_stage(TaskStage.MATCH)
-            staged_count, unmatched_count = await self._save_additional_results(
-                task,
+                warnings.extend(f"部分字幕文件落盘失败：{error}" for error in write_errors)
+            active_phase = _AttemptPhase.MATCH
+            saved, save_warnings = await self._save_additional_results(
+                request,
                 context,
                 candidate,
                 additional,
-                snapshot,
             )
-            task.result_source = candidate.source
-            task.result_package_scope = candidate.package_scope
-            task.result_format = selected_results[0].extracted.physical_path.suffix.lstrip(".").upper()
+            preserved_records.extend(saved)
+            warnings.extend(save_warnings)
             attempt_result = AttemptResult.SUCCESS
-            return conclude(written_records, None)
+            return conclude(written_records, None, committed_files)
         except asyncio.CancelledError:
             attempt_result = AttemptResult.INTERRUPTED
-            return conclude([], None)
+            return conclude(written_records, None, committed_files)
         except FileExistsError:
             attempt_result = AttemptResult.WRITE_FAILED
             error_summary = "目标字幕已存在，未覆盖"
             if retention is FailureResultRetention.PRESERVE and selected_results:
                 try:
-                    staged_count, unmatched_count = await self._save_additional_results(
-                        task,
+                    saved, save_warnings = await self._save_additional_results(
+                        request,
                         context,
                         candidate,
                         selected_results + additional,
-                        snapshot,
                     )
+                    preserved_records.extend(saved)
+                    warnings.extend(save_warnings)
                     error_summary = "目标字幕已存在，下载结果已保留"
                 except Exception as exc:  # noqa: BLE001 - 保留下载结果失败应返回安全失败
                     error_summary = f"目标字幕已存在，下载结果保留失败：{type(exc).__name__}"
-            return conclude([], CandidateAttemptReasonCode.SUBTITLE_DESTINATION_CONFLICT)
+            return conclude(written_records, CandidateAttemptReasonCode.SUBTITLE_DESTINATION_CONFLICT, committed_files)
         except OSError as exc:
             attempt_result = AttemptResult.WRITE_FAILED
             error_summary = f"文件操作失败：{type(exc).__name__}"
-            if retention is FailureResultRetention.PRESERVE and active_stage is TaskStage.WRITE and selected_results:
+            if (
+                retention is FailureResultRetention.PRESERVE
+                and active_phase is _AttemptPhase.WRITE
+                and selected_results
+            ):
                 try:
-                    staged_count, unmatched_count = await self._save_additional_results(
-                        task,
+                    saved, save_warnings = await self._save_additional_results(
+                        request,
                         context,
                         candidate,
                         selected_results + additional,
-                        snapshot,
                     )
+                    preserved_records.extend(saved)
+                    warnings.extend(save_warnings)
                     error_summary += "，下载结果已保留"
                 except Exception as preserve_exc:  # noqa: BLE001 - 保留下载结果失败应返回安全失败
                     error_summary += f"，下载结果保留失败：{type(preserve_exc).__name__}"
-            return conclude([], None)
+            return conclude(written_records, None, committed_files)
         except RuntimeError as exc:
-            attempt_result = _ATTEMPT_RESULT_BY_STAGE[active_stage]
+            attempt_result = _PHASE_RESULTS[active_phase]
             if type(exc).__name__ in {"SourceRequestError", "SourceLimitedError"}:
                 error_summary = str(exc)
             else:
-                error_summary = f"{self._stage_name(active_stage)}阶段失败：{exc}"
-            return conclude([], None)
+                error_summary = f"{_PHASE_NAMES[active_phase]}阶段失败：{exc}"
+            return conclude(written_records, None, committed_files)
         except Exception as exc:  # noqa: BLE001 - 候选边界必须收敛运行时失败
-            attempt_result = _ATTEMPT_RESULT_BY_STAGE[active_stage]
+            attempt_result = _PHASE_RESULTS[active_phase]
             error_summary = f"候选处理失败：{type(exc).__name__}"
-            return conclude([], None)
+            return conclude(written_records, None, committed_files)
 
     async def _candidate_files(
         self,
-        task: SubtitleTask,
+        request: CandidateAttemptRequest,
         context: SubtitleTarget,
         handle: CandidateHandle,
         files: list[ExtractedSubtitle],
-        *,
-        on_stage: StageCallback,
-    ) -> tuple[
-        list[AttributedSubtitle],
-        list[AttributedSubtitle],
-        CandidateAttributionSnapshot,
-        _CandidateFileMetrics,
-    ]:
+    ) -> tuple[list[AttributedSubtitle], list[AttributedSubtitle]]:
         """逐文件归属并选出当前目标第一优先字幕。"""
 
         candidate = handle.candidate
         snapshot = self.matcher.candidate_snapshot(candidate)
-        task.candidate_attribution_snapshot = snapshot
         attributed: list[AttributedSubtitle] = []
-        attribution_metrics = {
-            "attempt_count": 0,
-            "accepted_count": 0,
-            "rejected_count": 0,
-            "error_count": 0,
-            "over_limit_count": 0,
-            "reason_summary": {},
-        }
         other_media_count = 0
-        host_file_count = sum(1 for extracted in files if not extracted.is_direct_file)
-        if task.package_attribution_strategy is PackageAttributionStrategy.HOST_RECOGNITION and host_file_count:
+        use_direct_file_evidence = (
+            request.operation is SubtitleWrittenOperation.MANUAL_CANDIDATE
+            or request.package_attribution_strategy is PackageAttributionStrategy.TRUST_PACKAGE
+        )
+        host_file_count = sum(1 for extracted in files if not extracted.is_direct_file or not use_direct_file_evidence)
+        if request.package_attribution_strategy is PackageAttributionStrategy.HOST_RECOGNITION and host_file_count:
             logger.info(
-                f"{self._task_label(task)}开始调用 MoviePilot 文件识别处理"
+                f"{self._task_label(request.task_id)}开始调用 MoviePilot 文件识别处理"
                 f"{self._candidate_label(candidate)}中的 {host_file_count} 个字幕"
             )
         for extracted in files:
-            if extracted.is_direct_file:
+            if extracted.is_direct_file and use_direct_file_evidence:
                 evidence = FileAttributionEvidence(
                     logical_source_path=Path(extracted.logical_source_path),
                     method=FileAttributionMethod.DIRECT_FILE,
@@ -532,75 +493,40 @@ class CandidateAttemptService:
                     episode_evidence=AttributionEvidence.NOT_APPLICABLE,
                 )
             else:
-                request = FileAttributionRequest(
+                file_request = FileAttributionRequest(
                     path=extracted.physical_path,
                     logical_source_path=Path(extracted.logical_source_path),
                     target=context,
                     candidate_snapshot=snapshot,
-                    strategy=task.package_attribution_strategy,
+                    strategy=request.package_attribution_strategy,
                 )
-
-                async def announce_attribution_batch(_data: dict[str, object]) -> None:
-                    """仅在归属 facade 实际开始一批补充归属时推进任务阶段。"""
-
-                    await on_stage(TaskStage.AI_ATTRIBUTION)
-
-                async def finish_attribution_batch(_data: dict[str, object]) -> None:
-                    """归属 facade 完成一批补充归属后恢复常规匹配阶段。"""
-
-                    await on_stage(TaskStage.MATCH)
-
                 batch = await self.attributor.attribute_requests(
                     context,
                     candidate,
                     snapshot,
-                    [request],
-                    task.package_attribution_strategy,
+                    [file_request],
+                    request.package_attribution_strategy,
                     evidence_by_key={},
-                    on_batch_start=announce_attribution_batch,
-                    on_batch_end=finish_attribution_batch,
                 )
                 evidence = next(iter(batch.evidence_by_key.values()), None)
                 if evidence is None:
                     raise RuntimeError("文件归属能力未返回证据")
-                attribution_metrics["attempt_count"] += batch.submitted_count
-                attribution_metrics["accepted_count"] += batch.accepted_count
-                attribution_metrics["rejected_count"] += batch.rejected_count
-                attribution_metrics["error_count"] += batch.error_count
-                attribution_metrics["over_limit_count"] += batch.over_limit_count
-                for reason, count in batch.reason_summary.items():
-                    attribution_metrics["reason_summary"][reason] = (
-                        attribution_metrics["reason_summary"].get(reason, 0) + count
-                    )
             if evidence.belongs_to_target_media is False:
                 other_media_count += 1
                 continue
             attributed.append(AttributedSubtitle(extracted=extracted, evidence=evidence))
-        if task.package_attribution_strategy is PackageAttributionStrategy.HOST_RECOGNITION and host_file_count:
+        if request.package_attribution_strategy is PackageAttributionStrategy.HOST_RECOGNITION and host_file_count:
             logger.info(
-                f"{self._task_label(task)}已完成 MoviePilot 文件识别，"
+                f"{self._task_label(request.task_id)}已完成 MoviePilot 文件识别，"
                 f"处理 {host_file_count} 个字幕，其中明确属于其他媒体 {other_media_count} 个"
             )
 
-        current_files, additional, ambiguous_count, same_media_other_episode_count = self._classify_files(
+        current_files, additional, _ambiguous_count, _other_episode_count = self._classify_files(
             attributed,
             context,
         )
-        metrics: _CandidateFileMetrics = {
-            "extracted_count": len(files),
-            "current_target_count": len(current_files),
-            "same_media_other_episode_count": same_media_other_episode_count,
-            "ambiguous_count": ambiguous_count,
-            "other_media_count": other_media_count,
-            "ai_attempt_count": attribution_metrics["attempt_count"],
-            "ai_accepted_count": attribution_metrics["accepted_count"],
-            "ai_rejected_count": attribution_metrics["rejected_count"],
-            "ai_error_count": attribution_metrics["error_count"],
-            "ai_over_limit_count": attribution_metrics["over_limit_count"],
-            "ai_reason_summary": attribution_metrics["reason_summary"],
-        }
         if not current_files:
-            return [], additional, snapshot, metrics
+            return [], additional
         format_order = {value.upper().lstrip("."): index for index, value in enumerate(self.config.format_priority)}
         current_files.sort(
             key=lambda result: (
@@ -608,7 +534,7 @@ class CandidateAttemptService:
                 result.extracted.logical_source_path,
             )
         )
-        return current_files, additional, snapshot, metrics
+        return current_files, additional
 
     def _classify_files(
         self,
@@ -645,11 +571,10 @@ class CandidateAttemptService:
 
     async def _make_record(
         self,
-        task: SubtitleTask,
+        request: CandidateAttemptRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         result: AttributedSubtitle,
-        snapshot: CandidateAttributionSnapshot,
         status: RecordStatus,
         location: FileLocation,
         path: str | Path,
@@ -684,22 +609,18 @@ class CandidateAttemptService:
             canonical_identity_value=identity[1] if identity else None,
             tmdb_id=evidence.tmdb_id,
             imdb_id=evidence.imdb_id,
-            target_history_id=task.target_history_id if bind_target else None,
-            history_target_path=task.history_target_path if bind_target else None,
-            target_path=task.target_path if bind_target else None,
-            matched_path_mapping=task.matched_path_mapping if bind_target else None,
-            target_file_exists=task.target_file_exists if bind_target else None,
+            target_history_id=request.target_history_id if bind_target else None,
+            history_target_path=request.history_target_path if bind_target else None,
+            target_path=context.target_path if bind_target else None,
+            matched_path_mapping=request.matched_path_mapping if bind_target else None,
+            target_file_exists=request.target_file_exists if bind_target else None,
             final_subtitle_path=Path(final_path) if final_path is not None else None,
-            source_task_id=task.id,
-            candidate_key=candidate.stable_key,
+            source_task_id=request.task_id,
+            candidate_key=candidate.candidate_key,
             candidate_name=candidate.name,
-            candidate_attribution_snapshot=snapshot,
             logical_source_path=evidence.logical_source_path,
             file_attribution_method=evidence.method,
-            season_evidence=evidence.season_evidence,
-            episode_evidence=evidence.episode_evidence,
             unmatched_reason=evidence.unmatched_reason,
-            host_recognition_summary=evidence.host_recognition_summary,
             language=candidate.language,
             translation_type=candidate.translation_type,
             hearing_impaired=candidate.hearing_impaired,
@@ -711,54 +632,37 @@ class CandidateAttemptService:
             download_count=candidate.download_count,
             uploaded_at=candidate.uploaded_at,
             revision=candidate.revision,
-            ai_takeover_audit=evidence.ai_takeover_audit,
         )
         if status is RecordStatus.STAGED:
             record.staged_at = record.created_at
         return record
 
-    @staticmethod
-    def _record_task_result(task: SubtitleTask, record: MatchRecord) -> None:
-        """在记录能力完成提交后更新任务审计摘要。"""
-
-        task.record_ids.append(record.id)
-        task.record_counts[record.status.value] = task.record_counts.get(record.status.value, 0) + 1
-
     async def _write_candidate_file(
         self,
-        task: SubtitleTask,
+        request: CandidateAttemptRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         result: AttributedSubtitle,
-        snapshot: CandidateAttributionSnapshot,
     ) -> _CandidateWriteResult:
         """写入一个候选字幕并只在匹配记录保存成功后返回文件事实。"""
 
         try:
             record = await self._make_record(
-                task,
+                request,
                 context,
                 candidate,
                 result,
-                snapshot,
                 RecordStatus.MATCHED,
                 FileLocation.MEDIA_DIRECTORY,
                 "",
                 None,
                 True,
             )
-            operation = (
-                SubtitleWrittenOperation.MANUAL_CANDIDATE
-                if task.trigger.value == "manual_candidate"
-                else SubtitleWrittenOperation.AUTOMATIC_CANDIDATE
-            )
-            record = await self.inventory.commit_media(
+            committed_file = await self.inventory.commit_media(
                 record,
                 result.extracted.physical_path,
-                Path(task.target_path),
-                operation,
+                context.target_path,
             )
-            self._record_task_result(task, record)
         except asyncio.CancelledError:
             raise
         except FileExistsError:
@@ -770,7 +674,7 @@ class CandidateAttemptService:
             return _CandidateWriteResult(error_summary=f"文件操作失败：{type(exc).__name__}")
         except Exception as exc:  # noqa: BLE001 - 单文件记录失败不吞掉其它已提交文件
             return _CandidateWriteResult(error_summary=f"匹配记录保存失败：{type(exc).__name__}")
-        return _CandidateWriteResult(record=record)
+        return _CandidateWriteResult(record=committed_file.record, committed_file=committed_file)
 
     @staticmethod
     def _can_stage(result: AttributedSubtitle, context: SubtitleTarget) -> bool:
@@ -787,11 +691,10 @@ class CandidateAttemptService:
 
     async def _save_plugin_result(
         self,
-        task: SubtitleTask,
+        request: CandidateAttemptRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         result: AttributedSubtitle,
-        snapshot: CandidateAttributionSnapshot,
         *,
         bind_target: bool,
     ) -> MatchRecord:
@@ -799,11 +702,10 @@ class CandidateAttemptService:
 
         status = RecordStatus.STAGED if self._can_stage(result, context) else RecordStatus.UNMATCHED
         record = await self._make_record(
-            task,
+            request,
             context,
             candidate,
             result,
-            snapshot,
             status,
             FileLocation.PLUGIN_DATA,
             "",
@@ -811,21 +713,19 @@ class CandidateAttemptService:
             bind_target,
         )
         record = await self.inventory.commit_plugin(record, result.extracted.physical_path)
-        self._record_task_result(task, record)
         return record
 
     async def _save_additional_results(
         self,
-        task: SubtitleTask,
+        request: CandidateAttemptRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         results: list[AttributedSubtitle],
-        snapshot: CandidateAttributionSnapshot,
-    ) -> tuple[int, int]:
-        """保存附加字幕，单文件失败仅形成任务警告。"""
+    ) -> tuple[list[MatchRecord], list[str]]:
+        """保存附加字幕并把单文件失败返回给外层任务处理。"""
 
-        staged_count = 0
-        unmatched_count = 0
+        records: list[MatchRecord] = []
+        warnings: list[str] = []
         for result in results:
             evidence = result.evidence
             bind_target = bool(
@@ -837,36 +737,33 @@ class CandidateAttemptService:
             )
             try:
                 record = await self._save_plugin_result(
-                    task,
+                    request,
                     context,
                     candidate,
                     result,
-                    snapshot,
                     bind_target=bind_target,
                 )
             except Exception as exc:  # noqa: BLE001 - 附加字幕失败不能中断候选处理
-                task.warning_count += 1
-                task.warning_summaries.append(f"附加字幕保存失败：{type(exc).__name__}")
+                warnings.append(f"附加字幕保存失败：{type(exc).__name__}")
                 logger.warning(
-                    f"{self._task_label(task)}保存附加字幕"
+                    f"{self._task_label(request.task_id)}保存附加字幕"
                     f"“{result.extracted.logical_source_path}”失败，将继续处理任务："
                     f"{type(exc).__name__}"
                 )
                 continue
+            records.append(record)
             if record.status is RecordStatus.STAGED:
-                staged_count += 1
                 logger.info(
-                    f"{self._task_label(task)}已将附加字幕"
+                    f"{self._task_label(request.task_id)}已将附加字幕"
                     f"“{result.extracted.logical_source_path}”保存为暂存记录 {record.id}"
                 )
             else:
-                unmatched_count += 1
                 logger.info(
-                    f"{self._task_label(task)}无法完整确认附加字幕"
+                    f"{self._task_label(request.task_id)}无法完整确认附加字幕"
                     f"“{result.extracted.logical_source_path}”的归属，"
                     f"已保存为未匹配记录 {record.id}"
                 )
-        return staged_count, unmatched_count
+        return records, warnings
 
     @staticmethod
     def _unique_scope_value(evidence: FileAttributionEvidence, field: str) -> tuple[int | None, int]:
@@ -877,15 +774,3 @@ class CandidateAttemptService:
         if not values and scalar is not None:
             values = [scalar]
         return (values[0], 1) if len(values) == 1 else (None, len(values))
-
-    @staticmethod
-    def _stage_name(stage: TaskStage) -> str:
-        """返回候选流水线阶段的中文名称。"""
-
-        return {
-            TaskStage.DOWNLOAD: "候选下载",
-            TaskStage.EXTRACT: "下载结果解包",
-            TaskStage.MATCH: "字幕匹配",
-            TaskStage.AI_ATTRIBUTION: "AI 智能接管",
-            TaskStage.WRITE: "字幕落盘",
-        }[stage]

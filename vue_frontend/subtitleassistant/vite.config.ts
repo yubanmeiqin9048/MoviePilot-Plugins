@@ -127,12 +127,33 @@ export default defineConfig(({ command }) => ({
           Root(root: {
             walkRules: (callback: (rule: { selector?: string; remove: () => void }) => void) => void
           }) {
-            // Vuetify CSS belongs to the host. Keep it in the standalone shell during dev.
+            /*
+             * Vuetify CSS belongs to the host. remoteEntry injects this artifact's CSS into
+             * document.head, so an unanchored `.v-`/`.mdi-` rule would restyle the host's own
+             * components — the federation guide drops every one of them for that reason.
+             *
+             * A component's `:deep(.v-…)` override cannot reach the host: after compilation it
+             * is anchored by that component's `[data-v-…]` attribute. Removing those shipped a
+             * build whose layout silently differed from the standalone shell, so they stay.
+             * Both spellings are accepted because this plugin runs before Vue's scoped
+             * transform today — matching the compiled form too keeps the rules alive if that
+             * order ever changes, instead of silently dropping them again.
+             *
+             * Filter per comma-separated part so a mixed list can't smuggle a bare `.v-`
+             * selector through on the back of an anchored one.
+             */
             if (command !== 'build') return
             root.walkRules(rule => {
-              if (rule.selector && (rule.selector.includes('.v-') || rule.selector.includes('.mdi-'))) {
-                rule.remove()
-              }
+              if (!rule.selector) return
+              const parts = rule.selector.split(',')
+              const kept = parts.filter(part => {
+                const touchesVuetify = part.includes('.v-') || part.includes('.mdi-')
+                const scopedToThisPlugin = part.includes(':deep(') || part.includes('[data-v-')
+                return !touchesVuetify || scopedToThisPlugin
+              })
+              if (kept.length === parts.length) return
+              if (kept.length) rule.selector = kept.join(',')
+              else rule.remove()
             })
           },
         },

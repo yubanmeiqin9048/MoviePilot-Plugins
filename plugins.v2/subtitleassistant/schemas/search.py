@@ -6,27 +6,16 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .candidate import CandidateRecognition
-from .source import SourceDetails, SubtitleSource
+from .source import SourceSearchResult
 from .target import SearchTarget
 from .task import SubtitleTask
 
 __all__ = [
     "ManualSearchResult",
-    "ManualSearchStatus",
     "ManualSourceView",
     "ManualSubmitResult",
     "ManualSubmitStatus",
 ]
-
-
-class ManualSearchStatus(StrEnum):
-    """人工字幕搜索的来源状态。"""
-
-    SUCCESS = "success"
-    LIMITED = "limited"
-    ERROR = "error"
-    DISABLED = "disabled"
-    UNCONFIGURED = "unconfigured"
 
 
 class ManualSubmitStatus(StrEnum):
@@ -40,23 +29,16 @@ class ManualSubmitStatus(StrEnum):
 
 @dataclass(slots=True)
 class ManualSourceView:
-    """不包含下载句柄的人工来源搜索响应。"""
+    """人工搜索的一个来源结果：直用来源最小结果并附加该来源候选的识别标注。"""
 
-    source: SubtitleSource
-    status: ManualSearchStatus
+    run: SourceSearchResult
     candidates: list[CandidateRecognition] = field(default_factory=list)
-    default_queries: list[str] = field(default_factory=list)
-    executed_queries: list[str] = field(default_factory=list)
-    matched_query: str | None = None
-    duration_ms: int | None = None
-    error_summary: str | None = None
-    details: SourceDetails = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        """把边界处的来源状态收敛为搜索能力枚举。"""
+    @property
+    def candidate_count(self) -> int:
+        """返回该来源展示给用户的候选数。"""
 
-        if not isinstance(self.status, ManualSearchStatus):
-            self.status = ManualSearchStatus(self.status)
+        return len(self.candidates)
 
 
 @dataclass(slots=True)
@@ -74,7 +56,6 @@ class ManualSubmitResult:
 
     status: ManualSubmitStatus
     task: SubtitleTask | None = None
-    reused: bool = False
 
     def __post_init__(self) -> None:
         """把边界处的提交状态收敛为搜索能力枚举。"""

@@ -34,7 +34,7 @@ type SearchConditionSnapshot = {
   targetHistoryId: string | number
   keywords: Record<SubtitleSource, string | null>
 }
-type DownloadFeedback = 'queued' | 'reused'
+type DownloadFeedback = 'queued'
 
 const props = defineProps<{ api: PluginApi; pluginId: string; active: boolean }>()
 const emit = defineEmits<{ action: [] }>()
@@ -179,14 +179,13 @@ async function download(candidate: SubtitleCandidate): Promise<void> {
   delete nextFeedback[candidateKey]
   downloadFeedback.value = nextFeedback
   try {
-    const result = await downloadCandidate(props.api, props.pluginId, sessionId, candidateKey)
+    await downloadCandidate(props.api, props.pluginId, sessionId, candidateKey)
     if (requestId !== searchRequestId) return
     downloadFeedback.value = {
       ...downloadFeedback.value,
-      [candidateKey]: result.reused ? 'reused' : 'queued',
+      [candidateKey]: 'queued',
     }
-    if (result.reused) toast?.info('该候选已有处理中任务，已复用原任务')
-    else toast?.success('已加入下载队列')
+    toast?.success('已加入下载队列')
     emit('action')
   } catch (requestError) {
     if (requestId !== searchRequestId) return

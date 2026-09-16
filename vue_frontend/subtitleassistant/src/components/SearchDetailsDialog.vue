@@ -36,35 +36,7 @@ function openDialog(): void {
 }
 
 function cacheLabel(group: SearchSourceGroup): string {
-  const cache = Array.isArray(group.details.cache)
-    ? group.details.cache.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>
-    : []
-  if (group.details.cache_hit === true || cache.some(item => item.hit === true)) return '是，复用来源查询缓存'
-  if (group.details.cache_hit === false || cache.some(item => item.hit === false || item.state === 'miss' || item.state === 'invalid')) {
-    return '否，本次执行来源查询'
-  }
-  return '未记录'
-}
-
-function formatPageCount(group: SearchSourceGroup): string {
-  const pagination = Array.isArray(group.details.pagination)
-    ? group.details.pagination.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>
-    : []
-  const tracedPages = pagination.reduce((total, item) => {
-    const pagesFetched = item.pages_fetched
-    return total + (typeof pagesFetched === 'number' && Number.isFinite(pagesFetched) && pagesFetched > 0 ? pagesFetched : 0)
-  }, 0)
-  const value = tracedPages || group.details.page_count
-  return typeof value === 'number' && Number.isFinite(value) ? `${value} 页` : '未记录'
-}
-
-function paginationLabel(group: SearchSourceGroup): string {
-  const pagination = Array.isArray(group.details.pagination)
-    ? group.details.pagination.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>
-    : []
-  if (pagination.some(item => item.complete === false) || group.details.pagination_complete === false) return '不完整'
-  if (pagination.length > 0 || group.details.pagination_complete === true) return '完整'
-  return '未记录'
+  return group.cache_hit ? '是，复用来源查询缓存' : '否，本次执行来源查询'
 }
 
 function sourceGroups(): SearchSourceGroup[] {
@@ -115,8 +87,6 @@ function sourceGroups(): SearchSourceGroup[] {
             <dl class="source-detail__facts">
               <div><dt>候选数量</dt><dd>{{ group.candidate_count }}</dd></div>
               <div><dt>缓存是否复用</dt><dd>{{ cacheLabel(group) }}</dd></div>
-              <div><dt>分页数量</dt><dd>{{ formatPageCount(group) }}</dd></div>
-              <div><dt>分页完整性</dt><dd>{{ paginationLabel(group) }}</dd></div>
             </dl>
             <div class="source-detail__queries">
               <div>
@@ -125,10 +95,6 @@ function sourceGroups(): SearchSourceGroup[] {
                   <li v-for="(plan, index) in group.default_plans" :key="`${group.source}-plan-${index}`">{{ formatSearchPlan(plan) }}</li>
                 </ul>
                 <p v-else>未记录</p>
-              </div>
-              <div>
-                <h4>已执行查询</h4>
-                <p>{{ group.executed_queries.length ? group.executed_queries.join(' → ') : '未执行' }}</p>
               </div>
               <div>
                 <h4>命中查询</h4>
@@ -158,7 +124,7 @@ function sourceGroups(): SearchSourceGroup[] {
 .source-detail__heading > div { display: grid; min-width: 0; gap: 0.35rem; }
 .source-detail__heading h3 { margin: 0; color: rgb(var(--v-theme-on-surface)); font-size: 0.8125rem; font-weight: 650; }
 .source-detail__duration { flex: 0 0 auto; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; }
-.source-detail__facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; margin: 0.75rem 0 0; }
+.source-detail__facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; margin: 0.75rem 0 0; }
 .source-detail__facts > div { min-width: 0; }
 .source-detail__facts dt, .source-detail__queries h4 { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.625rem; font-weight: 500; }
 .source-detail__facts dd { margin: 0.18rem 0 0; color: rgb(var(--v-theme-on-surface)); font-size: 0.75rem; line-height: 1.4; overflow-wrap: anywhere; }

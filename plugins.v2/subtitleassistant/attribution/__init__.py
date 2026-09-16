@@ -1,7 +1,7 @@
 """字幕归属识别能力的调用侧契约。"""
 
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Protocol, cast
+from collections.abc import Mapping
+from typing import Protocol
 
 from ..schemas.attribution import (
     CandidateAttributionSnapshot,
@@ -12,7 +12,6 @@ from ..schemas.attribution import (
     PackageAttributionStrategy,
 )
 from ..schemas.candidate import CandidateRecognition, SubtitleCandidate
-from ..schemas.config import PluginConfig
 from ..schemas.target import SubtitleTarget
 
 
@@ -42,25 +41,12 @@ class CandidateRecognizer(Protocol):
 class FileAttributor:
     """按一般化请求批量归属字幕文件。"""
 
-    def __init__(
-        self,
-        ai_adapter: object | None = None,
-        recognizer: object | None = None,
-        *,
-        config_provider: Callable[[], PluginConfig] | None = None,
-    ) -> None:
+    def __init__(self, recognizer: object | None = None) -> None:
         """创建归属 facade 并隐藏内部实现。"""
 
-        from .service import AttributionAdapterPort, AttributionService
+        from .service import AttributionService
 
-        if ai_adapter is None and config_provider is not None:
-            from .ai import AiAttributionAdapter
-
-            ai_adapter = AiAttributionAdapter(config=config_provider)
-        self._service = AttributionService(
-            ai_adapter=cast(AttributionAdapterPort | None, ai_adapter),
-            recognizer=recognizer,
-        )
+        self._service = AttributionService(recognizer=recognizer)
 
     def recognize_candidate(
         self,
@@ -96,10 +82,8 @@ class FileAttributor:
         strategy: PackageAttributionStrategy,
         *,
         evidence_by_key: Mapping[str, FileAttributionEvidence] | None = None,
-        on_batch_start: Callable[[dict[str, object]], Awaitable[None] | None] | None = None,
-        on_batch_end: Callable[[dict[str, object]], Awaitable[None] | None] | None = None,
     ) -> FileAttributionBatchResult:
-        """返回每个字幕文件的归属证据。"""
+        """返回每个字幕文件的规则归属证据。"""
 
         return await self._service.attribute_requests(
             context,
@@ -108,8 +92,6 @@ class FileAttributor:
             requests,
             strategy,
             evidence_by_key=evidence_by_key,
-            on_batch_start=on_batch_start,
-            on_batch_end=on_batch_end,
         )
 
 

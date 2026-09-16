@@ -25,7 +25,7 @@ const props = defineProps<{
   downloadDisabled: boolean
   loadingCandidates: Record<string, boolean>
   downloadErrors: Record<string, string>
-  downloadFeedback: Record<string, 'queued' | 'reused'>
+  downloadFeedback: Record<string, 'queued'>
 }>()
 
 const emit = defineEmits<{ download: [candidate: SubtitleCandidate] }>()
@@ -48,7 +48,7 @@ const statusSummary = computed(() => props.sources
   .join(' · '))
 
 const attentionSummary = computed(() => {
-  const attention = props.sources.filter(group => ['limited', 'error', 'disabled', 'unconfigured'].includes(group.status))
+  const attention = props.sources.filter(group => ['partial', 'limited', 'error', 'disabled', 'unconfigured'].includes(group.status))
   if (!attention.length) return ''
   return `需要注意：${attention.map(group => `${sourceLabels[group.source]}${manualSourceState(group.status, group.candidate_count).label}`).join('、')}`
 })
@@ -83,7 +83,7 @@ function candidateRange(candidate: SubtitleCandidate): string {
 }
 
 function candidateFormat(candidate: SubtitleCandidate): string {
-  if (!candidate.format || candidate.format.toUpperCase() === 'UNKNOWN') return ''
+  if (candidate.format.toUpperCase() === 'UNKNOWN') return '格式：未知'
   return `格式：${candidate.format.toUpperCase()}`
 }
 
@@ -181,7 +181,7 @@ function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
                 <span class="candidate-name__source">{{ sourceLabels[candidate.source] }}</span>
               </div>
               <strong class="candidate-value">{{ candidate.name }}</strong>
-              <span v-if="candidate.file_name" class="candidate-secondary">文件名：{{ candidate.file_name }}</span>
+              <span class="candidate-secondary">文件名：{{ candidate.file_name || '未提供' }}</span>
             </td>
             <td data-label="范围" class="candidate-range">
               <span class="candidate-field-label">范围</span>
@@ -204,16 +204,6 @@ function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
               <div class="candidate-action__inner">
                 <VAlert v-if="props.downloadErrors[candidate.candidate_key]" type="error" variant="tonal" density="compact" class="download-error">
                   {{ props.downloadErrors[candidate.candidate_key] }}
-                </VAlert>
-                <VAlert
-                  v-else-if="props.downloadFeedback[candidate.candidate_key] === 'reused'"
-                  type="info"
-                  variant="tonal"
-                  density="compact"
-                  class="download-feedback"
-                  role="status"
-                >
-                  已有处理中任务已复用
                 </VAlert>
                 <VAlert
                   v-else-if="props.downloadFeedback[candidate.candidate_key] === 'queued'"

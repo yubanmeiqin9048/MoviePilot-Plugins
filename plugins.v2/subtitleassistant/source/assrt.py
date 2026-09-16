@@ -2,94 +2,96 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from app.core.config import settings
 from app.utils.http import AsyncRequestUtils
 
-from ..schemas.base import elapsed_ms, utc_now
+from ..schemas.base import utc_now
 from ..schemas.candidate import PackageScope, SubtitleCandidate, TranslationType
 from ..schemas.source import (
+    AssrtDownloadHandle,
     CandidateHandle,
     DownloadedAsset,
-    OpaqueCandidateHandle,
-    SourceHealth,
-    SourceStatus,
+    SourceErrorCode,
     SubtitleSource,
 )
 from ..schemas.target import SubtitleTarget
+from .base import (
+    SourceCachePort,
+    SourcePage,
+    SourcePlan,
+    SourcePlanQuery,
+    SourceProbe,
+    SubtitleSourceBase,
+)
 from .common import (
     SourceLimitedError,
     SourceRequestError,
     _proxy_kwargs,
     download_file,
     parse_datetime,
+    raise_for_status,
     safe_file_name,
     subtitle_format,
 )
 from .limiter import SlidingWindowLimiter
-from .pool import (
-    CandidatePage,
-    CandidatePoolQueryError,
-    CandidatePoolQueryLimitedError,
-    SourceQuery,
-    SourceQueryPlan,
-)
 
 
-class AssrtSource:
+class _AssrtRawPage(BaseModel):
+    """ASSRT adapter 私有的原始响应 envelope。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    status: int
+    sub: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class _AssrtRawItem(BaseModel):
+    """ASSRT 单项原始候选的私有校验模型。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    id: int | str | None = None
+    revision: int | str | None = None
+    native_name: str | None = None
+    videoname: str | None = None
+    subtype: str | None = None
+    lang: dict[str, JsonValue] | None = None
+    vote_machine_translate: JsonValue | None = None
+    vote_score: int | float | str | None = None
+    upload_time: str | None = None
+
+
+class AssrtSource(SubtitleSourceBase):
     """统一按标题执行最多两轮搜索的 ASSRT 来源。"""
 
     source = SubtitleSource.ASSRT
     BASE_URL = "https://api.assrt.net/v1"
-
-    @staticmethod
-    def _opaque_payload(handle: CandidateHandle) -> dict[str, Any] | None:
-        """解码 ASSRT 来源的内部下载句柄。"""
-
-        if not isinstance(handle.opaque, OpaqueCandidateHandle):
-            return None
-        try:
-            payload = json.loads(handle.opaque.token)
-        except (TypeError, ValueError):
-            return None
-        return payload if isinstance(payload, dict) else None
+    CACHE_TTL_SECONDS = 30 * 60
 
     def __init__(
         self,
         enabled: bool,
         credentials: dict[str, str],
-        allowed_formats: set[str],
+        cache: SourceCachePort | None = None,
         limiter: SlidingWindowLimiter | None = None,
     ) -> None:
         """创建 ASSRT 来源适配器。"""
 
-        self.enabled = enabled
+        super().__init__(enabled=enabled, cache=cache)
         self._token = credentials.get("token", "").strip()
-        self._allowed_formats = {item.upper().lstrip(".") for item in allowed_formats}
-        self._limiter = limiter or SlidingWindowLimiter(limit=5, window_seconds=60)
+        self._limiter = limiter or SlidingWindowLimiter(limit=20, window_seconds=60)
         self._last_details: dict[str, Any] = {"attribution": "https://assrt.net"}
-        self._credential_generation = 0
 
     @property
     def configured(self) -> bool:
         """判断 ASSRT Token 是否已配置。"""
 
         return bool(self._token)
-
-    async def replace_credentials(self, credentials: dict[str, str]) -> None:
-        """替换运行期 Token 并推进来源查询配置代次。"""
-
-        self._token = credentials.get("token", "").strip()
-        self._credential_generation += 1
-
-    @property
-    def configuration_generation(self) -> int:
-        """返回影响来源候选缓存身份的 Token 配置代次。"""
-
-        return self._credential_generation
 
     def _headers(self) -> dict[str, str]:
         """构造使用 Bearer Token 的 ASSRT 请求头。"""
@@ -108,31 +110,28 @@ class AssrtSource:
             ),
             "",
         )
-        return [item for item in (primary, alternate) if len(item) >= 3]
+        return [item for item in (primary, alternate) if len(item) >= 4]
 
-    def query_plan(
-        self,
-        context: SubtitleTarget,
-        custom_query: str | None,
-    ) -> SourceQueryPlan:
+    def _plan(self, context: SubtitleTarget, custom_query: str | None) -> SourcePlan:
         """根据标题回退或来源自定义关键词生成有序查询计划。"""
 
         defaults = self._default_queries(context)
         custom = (custom_query or "").strip()
-        labels = [custom] if custom else defaults
-        query_type = "custom" if custom else "keyword"
+        labels = [custom] if len(custom) >= 4 else [] if custom else defaults
         queries = [
-            SourceQuery(
+            SourcePlanQuery(
                 label=label,
                 identity={"path": "sub/search", "params": {"q": label, "cnt": 15, "pos": 0}},
-                query_type=query_type,
+                max_pages=1,
+                kind="title" if index == 0 else "fallback",
+                query=label,
             )
-            for label in labels
+            for index, label in enumerate(labels)
         ]
-        return SourceQueryPlan(
+        return SourcePlan(
             queries=queries,
-            default_queries=defaults,
             configured=self.configured,
+            skip_reason="keyword_too_short" if custom and len(custom) < 4 else None,
         )
 
     async def _request_json(
@@ -154,29 +153,28 @@ class AssrtSource:
             if response.status_code == 429:
                 limited_until = await self._limiter.mark_limited()
                 raise SourceLimitedError("ASSRT 分钟请求额度暂时受限", retry_at=limited_until)
-            if response.status_code >= 400:
-                raise SourceRequestError(f"ASSRT 请求返回 HTTP {response.status_code}")
+            raise_for_status(response, context="ASSRT ", limited_codes=frozenset())
             payload = response.json()
             if not isinstance(payload, dict):
-                raise SourceRequestError("ASSRT 响应结构无效")
+                raise SourceRequestError("ASSRT 响应结构无效", SourceErrorCode.MALFORMED_RESPONSE)
             status = int(payload.get("status", -1))
             if status == 30900:
                 limited_until = await self._limiter.mark_limited()
                 raise SourceLimitedError("ASSRT 分钟请求额度暂时受限", retry_at=limited_until)
             if status != 0:
-                raise SourceRequestError(f"ASSRT 返回错误状态 {status}")
+                raise SourceRequestError("ASSRT 返回错误状态", SourceErrorCode.INVALID_REQUEST)
             self._last_details["last_request_at"] = utc_now().isoformat()
             return payload
         except ValueError as exc:
-            raise SourceRequestError("ASSRT 响应无法解析") from exc
+            raise SourceRequestError("ASSRT 响应无法解析", SourceErrorCode.MALFORMED_RESPONSE) from exc
         finally:
             if response is not None:
                 await response.aclose()
 
-    async def fetch_page(self, query: SourceQuery, page_number: int) -> CandidatePage:
-        """执行一次 ASSRT 标题查询并归一化为安全候选页。"""
+    async def _fetch_page(self, query: SourcePlanQuery, page: int) -> SourcePage:
+        """执行一次 ASSRT 请求并归一化为安全候选页。"""
 
-        if page_number != 1:
+        if page != 1:
             raise SourceRequestError("ASSRT 不支持多页查询")
         path = query.identity.get("path")
         params = query.identity.get("params")
@@ -187,45 +185,42 @@ class AssrtSource:
         except SourceLimitedError as exc:
             if exc.retry_at:
                 self._last_details["limited_until"] = exc.retry_at.isoformat()
-            raise CandidatePoolQueryLimitedError(str(exc)) from exc
-        except SourceRequestError as exc:
-            raise CandidatePoolQueryError(str(exc)) from exc
-        handles, raw_count, rejected = self._normalize_pool(payload, query)
-        return CandidatePage(
+            raise
+        try:
+            raw_page = _AssrtRawPage.model_validate(payload)
+        except ValidationError as exc:
+            raise SourceRequestError("ASSRT 响应结构无效", SourceErrorCode.MALFORMED_RESPONSE) from exc
+        handles, raw_count, rejected, malformed_count = self._normalize_pool(raw_page.model_dump(), query)
+        return SourcePage(
             candidates=handles,
             raw_count=raw_count,
-            download_locator_excluded=rejected.get("download_locator", 0),
+            download_locator_excluded_count=rejected.get("download_locator", 0),
+            malformed_count=malformed_count,
         )
-
-    def is_valid_download_locator(self, handle: CandidateHandle) -> bool:
-        """判断候选句柄是否包含有效的 ASSRT 字幕 ID。"""
-
-        if handle.candidate.source is not self.source:
-            return False
-        payload = self._opaque_payload(handle)
-        if payload is None:
-            return False
-        subtitle_id = payload.get("id")
-        try:
-            return int(subtitle_id) > 0 if isinstance(subtitle_id, (str, int, float)) else False
-        except (TypeError, ValueError):
-            return False
 
     def _normalize_pool(
         self,
         payload: dict[str, Any],
-        query: SourceQuery,
-    ) -> tuple[list[CandidateHandle], int, dict[str, int]]:
+        query: SourcePlanQuery,
+    ) -> tuple[list[CandidateHandle], int, dict[str, int], int]:
         """归一化自动规则之前的 ASSRT 来源候选池。"""
 
         result: list[CandidateHandle] = []
         raw_count = 0
         rejected: dict[str, int] = {}
-        subs = (payload.get("sub") or {}).get("subs") or []
-        for item in subs:
-            if not isinstance(item, dict):
+        malformed_count = 0
+        sub = payload.get("sub") or {}
+        if not isinstance(sub, dict):
+            return result, raw_count, rejected, 1
+        subs = sub.get("subs") or []
+        if not isinstance(subs, list):
+            return result, raw_count, rejected, 1
+        for item_value in subs:
+            try:
+                item = _AssrtRawItem.model_validate(item_value).model_dump()
+            except ValidationError:
+                malformed_count += 1
                 continue
-            raw_count += 1
             try:
                 subtitle_id = int(item.get("id"))
             except (TypeError, ValueError):
@@ -234,6 +229,7 @@ class AssrtSource:
             if subtitle_id <= 0:
                 rejected["download_locator"] = rejected.get("download_locator", 0) + 1
                 continue
+            raw_count += 1
             language_data = item.get("lang") or {}
             marker = str(language_data.get("desc") or "")
             flags = language_data.get("langlist") if isinstance(language_data.get("langlist"), dict) else {}
@@ -246,7 +242,7 @@ class AssrtSource:
             except (TypeError, ValueError):
                 revision = 0
             candidate = SubtitleCandidate(
-                stable_key=f"assrt:{subtitle_id}:{revision}",
+                candidate_key=f"assrt:{subtitle_id}:{revision}",
                 source=self.source,
                 name=str(item.get("native_name") or item.get("videoname") or subtitle_id),
                 file_name=None,
@@ -268,12 +264,25 @@ class AssrtSource:
             result.append(
                 CandidateHandle(
                     candidate=candidate,
-                    opaque=OpaqueCandidateHandle(
-                        token=json.dumps({"id": subtitle_id}, separators=(",", ":"), sort_keys=True)
-                    ),
+                    download_handle=AssrtDownloadHandle(subtitle_id=subtitle_id),
                 )
             )
-        return result, raw_count, rejected
+        return result, raw_count, rejected, malformed_count
+
+    async def _probe(self, manual: bool) -> SourceProbe | None:
+        """查询 ASSRT 配额并服从统一分钟限流。"""
+
+        try:
+            payload = await self._request_json("user/quota", {}, wait=not manual)
+        except SourceLimitedError as exc:
+            if exc.retry_at:
+                self._last_details["limited_until"] = exc.retry_at.isoformat()
+            raise
+        except Exception as exc:
+            raise SourceRequestError("ASSRT 配额检查失败") from exc
+        quota = (payload.get("user") or {}).get("quota")
+        self._last_details.update({"quota": quota, "limited_until": None})
+        return None
 
     async def _detail(self, subtitle_id: int) -> dict[str, Any]:
         """下载前请求最新字幕详情。"""
@@ -290,10 +299,9 @@ class AssrtSource:
     async def download(self, handle: CandidateHandle, directory: Path) -> DownloadedAsset:
         """请求最新详情并优先下载完整候选包。"""
 
-        payload = self._opaque_payload(handle)
-        if payload is None or payload.get("id") is None:
+        if not isinstance(handle.download_handle, AssrtDownloadHandle):
             raise SourceRequestError("ASSRT 候选缺少有效下载句柄")
-        subtitle_id = int(payload["id"])
+        subtitle_id = handle.download_handle.subtitle_id
         detail = await self._detail(subtitle_id)
         url = detail.get("url")
         if not isinstance(url, str) or not url:
@@ -301,43 +309,3 @@ class AssrtSource:
         file_name = safe_file_name(detail.get("filename"), f"assrt-{subtitle_id}.bin")
         path = await download_file(AsyncRequestUtils(**_proxy_kwargs(settings.PROXY)), url, directory, file_name)
         return DownloadedAsset(path=path, file_name=file_name)
-
-    async def refresh(self, manual: bool = False) -> SourceStatus:
-        """查询 ASSRT 配额并服从统一分钟限流。"""
-
-        status = SourceStatus(source=self.source, enabled=self.enabled, configured=self.configured)
-        status.details = dict(self._last_details)
-        if not self.enabled or not self.configured:
-            status.health = SourceHealth.DISABLED
-            return status
-        started = utc_now()
-        status.last_checked_at = started
-        try:
-            payload = await self._request_json("user/quota", {}, wait=not manual)
-            quota = (payload.get("user") or {}).get("quota")
-            self._last_details.update({"quota": quota, "limited_until": None})
-            status.health = SourceHealth.HEALTHY
-            status.last_success_at = utc_now()
-        except SourceLimitedError as exc:
-            status.health = SourceHealth.LIMITED
-            status.last_error_at = utc_now()
-            status.last_error_summary = str(exc)
-            if exc.retry_at:
-                self._last_details["limited_until"] = exc.retry_at.isoformat()
-        except Exception:  # noqa: BLE001 - 外部字幕源异常必须收敛为安全状态
-            status.health = SourceHealth.ERROR
-            status.last_error_at = utc_now()
-            status.last_error_summary = "ASSRT 配额检查失败"
-        status.details = dict(self._last_details)
-        status.last_duration_ms = elapsed_ms(started)
-        return status
-
-    async def close(self) -> None:
-        """释放 ASSRT 来源运行态。"""
-
-        return
-
-    def runtime_details(self) -> dict[str, Any]:
-        """返回 ASSRT 非敏感运行观测。"""
-
-        return dict(self._last_details)

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field, JsonValue
+from pydantic import BeforeValidator, Field
 
 from ...schemas.candidate import (
     CandidateRecognitionStatus,
@@ -15,6 +14,7 @@ from ...schemas.candidate import (
     TranslationType,
 )
 from ...schemas.source import (
+    SourceErrorCode,
     SubtitleSource,
 )
 from .base import ApiModel
@@ -31,8 +31,7 @@ __all__ = [
     "SearchPlanItem",
 ]
 
-_ManualSearchStatus = Literal["success", "limited", "error", "disabled", "unconfigured"]
-type SourceDetails = dict[str, JsonValue]
+_ManualSearchStatus = Literal["success", "partial", "limited", "error", "disabled", "unconfigured"]
 
 
 def _enum_parser[EnumType: Enum](enum_type: type[EnumType]) -> Callable[[object], object]:
@@ -61,17 +60,6 @@ def _history_id_parser(value: object) -> object:
     return value
 
 
-def _datetime_parser(value: object) -> object:
-    """把 ISO-8601 字符串显式解析为时间值。"""
-
-    if isinstance(value, datetime) or not isinstance(value, str):
-        return value
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return value
-
-
 _CandidateRecognitionStatus = Annotated[
     CandidateRecognitionStatus,
     BeforeValidator(_enum_parser(CandidateRecognitionStatus)),
@@ -79,8 +67,8 @@ _CandidateRecognitionStatus = Annotated[
 _SubtitleSource = Annotated[SubtitleSource, BeforeValidator(_enum_parser(SubtitleSource))]
 _PackageScope = Annotated[PackageScope, BeforeValidator(_enum_parser(PackageScope))]
 _TranslationType = Annotated[TranslationType, BeforeValidator(_enum_parser(TranslationType))]
-_DateTimeOptional = Annotated[datetime | None, BeforeValidator(_datetime_parser)]
 _HistoryId = Annotated[int, BeforeValidator(_history_id_parser)]
+_SourceErrorCode = Annotated[SourceErrorCode, BeforeValidator(_enum_parser(SourceErrorCode))]
 
 
 class ManualSearchRequest(ApiModel):
@@ -101,7 +89,7 @@ class ManualCandidateItem(ApiModel):
     name: str
     file_name: str | None = None
     language: str | None = None
-    format: str | None = None
+    format: str = Field(min_length=1)
     package_scope: _PackageScope
     season: int | None = None
     episode: int | None = None
@@ -109,26 +97,21 @@ class ManualCandidateItem(ApiModel):
     episodes: list[int] = Field(default_factory=list)
     translation_type: _TranslationType
     hearing_impaired: bool
-    rating: float | None = None
-    votes: int | None = None
-    downloads: int | None = None
-    uploaded_at: _DateTimeOptional = None
-    query: str | None = None
-    source_details: SourceDetails = Field(default_factory=dict)
 
 
 class ManualSourceResult(ApiModel):
-    """单个来源的一次人工搜索结果。"""
+    """单个来源的一次人工搜索结果（最小信息集）。"""
 
     source: _SubtitleSource
     status: _ManualSearchStatus
     default_plans: list[SearchPlanItem] = Field(default_factory=list)
-    executed_queries: list[str] = Field(default_factory=list)
     matched_query: str | None = None
     candidate_count: int = 0
+    cache_hit: bool = False
     duration_ms: int | None = None
+    error_code: _SourceErrorCode | None = None
     error_summary: str | None = None
-    details: SourceDetails = Field(default_factory=dict)
+    retry_after_seconds: int | None = None
     candidates: list[ManualCandidateItem] = Field(default_factory=list)
 
 
@@ -150,5 +133,4 @@ class ManualDownloadResponse(ApiModel):
     """人工候选入队结果。"""
 
     task_id: str
-    reused: bool = False
     task: TaskListItem

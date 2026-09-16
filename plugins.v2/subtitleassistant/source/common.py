@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,23 @@ from anyio import Path as AsyncPath
 
 from app.utils.http import AsyncRequestUtils
 
+from ..schemas.source import SourceErrorCode
+
 
 class SourceRequestError(RuntimeError):
     """不包含响应原文和敏感字段的字幕源请求错误。"""
+
+    def __init__(
+        self,
+        message: str,
+        error_code: SourceErrorCode = SourceErrorCode.REQUEST_FAILED,
+        status_code: int | None = None,
+    ) -> None:
+        """保存可投影到候选池结果的安全错误类别。"""
+
+        super().__init__(message)
+        self.error_code = error_code
+        self.status_code = status_code
 
 
 class SourceLimitedError(SourceRequestError):
@@ -25,6 +40,31 @@ class SourceLimitedError(SourceRequestError):
 
         super().__init__(message)
         self.retry_at = retry_at
+
+
+def raise_for_status(
+    response: Any,
+    *,
+    context: str,
+    limited_codes: frozenset[int] = frozenset({429}),
+    retry_at: Callable[[Any], datetime] | None = None,
+) -> None:
+    """共享 HTTP 状态码阶梯：限流→受限、401/403→凭据无效、5xx→暂时不可用、4xx→请求无效。"""
+
+    if response is None:
+        raise SourceRequestError(f"{context}请求失败")
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code in limited_codes:
+        raise SourceLimitedError(
+            f"{context}暂时受限",
+            retry_at=retry_at(response) if retry_at is not None else None,
+        )
+    if status_code in {401, 403}:
+        raise SourceRequestError(f"{context}凭据无效", SourceErrorCode.INVALID_CREDENTIALS)
+    if status_code >= 500:
+        raise SourceRequestError(f"{context}服务暂时不可用", SourceErrorCode.TEMPORARY_UNAVAILABLE)
+    if status_code >= 400:
+        raise SourceRequestError(f"{context}请求无效", SourceErrorCode.INVALID_REQUEST)
 
 
 def _proxy_kwargs(proxies: dict[str, str] | None) -> dict[str, Any]:
@@ -75,7 +115,10 @@ async def download_file(
             if response is None:
                 raise SourceRequestError("字幕文件请求失败")
             if response.status_code >= 400:
-                raise SourceRequestError(f"字幕文件请求返回 HTTP {response.status_code}")
+                raise SourceRequestError(
+                    f"字幕文件请求返回 HTTP {response.status_code}",
+                    status_code=response.status_code,
+                )
             selected_name = file_name
             if prefer_response_name:
                 response_url = str(getattr(response, "url", "") or "")

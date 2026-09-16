@@ -31,7 +31,6 @@ class PluginConfig:
     format_priority: list[str] = field(default_factory=list)
     path_mappings: tuple[PathMapping, ...] = field(default_factory=tuple)
     package_attribution_strategy: PackageAttributionStrategy = PackageAttributionStrategy.TRUST_PACKAGE
-    ai_attribution_takeover_enabled: bool = False
 
     def __post_init__(self) -> None:
         """把来源优先级收敛为来源能力拥有的枚举。"""
@@ -63,5 +62,4 @@ class PluginConfig:
             "format_priority": list(self.format_priority),
             "path_mappings": [mapping.as_dict() for mapping in self.path_mappings],
             "package_attribution_strategy": self.package_attribution_strategy.value,
-            "ai_attribution_takeover_enabled": self.ai_attribution_takeover_enabled,
         }

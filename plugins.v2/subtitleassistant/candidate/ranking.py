@@ -80,7 +80,7 @@ def candidate_rank(
         0 if candidate.exact_id_match else 1,
         _position(candidate.source.value, source_values),
         *_source_quality(candidate),
-        candidate.stable_key,
+        candidate.candidate_key,
     )
 
 
@@ -98,7 +98,7 @@ def candidate_from_record(record: MatchRecord) -> SubtitleCandidate:
     """把暂存记录还原为可参与统一排序的安全候选。"""
 
     return SubtitleCandidate(
-        stable_key=record.candidate_key,
+        candidate_key=record.candidate_key,
         source=record.source,
         name=record.candidate_name or record.subtitle_file_name,
         file_name=record.subtitle_file_name,

@@ -14,7 +14,6 @@ export interface HostToast {
 
 export type TaskStatus = 'queued' | 'processing' | 'success' | 'skipped' | 'failed' | 'interrupted'
 export type TaskTrigger = 'transfer_event' | 'manual_candidate'
-export type TaskStage = 'preflight' | 'inventory' | 'search' | 'download' | 'extract' | 'match' | 'ai_attribution' | 'write'
 export type RecordStatus = 'matched' | 'staged' | 'unmatched'
 export type RecordDeleteMode = 'record_only' | 'record_and_file'
 export const MAX_RECORD_BATCH_SIZE = 100
@@ -28,8 +27,7 @@ export type SourceHealth = 'pending' | 'healthy' | 'limited' | 'error' | 'disabl
 export type FileLocation = 'media_directory' | 'plugin_data'
 export type MediaType = 'movie' | 'tv' | 'unknown'
 export type PackageAttributionStrategy = 'trust_package' | 'host_recognition'
-export type FileAttributionMethod = 'direct_file' | PackageAttributionStrategy | 'ai_takeover'
-export type AttributionEvidence = 'path' | 'candidate_snapshot' | 'ai_takeover' | 'not_applicable' | 'unknown'
+export type FileAttributionMethod = 'direct_file' | PackageAttributionStrategy
 export type UnmatchedReason =
   | 'media_unrecognized'
   | 'season_ambiguous'
@@ -42,17 +40,6 @@ export interface PathMapping {
   target_prefix: string
 }
 
-export interface CandidateAttributionSnapshot {
-  media_type: MediaType
-  year?: number | null
-  tmdb_id: number | null
-  imdb_id: string | null
-  seasons: number[]
-  episodes: number[]
-  package_scope: PackageScope
-  evidence: string[]
-}
-
 export interface ConfigModel {
   plugin_id?: string
   enabled: boolean
@@ -62,12 +49,6 @@ export interface ConfigModel {
   opensubtitles_configured: boolean
   assrt_configured: boolean
   allow_machine_translation: boolean
-  /** 匹配失败时是否允许插件请求字幕归属 AI 接管。 */
-  ai_attribution_takeover_enabled: boolean
-  /** MoviePilot 智能助手总开关状态，仅用于界面禁用提示，不参与保存。 */
-  ai_agent_enabled?: boolean
-  ai_agent_available?: boolean
-  host_ai_enabled?: boolean
   max_candidate_attempts: number
   source_priority: SubtitleSource[]
   format_priority: string[]
@@ -84,7 +65,6 @@ export type NonSensitiveConfig = Pick<
   | 'opensubtitles_enabled'
   | 'assrt_enabled'
   | 'allow_machine_translation'
-  | 'ai_attribution_takeover_enabled'
   | 'max_candidate_attempts'
   | 'source_priority'
   | 'format_priority'
@@ -104,7 +84,6 @@ export interface TaskListItem {
   target_history_id: string | number | null
   history_target_path: string | null
   status: TaskStatus
-  stage: TaskStage | null
   reason_code: string | null
   reason_message: string | null
   result_source: SubtitleSource | null
@@ -114,67 +93,7 @@ export interface TaskListItem {
   started_at: string | null
   finished_at: string | null
   duration_ms: number | null
-  warning_count: number
   trigger: TaskTrigger
-}
-
-export interface StageTrace {
-  stage: TaskStage
-  started_at: string
-  finished_at: string | null
-  duration_ms: number | null
-  summary: string | null
-}
-
-export type SourceRunStatus = 'success' | 'empty' | 'filtered' | 'error' | 'limited' | 'disabled' | 'unconfigured'
-export interface SourceRun {
-  source: SubtitleSource
-  status: SourceRunStatus
-  candidate_count?: number
-  raw_count?: number
-  admitted_count?: number
-  media_matched_count?: number
-  rejected_count?: number
-  rejection_summary?: Record<string, number>
-  duration_ms: number | null
-  error_summary: string | null
-  details: Record<string, unknown>
-}
-
-export type AttemptResult =
-  | 'success'
-  | 'download_failed'
-  | 'extract_failed'
-  | 'no_match'
-  | 'write_failed'
-  | 'interrupted'
-export interface CandidateAttempt {
-  candidate_key: string
-  source: SubtitleSource
-  package_scope: PackageScope
-  language: string
-  format: string
-  translation_type: TranslationType
-  hearing_impaired: boolean
-  attribution_strategy?: PackageAttributionStrategy | null
-  candidate_snapshot?: CandidateAttributionSnapshot | null
-  extracted_count?: number
-  current_target_count?: number
-  same_media_other_episode_count?: number
-  ambiguous_count?: number
-  other_media_count?: number
-  written_count?: number
-  staged_count?: number
-  unmatched_count?: number
-  ai_attempt_count?: number
-  ai_accepted_count?: number
-  ai_rejected_count?: number
-  ai_error_count?: number
-  ai_skipped_count?: number
-  ai_over_limit_count?: number
-  ai_reason_summary?: Record<string, number>
-  result: AttemptResult
-  error_summary: string | null
 }
 
 export interface TaskDetail extends TaskListItem {
@@ -183,17 +102,8 @@ export interface TaskDetail extends TaskListItem {
   target_storage: string | null
   matched_path_mapping?: PathMapping | null
   target_file_exists?: boolean | null
-  package_attribution_strategy?: PackageAttributionStrategy
-  candidate_attribution_snapshot?: CandidateAttributionSnapshot | null
-  existing_subtitle_check: Record<string, unknown>
-  inventory_result: Record<string, unknown>
-  stage_traces: StageTrace[]
-  source_runs: SourceRun[]
-  candidate_attempts: CandidateAttempt[]
   final_subtitle_path: string | null
-  record_ids: string[]
   record_counts: Record<string, number>
-  warning_summaries: string[]
   manual_source: SubtitleSource | null
   manual_candidate_key: string | null
   manual_candidate_summary: Record<string, unknown>
@@ -269,14 +179,8 @@ export interface RecordDetail extends RecordListItem {
   language: string
   translation_type: TranslationType
   hearing_impaired: boolean
-  candidate_attribution_snapshot?: CandidateAttributionSnapshot | null
   logical_source_path?: string | null
   file_attribution_method?: FileAttributionMethod | null
-  host_recognition_summary?: Record<string, unknown> | null
-  ai_takeover_audit?: Record<string, unknown> | null
-  ai_attribution_audit?: Record<string, unknown> | null
-  season_evidence?: AttributionEvidence | null
-  episode_evidence?: AttributionEvidence | null
   unmatched_reason?: UnmatchedReason | null
   target_file_exists?: boolean | null
   staged_at: string | null
@@ -329,7 +233,7 @@ export interface CandidateSourceFilterOption {
   value: CandidateSourceFilter
 }
 
-export type ManualSourceResult = 'success' | 'limited' | 'error' | 'disabled' | 'unconfigured'
+export type ManualSourceResult = 'success' | 'partial' | 'limited' | 'error' | 'disabled' | 'unconfigured'
 
 export interface SubtitleCandidate {
   candidate_key: string
@@ -338,7 +242,7 @@ export interface SubtitleCandidate {
   file_name: string | null
   source: SubtitleSource
   language: string | null
-  format: string | null
+  format: string
   package_scope: PackageScope
   season: number | null
   episode: number | null
@@ -346,24 +250,19 @@ export interface SubtitleCandidate {
   episodes: number[]
   translation_type: TranslationType
   hearing_impaired: boolean
-  rating: number | null
-  votes: number | null
-  downloads: number | null
-  uploaded_at: string | null
-  query: string | null
-  source_details: Record<string, string | number | boolean | null>
 }
 
 export interface SearchSourceGroup {
   source: SubtitleSource
   status: ManualSourceResult
   default_plans: SearchPlanItem[]
-  executed_queries: string[]
   matched_query: string | null
   candidate_count: number
+  cache_hit: boolean
   duration_ms: number | null
+  error_code: string | null
   error_summary: string | null
-  details: Record<string, unknown>
+  retry_after_seconds: number | null
   candidates: SubtitleCandidate[]
 }
 
@@ -375,7 +274,6 @@ export interface SearchResponse {
 
 export interface DownloadResponse {
   task_id: string
-  reused: boolean
   task: TaskListItem
 }
 

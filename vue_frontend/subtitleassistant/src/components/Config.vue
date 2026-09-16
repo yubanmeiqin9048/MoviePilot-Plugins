@@ -54,7 +54,6 @@ const form = reactive<{
   opensubtitles_enabled: boolean
   assrt_enabled: boolean
   allow_machine_translation: boolean
-  ai_attribution_takeover_enabled: boolean
   max_candidate_attempts: number
   package_attribution_strategy: PackageAttributionStrategy
 }>({
@@ -63,7 +62,6 @@ const form = reactive<{
   opensubtitles_enabled: false,
   assrt_enabled: false,
   allow_machine_translation: false,
-  ai_attribution_takeover_enabled: false,
   max_candidate_attempts: 3,
   package_attribution_strategy: 'trust_package',
 })
@@ -100,12 +98,6 @@ const openCredential = ref<ExternalSource | null>(null)
 
 const isDesktop = computed(() => mdAndUp.value)
 const pluginId = computed(() => typeof props.initialConfig?.plugin_id === 'string' ? props.initialConfig.plugin_id.trim() : '')
-const hostAiEnabled = computed(() => Boolean(
-  props.initialConfig?.ai_agent_enabled
-  ?? props.initialConfig?.ai_agent_available
-  ?? props.initialConfig?.host_ai_enabled
-  ?? props.initialConfig?.moviepilot_ai_enabled,
-))
 const osDraftValues = computed(() => Object.values(credentials.opensubtitles).map(value => value.trim()))
 const hasOsUpdate = computed(() => osDraftValues.value.some(Boolean))
 const hasAssrtUpdate = computed(() => Boolean(credentials.assrt.token.trim()))
@@ -136,7 +128,7 @@ const groupErrors = computed<Record<GroupKey, string>>(() => ({
 const groupSummary = computed<Record<GroupKey, string>>(() => ({
   sources: `${enabledSourceCount.value}/3 已启用 · 搜索顺序 ${sourcePriority.value.map(item => shortLabel(item)).join(' → ')}`,
   candidate: `最多试 ${form.max_candidate_attempts} 个候选 · ${form.allow_machine_translation ? '允许' : '不允许'}机翻 · 格式 ${formatPriority.value.join(' → ')}`,
-  attribution: `${form.package_attribution_strategy === 'trust_package' ? '信任候选包身份' : '交给 MoviePilot 逐个识别'} · AI 接管${form.ai_attribution_takeover_enabled ? '已开启' : '已关闭'}`,
+  attribution: `${form.package_attribution_strategy === 'trust_package' ? '信任候选包身份' : '交给 MoviePilot 逐个识别'}`,
   paths: pathMappings.value.length ? `${pathMappings.value.length} 条映射生效` : '未配置，直接使用整理历史中的原始目标路径',
 }))
 
@@ -179,7 +171,6 @@ function applyInitialConfig(): void {
   form.opensubtitles_enabled = Boolean(initial.opensubtitles_enabled)
   form.assrt_enabled = Boolean(initial.assrt_enabled)
   form.allow_machine_translation = Boolean(initial.allow_machine_translation)
-  form.ai_attribution_takeover_enabled = Boolean(initial.ai_attribution_takeover_enabled)
   form.max_candidate_attempts = validAttemptCount(initial.max_candidate_attempts) ? Number(initial.max_candidate_attempts) : 3
   form.package_attribution_strategy = initial.package_attribution_strategy === 'host_recognition'
     ? 'host_recognition'
@@ -334,7 +325,6 @@ function nonSensitiveConfig(): NonSensitiveConfig {
     opensubtitles_enabled: form.opensubtitles_enabled,
     assrt_enabled: form.assrt_enabled,
     allow_machine_translation: form.allow_machine_translation,
-    ai_attribution_takeover_enabled: form.ai_attribution_takeover_enabled,
     max_candidate_attempts: Number(form.max_candidate_attempts),
     source_priority: [...sourcePriority.value],
     format_priority: [...formatPriority.value],
@@ -440,7 +430,6 @@ function cancelConfigChanges(): void {
   form.opensubtitles_enabled = baseline.opensubtitles_enabled
   form.assrt_enabled = baseline.assrt_enabled
   form.allow_machine_translation = baseline.allow_machine_translation
-  form.ai_attribution_takeover_enabled = baseline.ai_attribution_takeover_enabled
   form.max_candidate_attempts = baseline.max_candidate_attempts
   form.package_attribution_strategy = baseline.package_attribution_strategy
   sourcePriority.value = [...baseline.source_priority]
@@ -684,13 +673,6 @@ function showNotice(text: string, color: 'success' | 'error' | 'warning'): void 
                 <span>逐个字幕调用 MoviePilot 媒体识别，并核对媒体 ID。</span>
               </button>
             </div>
-            <div class="fallback">
-              <VSwitch v-model="form.ai_attribution_takeover_enabled" color="primary" label="字幕归属失败时允许 AI 智能接管"
-                hide-details inset :disabled="!hostAiEnabled" />
-              <p>{{ hostAiEnabled
-                ? '仅在常规字幕归属无法形成确定结论时请求 MoviePilot 当前配置的 LLM；会发送媒体名称、候选名称和包内相对文件名，AI 只提出结构化归属建议，不会直接移动或删除文件。'
-                : '需先启用 MoviePilot 智能助手；当前插件开关偏好会保留，不会因宿主关闭而被改写。' }}</p>
-            </div>
           </template>
 
           <template v-else>
@@ -802,7 +784,6 @@ function showNotice(text: string, color: 'success' | 'error' | 'warning'): void 
 .choice-card--active { border-color: rgb(var(--v-theme-primary)); background: rgba(var(--v-theme-primary), .07); box-shadow: inset 0 0 0 1px rgb(var(--v-theme-primary)); }
 .choice-card strong { font-size: .8125rem; }
 .choice-card span { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .6875rem; line-height: 1.5; }
-.fallback p { margin: .25rem 0 0; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .6875rem; line-height: 1.55; }
 
 .map-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto; align-items: start; gap: .6rem; padding: .85rem; }
 .map-row + .map-row { border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }

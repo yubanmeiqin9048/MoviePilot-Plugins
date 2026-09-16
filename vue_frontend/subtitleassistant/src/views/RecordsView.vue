@@ -25,10 +25,7 @@ import {
 import {
   formatBytes,
   formatDate,
-  attributionEvidenceLabels,
-  displayValue,
   fileAttributionLabels,
-  friendlyKey,
   locationLabels,
   mediaLabel,
   mediaTypeLabels,
@@ -286,10 +283,6 @@ async function confirmDelete(mode: RecordDeleteMode): Promise<void> {
 function clearFilters(): void {
   searchInput.value = ''
   status.value = ''
-}
-
-function detailEntries(value: Record<string, unknown> | null | undefined): Array<[string, unknown]> {
-  return Object.entries(value || {})
 }
 
 function setRecordSelected(item: RecordListItem, selected: boolean): void {
@@ -577,25 +570,8 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
               <DetailRow label="翻译类型">{{ translationLabels[detail.translation_type] }}</DetailRow>
               <DetailRow label="听障字幕">{{ detail.hearing_impaired ? '是（SDH/CC）' : '否' }}</DetailRow>
               <DetailRow label="文件归属方式">{{ detail.file_attribution_method ? fileAttributionLabels[detail.file_attribution_method] : '未记录' }}</DetailRow>
-              <DetailRow label="季号证据">{{ detail.season_evidence ? attributionEvidenceLabels[detail.season_evidence] : '未记录' }}</DetailRow>
-              <DetailRow label="集号证据">{{ detail.episode_evidence ? attributionEvidenceLabels[detail.episode_evidence] : '未记录' }}</DetailRow>
               <DetailRow v-if="detail.unmatched_reason" label="未匹配原因">{{ unmatchedReasonLabels[detail.unmatched_reason] }}</DetailRow>
-              <DetailRow v-if="detail.candidate_attribution_snapshot" label="候选归属快照">{{ displayValue(detail.candidate_attribution_snapshot) }}</DetailRow>
-              <DetailRow v-if="detail.host_recognition_summary && Object.keys(detail.host_recognition_summary).length" label="媒体识别摘要">{{ displayValue(detail.host_recognition_summary) }}</DetailRow>
             </dl></VExpansionPanelText>
-          </VExpansionPanel>
-          <VExpansionPanel v-if="detail.ai_takeover_audit || detail.ai_attribution_audit">
-            <VExpansionPanelTitle>AI 智能接管审计</VExpansionPanelTitle>
-            <VExpansionPanelText>
-              <dl class="ai-audit-list">
-                <DetailRow
-                  v-for="[key, value] in detailEntries(detail.ai_takeover_audit || detail.ai_attribution_audit || {})"
-                  :key="key"
-                  :label="friendlyKey(key)"
-                >{{ displayValue(value) }}</DetailRow>
-              </dl>
-              <p class="cell-note">仅展示规范化审计字段，不包含原始提示、响应、密钥或 Token 用量。</p>
-            </VExpansionPanelText>
           </VExpansionPanel>
           <VExpansionPanel>
             <VExpansionPanelTitle>生命周期</VExpansionPanelTitle>
@@ -695,7 +671,6 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
 .detail-state { margin: 1rem; }
 .detail-sections { border-radius: 0; }
 .retarget-audit { margin-top: 0.5rem; }
-.ai-audit-list { margin: 0; }
 .mobile-list { padding: 0; border-block: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); background: transparent; }
 .mobile-list__item { min-height: 6rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .mobile-list__detail { display: grid; width: 100%; min-width: 0; padding: 0; border: 0; color: inherit; text-align: start; background: transparent; cursor: pointer; font: inherit; }

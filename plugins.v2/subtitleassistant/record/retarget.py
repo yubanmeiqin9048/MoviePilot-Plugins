@@ -62,7 +62,7 @@ async def _publish_subtitle_written_best_effort(
     try:
         await publisher.publish(event)
     except Exception as exc:  # noqa: BLE001 - 提交后的通知失败不能回滚业务事实
-        logger.error(f"字幕落盘事件发布失败，已保留成功业务结果；异常类型为 {type(exc).__name__}")
+        logger.warning(f"字幕落盘事件发布失败，已保留成功业务结果；异常类型为 {type(exc).__name__}")
 
 
 class RetargetStorePort(Protocol):
@@ -456,6 +456,7 @@ class RetargetService:
                 new_history_target_path=resolution.original_path,
                 old_target_path=record.target_path,
                 new_target_path=resolution.resolved_path,
+                new_matched_path_mapping=self._mapping_snapshot(resolution),
                 old_subtitle_path=old_subtitle,
                 new_subtitle_path=destination,
             )

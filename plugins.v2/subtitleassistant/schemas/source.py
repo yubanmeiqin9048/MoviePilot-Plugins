@@ -1,4 +1,4 @@
-"""字幕源状态、候选池结果与下载交接公共契约。"""
+"""字幕源状态、来源查询结果与下载交接公共契约。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field, JsonValue
 
@@ -16,19 +16,18 @@ if TYPE_CHECKING:
     from .candidate import SubtitleCandidate
 
 __all__ = [
-    "CacheTrace",
-    "CacheTraceState",
+    "AssrtDownloadHandle",
     "CandidateHandle",
-    "CandidatePoolQueryBatchResult",
-    "CandidatePoolStatus",
     "DownloadedAsset",
-    "OpaqueCandidateHandle",
-    "PaginationTrace",
-    "SourceCandidatePoolResult",
+    "MoviePilotDownloadHandle",
+    "OpenSubtitlesDownloadHandle",
     "SourceDetails",
+    "SourceErrorCode",
     "SourceHealth",
-    "SourceRun",
-    "SourceRunStatus",
+    "SourcePlanEntry",
+    "SourceSearchBatch",
+    "SourceSearchResult",
+    "SourceSearchStatus",
     "SourceStatus",
     "SubtitleSource",
 ]
@@ -52,20 +51,8 @@ class SourceHealth(StrEnum):
     DISABLED = "disabled"
 
 
-class SourceRunStatus(StrEnum):
-    """单个字幕源在一次任务中的运行结果。"""
-
-    SUCCESS = "success"
-    EMPTY = "empty"
-    FILTERED = "filtered"
-    ERROR = "error"
-    LIMITED = "limited"
-    DISABLED = "disabled"
-    UNCONFIGURED = "unconfigured"
-
-
-class CandidatePoolStatus(StrEnum):
-    """单个字幕源候选池的运行结果。"""
+class SourceSearchStatus(StrEnum):
+    """单个字幕源一次查询的最小运行结果六态。"""
 
     SUCCESS = "success"
     PARTIAL = "partial"
@@ -75,131 +62,147 @@ class CandidatePoolStatus(StrEnum):
     UNCONFIGURED = "unconfigured"
 
 
-class CacheTraceState(StrEnum):
-    """来源查询缓存读取状态。"""
+class SourceErrorCode(StrEnum):
+    """来源查询与下载可归类的安全错误码。"""
 
-    HIT = "hit"
-    MISS = "miss"
-    INVALID = "invalid"
+    INVALID_CREDENTIALS = "invalid_credentials"
+    INVALID_REQUEST = "invalid_request"
+    LIMITED = "limited"
+    MALFORMED_RESPONSE = "malformed_response"
+    REQUEST_FAILED = "request_failed"
+    TEMPORARY_UNAVAILABLE = "temporary_unavailable"
 
 
 type SourceDetails = dict[str, JsonValue]
+type SourcePlanKind = Literal["id", "title", "filename", "fallback"]
 
 
 @dataclass(frozen=True, slots=True)
-class OpaqueCandidateHandle:
-    """来源自有下载句柄的安全、不透明标识。"""
+class MoviePilotDownloadHandle:
+    """MoviePilot 下载所需的受审计站点定位。"""
 
-    token: str
+    site_id: int
+    enclosure: str
 
     def __post_init__(self) -> None:
-        """拒绝空句柄，避免跨能力契约携带无效状态。"""
+        """拒绝无法重新取得资源的站点定位。"""
 
-        if not self.token:
-            raise ValueError("候选句柄不能为空")
+        if self.site_id <= 0 or not self.enclosure:
+            raise ValueError("MoviePilot 下载句柄无效")
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
+class OpenSubtitlesDownloadHandle:
+    """OpenSubtitles 下载所需的文件 ID。"""
+
+    file_id: int
+
+    def __post_init__(self) -> None:
+        """拒绝无效的文件 ID。"""
+
+        if self.file_id <= 0:
+            raise ValueError("OpenSubtitles 下载句柄无效")
+
+
+@dataclass(frozen=True, slots=True)
+class AssrtDownloadHandle:
+    """ASSRT 下载所需的字幕 ID。"""
+
+    subtitle_id: int
+
+    def __post_init__(self) -> None:
+        """拒绝无效的字幕 ID。"""
+
+        if self.subtitle_id <= 0:
+            raise ValueError("ASSRT 下载句柄无效")
+
+
+type SourceDownloadHandle = MoviePilotDownloadHandle | OpenSubtitlesDownloadHandle | AssrtDownloadHandle
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateHandle:
-    """来源交给任务的安全候选与内存下载句柄。"""
+    """来源交给任务的安全候选与强类型下载句柄。"""
 
     candidate: SubtitleCandidate
-    opaque: OpaqueCandidateHandle
+    download_handle: SourceDownloadHandle
+
+    def __post_init__(self) -> None:
+        """验证候选来源与白名单下载句柄一致。"""
+
+        if not self._matches_source(self.candidate, self.download_handle):
+            raise ValueError("候选与下载句柄来源不一致")
+
+    @staticmethod
+    def _matches_source(candidate: SubtitleCandidate, handle: SourceDownloadHandle) -> bool:
+        """验证候选来源与其白名单句柄类型相符。"""
+
+        return (
+            (candidate.source is SubtitleSource.MOVIEPILOT and isinstance(handle, MoviePilotDownloadHandle))
+            or (candidate.source is SubtitleSource.OPENSUBTITLES and isinstance(handle, OpenSubtitlesDownloadHandle))
+            or (candidate.source is SubtitleSource.ASSRT and isinstance(handle, AssrtDownloadHandle))
+        )
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DownloadedAsset:
     """字幕源下载到临时目录后的文件。"""
 
     path: Path
     file_name: str
 
+    def __init__(self, path: Path, file_name: str) -> None:
+        """创建并校验下载资产。"""
+
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "file_name", file_name)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        """保证下载结果名称与实际临时文件一致。"""
+
+        if self.file_name != self.path.name:
+            raise ValueError("下载结果文件名必须等于实际路径名称")
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePlanEntry:
+    """来源默认查询计划的展示条目：计划展示的唯一真源。"""
+
+    kind: SourcePlanKind
+    label: str
+    query: str | None = None
+    editable: bool = False
+
 
 @dataclass(slots=True)
-class CacheTrace:
-    """一次来源查询的缓存执行轨迹。"""
-
-    query: str
-    state: CacheTraceState
-    hit: bool = False
-    stored: bool = False
-    stored_at: str | None = None
-    ttl_seconds: int = 0
-
-
-@dataclass(slots=True)
-class PaginationTrace:
-    """一次来源查询的分页执行轨迹。"""
-
-    query: str
-    pages_fetched: int = 0
-    complete: bool = True
-    failed_page: int | None = None
-    cached: bool = False
-
-
-@dataclass(slots=True)
-class SourceCandidatePoolResult:
-    """单个字幕源的安全候选池运行结果。"""
+class SourceSearchResult:
+    """单个字幕来源一次查询的最小安全结果。"""
 
     source: SubtitleSource
-    status: CandidatePoolStatus
+    status: SourceSearchStatus
     candidates: list[CandidateHandle] = field(default_factory=list)
-    raw_count: int = 0
-    candidate_pool_count: int = 0
-    download_locator_excluded_count: int = 0
-    default_queries: list[str] = field(default_factory=list)
-    executed_queries: list[str] = field(default_factory=list)
     matched_query: str | None = None
-    cache_trace: list[CacheTrace] = field(default_factory=list)
-    pagination_trace: list[PaginationTrace] = field(default_factory=list)
+    default_queries: list[SourcePlanEntry] = field(default_factory=list)
+    cache_hit: bool = False
     duration_ms: int = 0
     error_summary: str | None = None
+    error_code: SourceErrorCode | None = None
+    retry_after_seconds: int | None = None
     skip_reason: str | None = None
 
-    @property
-    def details(self) -> SourceDetails:
-        """返回不包含下载定位的安全运行摘要。"""
+    def __post_init__(self) -> None:
+        """把边界处的来源状态收敛为六态枚举。"""
 
-        return {
-            "default_queries": list(self.default_queries),
-            "executed_queries": list(self.executed_queries),
-            "matched_query": self.matched_query,
-            "raw_count": self.raw_count,
-            "candidate_pool_count": self.candidate_pool_count,
-            "download_locator_excluded_count": self.download_locator_excluded_count,
-            "cache": [
-                {
-                    "query": item.query,
-                    "state": item.state.value,
-                    "hit": item.hit,
-                    "stored": item.stored,
-                    "stored_at": item.stored_at,
-                    "ttl_seconds": item.ttl_seconds,
-                }
-                for item in self.cache_trace
-            ],
-            "pagination": [
-                {
-                    "query": item.query,
-                    "pages_fetched": item.pages_fetched,
-                    "complete": item.complete,
-                    "failed_page": item.failed_page,
-                    "cached": item.cached,
-                }
-                for item in self.pagination_trace
-            ],
-            "duration_ms": self.duration_ms,
-            "error_summary": self.error_summary,
-            "skip_reason": self.skip_reason,
-        }
+        if not isinstance(self.status, SourceSearchStatus):
+            self.status = SourceSearchStatus(self.status)
 
 
 @dataclass(slots=True)
-class CandidatePoolQueryBatchResult:
-    """批量候选池查询返回的逐来源结果。"""
+class SourceSearchBatch:
+    """全部来源一次查询返回的逐来源结果。"""
 
-    sources: dict[SubtitleSource, SourceCandidatePoolResult]
+    sources: dict[SubtitleSource, SourceSearchResult]
 
 
 class SourceStatus(StrictModel):
@@ -214,20 +217,4 @@ class SourceStatus(StrictModel):
     last_error_at: datetime | None = None
     last_error_summary: str | None = None
     last_duration_ms: int | None = None
-    details: SourceDetails = Field(default_factory=dict)
-
-
-class SourceRun(StrictModel):
-    """单个字幕源在任务中的安全执行摘要。"""
-
-    source: SubtitleSource
-    status: SourceRunStatus
-    candidate_count: int = 0
-    raw_count: int = 0
-    admitted_count: int = 0
-    media_matched_count: int = 0
-    rejected_count: int = 0
-    rejection_summary: dict[str, int] = Field(default_factory=dict)
-    duration_ms: int | None = None
-    error_summary: str | None = None
     details: SourceDetails = Field(default_factory=dict)

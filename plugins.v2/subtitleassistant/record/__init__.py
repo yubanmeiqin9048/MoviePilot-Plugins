@@ -7,12 +7,13 @@ from typing import Protocol
 
 from app.log import logger
 
-from ..schemas.event import SubtitleWrittenEvent, SubtitleWrittenOperation
+from ..schemas.event import SubtitleWrittenEvent
 from ..schemas.record import (
     BatchDeleteRecordConfirmation,
     BatchDeleteResult,
     BatchRetargetPreview,
     BatchRetargetResult,
+    CommittedFileFact,
     DeleteMode,
     DeleteRecordConfirmation,
     DeleteRecordResult,
@@ -25,6 +26,13 @@ from ..schemas.record import (
 from ..schemas.target import PathMappingSnapshot, SubtitleTarget
 from ..target import TargetCatalog
 from .lock import ReentrantAsyncLock
+
+
+class SubtitleEventPublisher(Protocol):
+    """记录维护能力使用的字幕落盘事件端口。"""
+
+    async def publish(self, event: SubtitleWrittenEvent) -> None:
+        """尽力广播一条已提交的字幕落盘事实。"""
 
 
 class RecordStorePort(Protocol):
@@ -86,13 +94,6 @@ class RecordFilePort(Protocol):
         """排他复制字幕文件。"""
 
 
-class SubtitleEventPublisher(Protocol):
-    """记录提交完成后使用的事件发布端口。"""
-
-    async def publish(self, event: SubtitleWrittenEvent) -> None:
-        """尽力广播已提交的落盘事实。"""
-
-
 class _RecordDeletion(Protocol):
     """记录查询 facade 代理的内部删除操作。"""
 
@@ -137,7 +138,6 @@ class RecordCommitter:
         records: list[MatchRecord],
         format_priority: list[str],
         source_priority: list[str],
-        publisher: SubtitleEventPublisher | None = None,
     ) -> None:
         """创建共享库存与记录提交协调器。"""
 
@@ -146,7 +146,6 @@ class RecordCommitter:
         self._store = store
         self._mutation_lock = ReentrantAsyncLock()
         self._filesystem = filesystem
-        self._publisher = publisher
         self._inventory = SubtitleInventory(
             store=store,
             filesystem=filesystem,
@@ -171,9 +170,8 @@ class RecordCommitter:
         record: MatchRecord,
         source: Path,
         target: Path,
-        operation: SubtitleWrittenOperation,
-    ) -> MatchRecord:
-        """提交媒体字幕、匹配记录与已落盘事件，并在保存失败时回滚文件。"""
+    ) -> CommittedFileFact:
+        """提交媒体字幕与匹配记录，并返回逐文件已提交事实。"""
 
         destination: Path | None = None
         try:
@@ -190,8 +188,7 @@ class RecordCommitter:
                         f"媒体目录字幕写入后记录提交失败，补偿删除失败；异常类型为 {type(rollback_exc).__name__}"
                     )
             raise
-        await self._publish_subtitle_written(record, operation)
-        return record
+        return CommittedFileFact(record=record, target_path=Path(target), subtitle_path=destination)
 
     async def commit_plugin(self, record: MatchRecord, source: Path) -> MatchRecord:
         """提交插件数据字幕与匹配记录，并在失败时清理残留。"""
@@ -231,8 +228,6 @@ class RecordCommitter:
             matched_path_mapping=matched_path_mapping,
             target_file_exists=target_file_exists,
         )
-        for record in result.records:
-            await self._publish_subtitle_written(record, SubtitleWrittenOperation.INVENTORY_CONSUMPTION)
         return result
 
     def catalog(self) -> RecordCatalog:
@@ -269,29 +264,6 @@ class RecordCommitter:
                 publisher=publisher,
             )
         )
-
-    async def _publish_subtitle_written(
-        self,
-        record: MatchRecord,
-        operation: SubtitleWrittenOperation,
-    ) -> None:
-        """尽力发布已完整提交的媒体目录字幕事件。"""
-
-        if self._publisher is None:
-            return
-        try:
-            await self._publisher.publish(
-                SubtitleWrittenEvent(
-                    plugin_id="SubtitleAssistant",
-                    operation=operation,
-                    task_id=record.source_task_id,
-                    record_id=record.id,
-                    target_path=record.target_path or record.path,
-                    subtitle_path=record.final_subtitle_path or record.path,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - 事件失败不能反转已提交结果
-            logger.error(f"字幕落盘事件发布失败，已保留成功业务结果；异常类型为 {type(exc).__name__}")
 
 
 class RecordCatalog:

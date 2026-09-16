@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
 from app.chain.search import SearchChain
 from app.core.config import settings
 from app.db.site_oper import SiteOper
@@ -19,17 +21,23 @@ from app.log import logger
 from app.schemas.types import SystemConfigKey
 from app.utils.http import AsyncRequestUtils
 
-from ..schemas.base import elapsed_ms, utc_now
 from ..schemas.candidate import SubtitleCandidate, TranslationType
 from ..schemas.source import (
     CandidateHandle,
     DownloadedAsset,
-    OpaqueCandidateHandle,
+    MoviePilotDownloadHandle,
     SourceHealth,
-    SourceStatus,
     SubtitleSource,
 )
 from ..schemas.target import SubtitleTarget
+from .base import (
+    SourceCachePort,
+    SourcePage,
+    SourcePlan,
+    SourcePlanQuery,
+    SourceProbe,
+    SubtitleSourceBase,
+)
 from .common import (
     SourceRequestError,
     _proxy_kwargs,
@@ -38,11 +46,42 @@ from .common import (
     safe_file_name,
     subtitle_format,
 )
-from .pool import (
-    CandidatePage,
-    SourceQuery,
-    SourceQueryPlan,
-)
+
+
+class _MoviePilotRawPage(BaseModel):
+    """MoviePilot adapter 私有的宿主原始搜索结果 envelope。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, arbitrary_types_allowed=True)
+
+    items: list[object] = Field(default_factory=list)
+
+
+class _MoviePilotRawItem(BaseModel):
+    """MoviePilot 宿主候选的私有属性边界模型。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True, from_attributes=True)
+
+    site: int | str | None = None
+    enclosure: str | None = None
+    subtitle_id: int | str | None = None
+    torrent_id: int | str | None = None
+    title: str | None = None
+    file_name: str | None = None
+    description: str | None = None
+    language: str | None = None
+    site_order: int | str | None = None
+    grabs: int | str | None = None
+    pubdate: str | None = None
+    site_name: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_host_candidate_shape(cls, value: object) -> object:
+        """拒绝既非宿主候选也非测试替身的畸形条目。"""
+
+        if isinstance(value, dict) or hasattr(value, "site") or hasattr(value, "title"):
+            return value
+        raise ValueError("MoviePilot 候选缺少宿主字段")
 
 
 def _create_keyword_extractor() -> Any | None:
@@ -55,35 +94,16 @@ def _create_keyword_extractor() -> Any | None:
     return yake.KeywordExtractor(lan="en", n=1, top=12)
 
 
-def _opaque_payload(handle: CandidateHandle) -> dict[str, Any] | None:
-    """解码 MoviePilot 来源的内部下载句柄。"""
-
-    if not isinstance(handle.opaque, OpaqueCandidateHandle):
-        return None
-    try:
-        payload = json.loads(handle.opaque.token)
-    except (TypeError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-class MoviePilotSource:
+class MoviePilotSource(SubtitleSourceBase):
     """只调用宿主标题搜索接口并在下载前重新读取站点配置。"""
 
     source = SubtitleSource.MOVIEPILOT
+    CACHE_TTL_SECONDS = 10 * 60
 
-    def __init__(
-        self,
-        enabled: bool,
-        allowed_formats: set[str],
-    ) -> None:
+    def __init__(self, enabled: bool, cache: SourceCachePort | None = None) -> None:
         """创建 MoviePilot 站点来源适配器。"""
 
-        self.enabled = enabled
-        self._allowed_formats = {item.upper().lstrip(".") for item in allowed_formats}
-        self._last_details: dict[str, Any] = {}
-        self._site_ids: tuple[int, ...] | None = None
-        self._configuration_generation = 0
+        super().__init__(enabled=enabled, cache=cache)
 
     @property
     def configured(self) -> bool:
@@ -107,7 +127,7 @@ class MoviePilotSource:
             return None
 
     @staticmethod
-    def _stable_key(item: Any) -> str:
+    def _candidate_key(item: Any) -> str:
         """构造不包含原始下载链接的稳定来源键。"""
 
         site = MoviePilotSource._field(item, "site")
@@ -121,7 +141,6 @@ class MoviePilotSource:
             "site": site,
             "title": MoviePilotSource._field(item, "title", ""),
             "file_name": MoviePilotSource._field(item, "file_name", ""),
-            "enclosure": MoviePilotSource._field(item, "enclosure", ""),
         }
         digest = hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")).hexdigest()
         return f"moviepilot:sha256:{digest}"
@@ -143,7 +162,7 @@ class MoviePilotSource:
         elif "ai翻译" in marker or "ai translated" in marker:
             translation = TranslationType.AI
         candidate = SubtitleCandidate(
-            stable_key=self._stable_key(item),
+            candidate_key=self._candidate_key(item),
             source=self.source,
             name=title,
             file_name=str(file_name or "") or None,
@@ -164,18 +183,7 @@ class MoviePilotSource:
         )
         return CandidateHandle(
             candidate=candidate,
-            opaque=OpaqueCandidateHandle(
-                token=json.dumps(
-                    {
-                        "site_id": candidate.site_id,
-                        "enclosure": enclosure,
-                        "file_name": str(file_name or ""),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            ),
+            download_handle=MoviePilotDownloadHandle(site_id=site_id, enclosure=enclosure),
         )
 
     @staticmethod
@@ -205,13 +213,6 @@ class MoviePilotSource:
                 break
         return queries, None if queries else "keyword_extraction_empty"
 
-    def _remember_site_ids(self, site_ids: tuple[int, ...]) -> None:
-        """记录宿主有效站点集合并在集合变化时推进配置代次。"""
-
-        if self._site_ids is not None and site_ids != self._site_ids:
-            self._configuration_generation += 1
-        self._site_ids = site_ids
-
     async def _subtitle_site_indexers(self) -> list[dict[str, Any]]:
         """返回当前启用且声明支持字幕搜索的宿主索引站点。"""
 
@@ -222,8 +223,6 @@ class MoviePilotSource:
                 continue
             if not enabled_sites or indexer.get("id") in enabled_sites:
                 result.append(indexer)
-        site_ids = tuple(sorted(int(indexer["id"]) for indexer in result if indexer.get("id") is not None))
-        self._remember_site_ids(site_ids)
         return result
 
     def _sync_subtitle_site_ids(self) -> tuple[int, ...]:
@@ -246,108 +245,88 @@ class MoviePilotSource:
             return ()
         return tuple(sorted(site_ids))
 
-    @property
-    def configuration_generation(self) -> int:
-        """返回当前宿主字幕站点配置代次。"""
-
-        return self._configuration_generation
-
-    def query_plan(
-        self,
-        context: SubtitleTarget,
-        custom_query: str | None,
-    ) -> SourceQueryPlan:
+    def _plan(self, context: SubtitleTarget, custom_query: str | None) -> SourcePlan:
         """根据媒体上下文生成 MoviePilot 默认或自定义查询计划。"""
 
         site_ids = self._sync_subtitle_site_ids()
-        self._remember_site_ids(site_ids)
         default_queries, skip_reason = self._default_queries(context)
         custom = (custom_query or "").strip()
         labels = [custom] if custom else default_queries
-        query_type = "custom" if custom else "keyword"
         queries = [
-            SourceQuery(
+            SourcePlanQuery(
                 label=label,
-                query_type=query_type,
-                identity={
-                    "title": label,
-                    "query_type": query_type,
-                },
+                identity={"title": label},
+                max_pages=1,
+                kind="filename" if custom else "title",
+                query=label,
             )
             for label in labels
         ]
-        return SourceQueryPlan(
+        return SourcePlan(
             queries=queries,
-            default_queries=default_queries,
             configured=bool(site_ids),
             skip_reason=skip_reason,
         )
 
-    async def fetch_page(self, query: SourceQuery, page_number: int) -> CandidatePage:
+    async def _fetch_page(self, query: SourcePlanQuery, page: int) -> SourcePage:
         """执行一次 MoviePilot 原生标题查询并归一化为安全候选页。"""
 
         indexers = await self._subtitle_site_indexers()
         site_ids = sorted(int(indexer["id"]) for indexer in indexers if indexer.get("id") is not None)
         if not site_ids:
-            return CandidatePage()
+            return SourcePage()
         logger.info(f"开始查询 MoviePilot 站点字幕源，查询词为“{query.label}”")
         items = await SearchChain().async_search_subtitles_by_title(
             title=query.label,
-            page=max(0, page_number - 1),
+            page=max(0, page - 1),
             sites=site_ids,
             cache_local=False,
         )
-        page = self._normalize_page(list(items or []), query.label)
-        logger.info(
-            f"MoviePilot 站点字幕源查询“{query.label}”完成，共返回 {page.raw_count} 个结果，"
-            f"其中 {len(page.candidates)} 个具备下载定位"
-        )
-        return page
-
-    def is_valid_download_locator(self, handle: CandidateHandle) -> bool:
-        """判断候选句柄是否保留可供服务端下载的站点和定位。"""
-
-        if handle.candidate.source is not self.source:
-            return False
-        payload = _opaque_payload(handle)
-        if payload is None:
-            return False
-        site_id = payload.get("site_id")
-        enclosure = payload.get("enclosure")
         try:
-            valid_site = int(site_id) > 0 if isinstance(site_id, (str, int, float)) else False
-        except (TypeError, ValueError):
-            valid_site = False
-        return valid_site and isinstance(enclosure, str) and bool(enclosure)
+            raw_page = _MoviePilotRawPage.model_validate({"items": list(items or [])})
+        except ValidationError as exc:
+            raise SourceRequestError("MoviePilot 响应结构无效") from exc
+        page_result = self._normalize_page(raw_page.items, query.label)
+        logger.info(
+            f"MoviePilot 站点字幕源查询“{query.label}”完成，共返回 {page_result.raw_count} 个结果，"
+            f"其中 {len(page_result.candidates)} 个具备下载定位"
+        )
+        return page_result
 
-    def _normalize_page(self, items: list[Any], query: str) -> CandidatePage:
+    def _normalize_page(self, items: list[object], query: str) -> SourcePage:
         """把一页宿主结果转换为共享候选池可接受的安全结果。"""
 
         handles: list[CandidateHandle] = []
+        raw_count = 0
         excluded = 0
-        for item in items:
+        malformed_count = 0
+        for value in items:
+            try:
+                item = _MoviePilotRawItem.model_validate(value, from_attributes=True)
+            except ValidationError:
+                malformed_count += 1
+                continue
             handle = self._normalize_pool(item, query)
             if handle is None:
                 excluded += 1
             else:
                 handles.append(handle)
-        return CandidatePage(
+                raw_count += 1
+        return SourcePage(
             candidates=handles,
-            raw_count=len(items),
-            download_locator_excluded=excluded,
+            raw_count=raw_count,
+            download_locator_excluded_count=excluded,
+            malformed_count=malformed_count,
         )
 
     async def download(self, handle: CandidateHandle, directory: Path) -> DownloadedAsset:
         """按站点 ID 重新水合凭据后下载候选字幕。"""
 
-        payload = _opaque_payload(handle)
-        if payload is None:
+        if not isinstance(handle.download_handle, MoviePilotDownloadHandle):
             raise SourceRequestError("MoviePilot 候选缺少有效下载句柄")
-        site_id = payload.get("site_id")
-        enclosure = payload.get("enclosure")
-        if site_id is None or not isinstance(enclosure, str) or not enclosure:
-            raise SourceRequestError("MoviePilot 候选缺少站点或下载定位")
-        site = await SiteOper().async_get(int(site_id))
+        site_id = handle.download_handle.site_id
+        enclosure = handle.download_handle.enclosure
+        site = await SiteOper().async_get(site_id)
         if not site or not bool(getattr(site, "is_active", False)):
             raise SourceRequestError("MoviePilot 字幕站点不存在或已停用")
         request_options: dict[str, Any] = {
@@ -359,7 +338,7 @@ class MoviePilotSource:
         request = AsyncRequestUtils(**request_options)
         fallback_name = safe_file_name(
             handle.candidate.file_name,
-            f"moviepilot-{handle.candidate.stable_key.rsplit(':', 1)[-1]}.bin",
+            f"moviepilot-{handle.candidate.candidate_key.rsplit(':', 1)[-1]}.bin",
         )
         path = await download_file(
             request,
@@ -370,51 +349,25 @@ class MoviePilotSource:
         )
         return DownloadedAsset(path=path, file_name=path.name)
 
-    async def refresh(self, manual: bool = False) -> SourceStatus:
+    async def _probe(self, manual: bool) -> SourceProbe | None:
         """重新读取宿主当前有效站点列表，不发起测试搜索。"""
 
         del manual
-        status = SourceStatus(source=self.source, enabled=self.enabled, configured=True)
-        if not self.enabled:
-            status.health = SourceHealth.DISABLED
-            return status
-        started = utc_now()
-        status.last_checked_at = started
-        try:
-            indexers = await self._subtitle_site_indexers()
-            site_names = [
-                str(indexer.get("name") or indexer.get("domain") or indexer.get("id")) for indexer in indexers
-            ]
-            self._last_details = {
-                "site_names": site_names,
-                "site_count": len(site_names),
-                **{
-                    key: value
-                    for key, value in self._last_details.items()
-                    if key in {"site_candidate_counts", "candidate_total", "last_search_at"}
-                },
-            }
-            status.details = self._last_details
-            if site_names:
-                status.health = SourceHealth.HEALTHY
-                status.last_success_at = utc_now()
-            else:
-                status.configured = False
-                status.health = SourceHealth.DISABLED
-                status.last_error_summary = "没有启用且支持字幕搜索的站点"
-        except Exception:  # noqa: BLE001 - 外部字幕源异常必须收敛为安全状态
-            status.health = SourceHealth.ERROR
-            status.last_error_at = utc_now()
-            status.last_error_summary = "MoviePilot 站点状态读取失败"
-        status.last_duration_ms = elapsed_ms(started)
-        return status
-
-    async def close(self) -> None:
-        """释放 MoviePilot 来源运行态。"""
-
-        return
-
-    def runtime_details(self) -> dict[str, Any]:
-        """返回不含站点凭据和下载链接的运行观测。"""
-
-        return dict(self._last_details)
+        indexers = await self._subtitle_site_indexers()
+        site_names = [str(indexer.get("name") or indexer.get("domain") or indexer.get("id")) for indexer in indexers]
+        self._last_details = {
+            "site_names": site_names,
+            "site_count": len(site_names),
+            **{
+                key: value
+                for key, value in self._last_details.items()
+                if key in {"site_candidate_counts", "candidate_total", "last_search_at"}
+            },
+        }
+        if site_names:
+            return None
+        return SourceProbe(
+            health=SourceHealth.DISABLED,
+            configured=False,
+            error_summary="没有启用且支持字幕搜索的站点",
+        )

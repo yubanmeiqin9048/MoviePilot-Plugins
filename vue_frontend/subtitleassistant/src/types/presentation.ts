@@ -1,6 +1,4 @@
 import type {
-  AttemptResult,
-  AttributionEvidence,
   FileLocation,
   FileAttributionMethod,
   HistoryRow,
@@ -11,9 +9,7 @@ import type {
   RecordStatus,
   SearchPlanItem,
   SourceHealth,
-  SourceRunStatus,
   SubtitleSource,
-  TaskStage,
   TaskStatus,
   TaskTrigger,
   TargetItem,
@@ -57,17 +53,6 @@ export const sourceHealthStates: Record<SourceHealth, StatePresentation> = {
   disabled: { label: '已禁用', icon: 'mdi-minus-circle-outline', color: 'default' },
 }
 
-export const stageLabels: Record<TaskStage, string> = {
-  preflight: '前置检查',
-  inventory: '查询字幕库存',
-  search: '搜索字幕源',
-  download: '下载候选',
-  extract: '解包',
-  match: '匹配',
-  ai_attribution: 'AI 智能接管',
-  write: '落盘',
-}
-
 export const sourceLabels: Record<SubtitleSource, string> = {
   moviepilot: 'MoviePilot 站点源',
   opensubtitles: 'OpenSubtitles',
@@ -95,15 +80,6 @@ export const fileAttributionLabels: Record<FileAttributionMethod, string> = {
   direct_file: '直接字幕文件',
   trust_package: '信任候选包',
   host_recognition: 'MoviePilot 文件识别',
-  ai_takeover: 'AI 智能接管',
-}
-
-export const attributionEvidenceLabels: Record<AttributionEvidence, string> = {
-  path: '文件路径识别',
-  candidate_snapshot: '候选唯一范围继承',
-  ai_takeover: 'AI 智能接管',
-  not_applicable: '不适用',
-  unknown: '无法确定',
 }
 
 export const unmatchedReasonLabels: Record<UnmatchedReason, string> = {
@@ -132,32 +108,14 @@ export const locationLabels: Record<FileLocation, string> = {
   plugin_data: '插件数据目录',
 }
 
-export const sourceRunLabels: Record<SourceRunStatus, string> = {
-  success: '已返回候选',
-  empty: '未返回候选',
-  filtered: '没有适用候选',
-  error: '请求异常',
-  limited: '请求受限',
-  disabled: '未启用',
-  unconfigured: '未配置',
-}
-
 export function manualSourceState(status: ManualSourceResult, candidateCount: number): StatePresentation {
   if (status === 'success' && candidateCount > 0) return { label: '已返回', icon: 'mdi-check-circle-outline', color: 'success' }
   if (status === 'success') return { label: '无结果', icon: 'mdi-file-search-outline', color: 'default' }
+  if (status === 'partial') return { label: '部分完成', icon: 'mdi-alert-circle-outline', color: 'warning' }
   if (status === 'limited') return { label: '受限', icon: 'mdi-timer-alert-outline', color: 'warning' }
   if (status === 'disabled') return { label: '已禁用', icon: 'mdi-minus-circle-outline', color: 'default' }
   if (status === 'unconfigured') return { label: '未配置', icon: 'mdi-cog-off-outline', color: 'default' }
   return { label: '异常', icon: 'mdi-alert-circle-outline', color: 'error' }
-}
-
-export const attemptLabels: Record<AttemptResult, string> = {
-  success: '落盘成功',
-  download_failed: '下载失败',
-  extract_failed: '解包失败',
-  no_match: '包内无匹配',
-  write_failed: '落盘失败',
-  interrupted: '已中断',
 }
 
 export function isTerminalTask(status: TaskStatus): boolean {
@@ -302,6 +260,44 @@ export function fullPath(path?: string | null): string {
   return path || '未记录'
 }
 
+/** 路径的父目录；已在根一级或没有分隔符时返回空串。 */
+export function parentDirectory(path?: string | null): string {
+  if (!path) return ''
+  const index = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return index <= 0 ? '' : path.slice(0, index)
+}
+
+/**
+ * 一组文件路径的最长公共目录；少于两条、或任一条没有父目录时返回空串。
+ * 按目录边界逐段回退，避免 /media/电影 命中 /media/电影2。
+ */
+export function commonDirectory(paths: Array<string | null | undefined>): string {
+  const directories = paths
+    .filter((path): path is string => Boolean(path))
+    .map(parentDirectory)
+  if (directories.length < 2 || directories.some(directory => !directory)) return ''
+  let prefix = directories[0]
+  for (const directory of directories.slice(1)) {
+    while (prefix && !insideDirectory(directory, prefix)) prefix = parentDirectory(prefix)
+    if (!prefix) return ''
+  }
+  return prefix
+}
+
+/** 去掉公共目录前缀后的剩余部分；等于该目录时返回空串，不在其下时返回原路径。 */
+export function relativeToDirectory(path?: string | null, directory?: string | null): string {
+  if (!path) return ''
+  if (!directory || !insideDirectory(path, directory)) return path
+  return path.slice(directory.length + 1)
+}
+
+function insideDirectory(path: string, directory: string): boolean {
+  if (path === directory) return true
+  if (!path.startsWith(directory)) return false
+  const separator = path.charAt(directory.length)
+  return separator === '/' || separator === '\\'
+}
+
 export function displayValue(value: unknown): string {
   if (value === null || value === undefined || value === '') return '未记录'
   if (typeof value === 'boolean') return value ? '是' : '否'
@@ -340,12 +336,7 @@ export function friendlyKey(key: string): string {
     media_or_episode_mismatch: '媒体或季集不匹配',
     foreign_parts_only: '仅外语对白',
     machine_translation: '机器或 AI 翻译',
-    cache_hit: '是否复用缓存',
-    cache_stored_at: '缓存生成时间',
     cache_ttl_seconds: '缓存有效秒数',
-    page_count: '读取页数',
-    pagination_complete: '分页是否完整',
-    query_type: '查询方式',
     query: '查询词',
     session_active: '会话状态',
     last_search_at: '最近搜索',

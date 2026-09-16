@@ -10,10 +10,8 @@ import DetailRow from '@/components/DetailRow.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import StateChip from '@/components/StateChip.vue'
 import { useDebouncedValue } from '@/composables/useDebouncedValue'
-import type { PluginApi, SourceRun, TaskDetail, TaskListItem, TaskStatus } from '@/types'
+import type { PluginApi, TaskDetail, TaskListItem, TaskStatus } from '@/types'
 import {
-  attemptLabels,
-  attributionStrategyLabels,
   displayValue,
   elapsedDuration,
   formatDate,
@@ -24,11 +22,8 @@ import {
   mediaTypeLabels,
   packageLabels,
   sourceLabels,
-  sourceRunLabels,
-  stageLabels,
   taskStates,
   taskTriggerLabels,
-  translationLabels,
 } from '@/types/presentation'
 
 const props = defineProps<{
@@ -298,7 +293,7 @@ function resultText(item: TaskListItem): string {
     ].filter(Boolean).join(' · ') || '字幕已落盘'
   }
   if (item.status === 'queued') return '等待处理'
-  if (item.status === 'processing') return item.stage ? stageLabels[item.stage] : '正在处理'
+  if (item.status === 'processing') return '正在处理'
   return item.reason_message || item.reason_code || '未记录原因'
 }
 
@@ -310,57 +305,6 @@ function taskTime(item: TaskListItem): string {
 
 function detailEntries(value: Record<string, unknown>): Array<[string, unknown]> {
   return Object.entries(value || {})
-}
-
-type SourceRunMetric = 'raw_count' | 'admitted_count' | 'media_matched_count' | 'rejected_count'
-
-function sourceRunMetric(run: SourceRun, key: SourceRunMetric): number | null {
-  const value = run[key]
-  if (typeof value === 'number') return value
-  const detailValue = run.details?.[key]
-  return typeof detailValue === 'number' ? detailValue : null
-}
-
-function hasSourceRunFunnel(run: SourceRun): boolean {
-  return ['raw_count', 'admitted_count', 'media_matched_count'].some(
-    key => sourceRunMetric(run, key as SourceRunMetric) !== null,
-  )
-}
-
-function isSkippedSourceRun(run: SourceRun): boolean {
-  return run.status === 'disabled' || run.status === 'unconfigured'
-}
-
-function sourceRunFunnel(run: SourceRun): string {
-  const rawCount = sourceRunMetric(run, 'raw_count') ?? 0
-  const admittedCount = sourceRunMetric(run, 'admitted_count') ?? 0
-  const matchedCount = sourceRunMetric(run, 'media_matched_count') ?? 0
-  return `来源返回 ${rawCount} → 自动规则保留 ${admittedCount} → 当前目标匹配 ${matchedCount}`
-}
-
-function sourceRunContext(run: SourceRun): string {
-  if (isSkippedSourceRun(run)) return ''
-  const details = run.details || {}
-  const parts: string[] = []
-  if (details.cache_hit === true) {
-    parts.push(details.cache_stored_at ? `复用 ${formatDate(String(details.cache_stored_at))} 的缓存` : '复用缓存')
-  } else if (details.cache_hit === false) {
-    parts.push('实际查询字幕源')
-  }
-  const pageCount = typeof details.page_count === 'number' ? details.page_count : null
-  if (pageCount && pageCount > 1) parts.push(`读取 ${pageCount} 页`)
-  if (details.pagination_complete === false) parts.push('分页结果不完整')
-  if (typeof details.query === 'string' && details.query) parts.push(`查询“${details.query}”`)
-  return parts.join(' · ')
-}
-
-function sourceRunRejectionSummary(run: SourceRun): string {
-  const summary = run.rejection_summary ?? run.details?.rejection_summary
-  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return ''
-  return Object.entries(summary)
-    .filter((entry): entry is [string, number] => typeof entry[1] === 'number' && entry[1] > 0)
-    .map(([reason, count]) => `${friendlyKey(reason)} ${count}`)
-    .join(' · ')
 }
 </script>
 
@@ -476,7 +420,6 @@ function sourceRunRejectionSummary(run: SourceRun): string {
                 <td><span class="file-name" :title="item.target_file_name">{{ item.target_file_name }}</span></td>
                 <td>
                   <StateChip :state="taskStates[item.status]" />
-                  <div v-if="item.status === 'processing' && item.stage" class="cell-note">{{ stageLabels[item.stage] }}</div>
                 </td>
                 <td><span class="cell-note">{{ taskTriggerLabels[item.trigger] }}</span></td>
                 <td><span class="result-text">{{ resultText(item) }}</span></td>
@@ -519,7 +462,7 @@ function sourceRunRejectionSummary(run: SourceRun): string {
               <VListItemSubtitle class="mobile-subtitle">{{ item.target_file_name }}</VListItemSubtitle>
               <VListItemSubtitle class="mobile-meta">
                 <StateChip :state="taskStates[item.status]" size="x-small" />
-                <span>{{ item.status === 'processing' && item.stage ? stageLabels[item.stage] : formatDate(item.started_at || item.created_at) }}</span>
+                <span>{{ formatDate(item.started_at || item.created_at) }}</span>
               </VListItemSubtitle>
             </button>
             <template #append>
@@ -577,10 +520,6 @@ function sourceRunRejectionSummary(run: SourceRun): string {
                 <DetailRow label="媒体">{{ mediaLabel(detail.media_title, detail.year, detail.season, detail.episode) }}</DetailRow>
                 <DetailRow label="状态"><StateChip :state="taskStates[detail.status]" /></DetailRow>
                 <DetailRow label="触发方式">{{ taskTriggerLabels[detail.trigger] }}</DetailRow>
-                <DetailRow v-if="detail.manual_source" label="人工来源">{{ sourceLabels[detail.manual_source] }}</DetailRow>
-                <DetailRow v-if="detail.actual_search_query" label="实际搜索词">{{ detail.actual_search_query }}</DetailRow>
-                <DetailRow v-if="detail.manual_candidate_key" label="候选键"><CopyValue :value="detail.manual_candidate_key" label="候选键" /></DetailRow>
-                <DetailRow v-if="detail.stage" label="当前阶段">{{ stageLabels[detail.stage] }}</DetailRow>
                 <DetailRow label="终态原因">{{ detail.reason_message || detail.reason_code || '无' }}</DetailRow>
                 <DetailRow label="创建时间">{{ formatDate(detail.created_at) }}</DetailRow>
                 <DetailRow label="开始时间">{{ formatDate(detail.started_at) }}</DetailRow>
@@ -612,114 +551,24 @@ function sourceRunRejectionSummary(run: SourceRun): string {
           </VExpansionPanel>
 
           <VExpansionPanel>
-            <VExpansionPanelTitle>处理轨迹</VExpansionPanelTitle>
-            <VExpansionPanelText>
-              <div class="subsection">
-                <h4>已有字幕检查</h4>
-                <dl v-if="detailEntries(detail.existing_subtitle_check).length">
-                  <DetailRow v-for="[key, value] in detailEntries(detail.existing_subtitle_check)" :key="key" :label="friendlyKey(key)">{{ displayValue(value) }}</DetailRow>
-                </dl>
-                <p v-else class="muted">未记录检查摘要</p>
-              </div>
-              <div class="subsection">
-                <h4>字幕库存</h4>
-                <dl v-if="detailEntries(detail.inventory_result).length">
-                  <DetailRow v-for="[key, value] in detailEntries(detail.inventory_result)" :key="key" :label="friendlyKey(key)">{{ displayValue(value) }}</DetailRow>
-                </dl>
-                <p v-else class="muted">未记录库存摘要</p>
-              </div>
-              <VTimeline v-if="detail.stage_traces.length" density="compact" side="end" class="task-timeline">
-                <VTimelineItem v-for="trace in detail.stage_traces" :key="`${trace.stage}-${trace.started_at}`" dot-color="primary" size="x-small">
-                  <strong>{{ stageLabels[trace.stage] }}</strong>
-                  <div class="muted">{{ trace.summary || '阶段已完成' }}</div>
-                  <div class="muted">{{ formatDate(trace.started_at) }} · {{ formatDuration(trace.duration_ms) }}</div>
-                </VTimelineItem>
-              </VTimeline>
-            </VExpansionPanelText>
-          </VExpansionPanel>
-
-          <VExpansionPanel>
-            <VExpansionPanelTitle>字幕源与候选</VExpansionPanelTitle>
-            <VExpansionPanelText>
-              <dl class="candidate-policy">
-                <DetailRow label="包内归属策略">
-                  {{ detail.package_attribution_strategy
-                    ? attributionStrategyLabels[detail.package_attribution_strategy]
-                    : '未记录' }}
-                </DetailRow>
-                <DetailRow v-if="detail.candidate_attribution_snapshot" label="候选归属快照">
-                  {{ displayValue(detail.candidate_attribution_snapshot) }}
-                </DetailRow>
-              </dl>
-              <VList v-if="detail.source_runs.length" density="compact" class="audit-list">
-                <VListItem v-for="run in detail.source_runs" :key="run.source" :title="sourceLabels[run.source]">
-                  <template #subtitle>
-                    <span class="source-run-summary">
-                      <span>{{ sourceRunLabels[run.status] }}</span>
-                      <span v-if="!isSkippedSourceRun(run) && hasSourceRunFunnel(run)">{{ sourceRunFunnel(run) }}</span>
-                      <span v-else-if="!isSkippedSourceRun(run)">{{ run.candidate_count ?? 0 }} 个候选</span>
-                      <span v-if="run.duration_ms !== null">{{ formatDuration(run.duration_ms) }}</span>
-                    </span>
-                    <span v-if="sourceRunContext(run)" class="source-run-context">
-                      {{ sourceRunContext(run) }}
-                    </span>
-                    <span v-if="sourceRunRejectionSummary(run)" class="source-run-rejections">
-                      自动排除：{{ sourceRunRejectionSummary(run) }}
-                    </span>
-                    <span v-if="run.error_summary" class="error-text">{{ run.error_summary }}</span>
-                  </template>
-                </VListItem>
-              </VList>
-              <p v-else class="muted">没有字幕源运行记录</p>
-
-              <VAlert v-if="detail.trigger === 'manual_candidate'" type="info" variant="tonal" density="compact" class="mt-3">
-                这是人工字幕搜索选定候选后的下载任务；库存查询与自动准入筛选不会在此任务中重复执行。
-              </VAlert>
-              <dl v-if="detail.trigger === 'manual_candidate' && detailEntries(detail.manual_candidate_summary).length" class="manual-summary">
-                <DetailRow v-for="[key, value] in detailEntries(detail.manual_candidate_summary)" :key="key" :label="friendlyKey(key)">{{ displayValue(value) }}</DetailRow>
-              </dl>
-
-              <div v-if="detail.candidate_attempts.length" class="candidate-list">
-                <div v-for="attempt in detail.candidate_attempts" :key="attempt.candidate_key" class="candidate-item">
-                  <div class="candidate-item__heading">
-                    <strong>{{ sourceLabels[attempt.source] }}</strong>
-                    <span>{{ attemptLabels[attempt.result] }}</span>
-                  </div>
-                  <div class="muted">{{ [packageLabels[attempt.package_scope], attempt.format && attempt.format !== 'UNKNOWN' ? attempt.format : '', attempt.language, translationLabels[attempt.translation_type], attempt.hearing_impaired ? 'SDH/CC' : ''].filter(Boolean).join(' · ') }}</div>
-                  <div v-if="attempt.attribution_strategy" class="muted">归属策略：{{ attributionStrategyLabels[attempt.attribution_strategy] }}</div>
-                  <div v-if="attempt.candidate_snapshot" class="muted">候选快照：{{ displayValue(attempt.candidate_snapshot) }}</div>
-                  <div v-if="attempt.extracted_count != null" class="candidate-funnel">
-                    解包 {{ attempt.extracted_count }}
-                    → 当前目标 {{ attempt.current_target_count ?? 0 }}
-                    → 其他季集 {{ attempt.same_media_other_episode_count ?? 0 }}
-                    / 归属不明确 {{ attempt.ambiguous_count ?? 0 }}
-                    / 其他媒体 {{ attempt.other_media_count ?? 0 }}
-                    → 落盘 {{ attempt.written_count ?? 0 }}
-                    / 暂存 {{ attempt.staged_count ?? 0 }}
-                    / 未匹配 {{ attempt.unmatched_count ?? 0 }}
-                  </div>
-                  <div v-if="(attempt.ai_attempt_count ?? 0) || (attempt.ai_accepted_count ?? 0) || (attempt.ai_rejected_count ?? 0) || (attempt.ai_error_count ?? 0) || (attempt.ai_over_limit_count ?? 0) || (attempt.ai_reason_summary && Object.keys(attempt.ai_reason_summary).length)" class="candidate-ai">
-                    AI 智能接管：尝试 {{ attempt.ai_attempt_count }} · 采纳 {{ attempt.ai_accepted_count ?? 0 }} · 拒绝 {{ attempt.ai_rejected_count ?? 0 }} · 错误 {{ attempt.ai_error_count ?? 0 }}<span v-if="attempt.ai_over_limit_count"> · 超限/未提交 {{ attempt.ai_over_limit_count }}</span>
-                  </div>
-                  <div v-if="attempt.ai_reason_summary && Object.keys(attempt.ai_reason_summary).length" class="muted">AI 结果摘要：{{ displayValue(attempt.ai_reason_summary) }}</div>
-                  <div v-if="attempt.error_summary" class="error-text">{{ attempt.error_summary }}</div>
-                </div>
-              </div>
-            </VExpansionPanelText>
-          </VExpansionPanel>
-
-          <VExpansionPanel>
-            <VExpansionPanelTitle>产物</VExpansionPanelTitle>
+            <VExpansionPanelTitle>结果</VExpansionPanelTitle>
             <VExpansionPanelText>
               <dl>
                 <DetailRow label="最终字幕"><CopyValue :value="detail.final_subtitle_path" label="字幕路径" /></DetailRow>
-                <DetailRow label="匹配记录">{{ detail.record_ids.length ? `${detail.record_ids.length} 条` : '无' }}</DetailRow>
+                <DetailRow label="结果来源">{{ detail.result_source ? sourceLabels[detail.result_source] : '无' }}</DetailRow>
+                <DetailRow label="结果格式">{{ detail.result_format || '未记录' }}</DetailRow>
+                <DetailRow label="结果范围">{{ detail.result_package_scope ? packageLabels[detail.result_package_scope] : '未记录' }}</DetailRow>
                 <DetailRow v-for="(count, key) in detail.record_counts" :key="key" :label="friendlyKey(key)">{{ count }}</DetailRow>
-                <DetailRow label="警告数量">{{ detail.warning_count }}</DetailRow>
               </dl>
-              <VAlert v-if="detail.warning_summaries.length" type="warning" variant="tonal" density="compact" class="mt-3">
-                <ul class="warning-list"><li v-for="warning in detail.warning_summaries" :key="warning">{{ warning }}</li></ul>
+              <VAlert v-if="detail.trigger === 'manual_candidate'" type="info" variant="tonal" density="compact" class="mt-3">
+                这是人工字幕搜索选定候选后的下载任务；库存查询与自动准入筛选不会在此任务中重复执行。
               </VAlert>
+              <dl v-if="detail.trigger === 'manual_candidate'" class="manual-summary mt-3">
+                <DetailRow v-if="detail.manual_source" label="人工来源">{{ sourceLabels[detail.manual_source] }}</DetailRow>
+                <DetailRow v-if="detail.actual_search_query" label="实际搜索词">{{ detail.actual_search_query }}</DetailRow>
+                <DetailRow v-if="detail.manual_candidate_key" label="候选键"><CopyValue :value="detail.manual_candidate_key" label="候选键" /></DetailRow>
+                <DetailRow v-for="[key, value] in detailEntries(detail.manual_candidate_summary)" :key="key" :label="friendlyKey(key)">{{ displayValue(value) }}</DetailRow>
+              </dl>
             </VExpansionPanelText>
           </VExpansionPanel>
         </VExpansionPanels>
@@ -772,22 +621,8 @@ function sourceRunRejectionSummary(run: SourceRun): string {
 .page-size { min-width: 7rem; }
 .detail-state { margin: 1rem; }
 .detail-sections { border-radius: 0; }
-.subsection + .subsection { margin-top: 1.25rem; }
-.subsection h4 { margin: 0 0 0.5rem; font-size: 0.875rem; }
-.task-timeline { height: auto !important; }
 .muted { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.8125rem; line-height: 1.5; }
 .error-text { display: block; margin-top: 0.25rem; color: rgb(var(--v-theme-error)); font-size: 0.8125rem; }
-.audit-list { background: transparent; }
-.source-run-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; }
-.source-run-summary > span + span::before { margin-right: 0.5rem; content: '·'; }
-.source-run-context, .source-run-rejections { display: block; margin-top: 0.25rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); }
-.candidate-policy { margin: 0 0 0.75rem; }
-.candidate-list { display: grid; gap: 0.625rem; margin-top: 1rem; }
-.candidate-item { padding: 0.75rem; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.25rem; }
-.candidate-item__heading { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.8125rem; }
-.candidate-funnel { margin-top: 0.35rem; overflow-wrap: anywhere; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; line-height: 1.55; }
-.candidate-ai { margin-top: 0.35rem; overflow-wrap: anywhere; color: rgb(var(--v-theme-primary)); font-size: 0.75rem; line-height: 1.55; }
-.warning-list { margin: 0; padding-left: 1.25rem; }
 .mobile-list { padding: 0; border-block: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); background: transparent; }
 .mobile-list__item { min-height: 6rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .mobile-list__detail { display: grid; width: 100%; min-width: 0; padding: 0; border: 0; color: inherit; text-align: start; background: transparent; cursor: pointer; font: inherit; }

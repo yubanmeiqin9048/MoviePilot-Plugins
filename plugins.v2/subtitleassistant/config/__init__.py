@@ -101,7 +101,6 @@ def load_config(raw: Mapping[str, object] | None, allowed_formats: Sequence[str]
         format_priority=_normalize_format_priority(allowed_formats, values.get("format_priority")),
         path_mappings=tuple(mappings),
         package_attribution_strategy=strategy,
-        ai_attribution_takeover_enabled=bool(values.get("ai_attribution_takeover_enabled", False)),
     )
 
 
@@ -120,7 +119,6 @@ def public_config(config: PluginConfig, **kwargs: object) -> dict[str, object]:
         "format_priority": list(config.format_priority),
         "path_mappings": [mapping.as_dict() for mapping in config.path_mappings],
         "package_attribution_strategy": config.package_attribution_strategy.value,
-        "ai_attribution_takeover_enabled": config.ai_attribution_takeover_enabled,
         **kwargs,
     }
 

@@ -7,12 +7,9 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import Field, JsonValue
+from pydantic import Field
 
 from .attribution import (
-    AiAttributionAudit,
-    AttributionEvidence,
-    CandidateAttributionSnapshot,
     FileAttributionMethod,
     UnmatchedReason,
 )
@@ -32,6 +29,7 @@ __all__ = [
     "BatchRetargetPreviewItem",
     "BatchRetargetResult",
     "BatchRetargetResultItem",
+    "CommittedFileFact",
     "DeleteMode",
     "DeleteRecordConfirmation",
     "DeleteRecordResult",
@@ -86,6 +84,7 @@ class RetargetHistoryEntry(StrictModel):
     new_history_target_path: Path | None = None
     old_target_path: Path | None = None
     new_target_path: Path
+    new_matched_path_mapping: PathMappingSnapshot | None = None
     old_subtitle_path: Path
     new_subtitle_path: Path
 
@@ -125,13 +124,9 @@ class MatchRecord(StrictModel):
     consumed_task_id: str | None = None
     candidate_key: str
     candidate_name: str | None = None
-    candidate_attribution_snapshot: CandidateAttributionSnapshot | None = None
     logical_source_path: Path | None = None
     file_attribution_method: FileAttributionMethod | None = None
-    season_evidence: AttributionEvidence = AttributionEvidence.UNKNOWN
-    episode_evidence: AttributionEvidence = AttributionEvidence.UNKNOWN
     unmatched_reason: UnmatchedReason | None = None
-    host_recognition_summary: dict[str, JsonValue] = Field(default_factory=dict)
     language: str
     translation_type: TranslationType = TranslationType.UNKNOWN
     hearing_impaired: bool = False
@@ -144,7 +139,6 @@ class MatchRecord(StrictModel):
     uploaded_at: datetime | None = None
     revision: int | None = None
     retarget_history: list[RetargetHistoryEntry] = Field(default_factory=list)
-    ai_takeover_audit: AiAttributionAudit | None = None
 
     @property
     def inventory_key(self) -> tuple[str, MediaIdentityKind, str, int, int] | None:
@@ -167,6 +161,15 @@ class MatchRecord(StrictModel):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CommittedFileFact:
+    """一条媒体目录字幕与匹配记录已共同提交的文件事实。"""
+
+    record: MatchRecord
+    target_path: Path
+    subtitle_path: Path
+
+
 @dataclass(slots=True)
 class InventoryConsumeResult:
     """字幕库存消费结果。"""
@@ -174,6 +177,7 @@ class InventoryConsumeResult:
     matched: bool = False
     record: MatchRecord | None = None
     records: list[MatchRecord] = field(default_factory=list)
+    committed_files: list[CommittedFileFact] = field(default_factory=list)
     warning: str | None = None
 
     def __post_init__(self) -> None:
@@ -184,6 +188,16 @@ class InventoryConsumeResult:
         elif self.records and self.record is None:
             self.record = self.records[0]
         self.matched = self.matched or bool(self.records)
+        if not self.committed_files:
+            self.committed_files = [
+                CommittedFileFact(
+                    record=record,
+                    target_path=record.target_path or record.path,
+                    subtitle_path=record.final_subtitle_path or record.path,
+                )
+                for record in self.records
+                if record.status is RecordStatus.MATCHED and record.location is FileLocation.MEDIA_DIRECTORY
+            ]
 
 
 @dataclass(frozen=True, slots=True)

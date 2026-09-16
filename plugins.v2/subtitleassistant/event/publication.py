@@ -32,7 +32,7 @@ class SubtitleEvents:
         try:
             self._event_manager.send_event(EventType.PluginAction, _host_payload(event))
         except Exception as exc:  # noqa: BLE001 - 广播失败不得反馈到已提交业务
-            logger.error(f"字幕落盘插件动作广播失败，已保留成功业务结果；异常类型为 {type(exc).__name__}")
+            logger.warning(f"字幕落盘插件动作广播失败，已保留成功业务结果；异常类型为 {type(exc).__name__}")
 
 
 def _host_payload(event: SubtitleWrittenEvent) -> dict[str, str | None]:

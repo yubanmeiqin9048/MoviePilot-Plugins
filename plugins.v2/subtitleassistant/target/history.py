@@ -3,21 +3,17 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Protocol
 
 from app.db.models.transferhistory import TransferHistory
-from app.schemas.types import MediaType as HostMediaType
 from app.utils.jieba import cut as jieba_cut
 
-from ..schemas.attribution import CandidateMatchContext
 from ..schemas.config import PluginConfig
-from ..schemas.target import MediaType, PathMappingResolution, SearchTarget, SubtitleTarget
+from ..schemas.target import ResolvedTarget, SearchTarget, SubtitleTarget
 from .mapping import resolve_path
+from .projection import target_from_history
 
 
 @dataclass(slots=True)
@@ -152,25 +148,6 @@ def _history_search_query(value: str | None) -> tuple[str | None, bool | None, b
     return "%".join(jieba_cut(query, HMM=False)), None, False
 
 
-def _parse_number(value: object) -> int | None:
-    """从宿主季集字段中读取第一个整数。"""
-
-    match = re.search(r"\d+", str(value or ""))
-    return int(match.group()) if match else None
-
-
-def _parse_history_time(value: object) -> datetime:
-    """把宿主整理时间归一化为 UTC。"""
-
-    try:
-        parsed = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return datetime.now(UTC)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
-    return parsed.astimezone(UTC)
-
-
 class TargetCatalogService:
     """拥有整理历史分页、目标投影与实际字幕路径解析。"""
 
@@ -204,77 +181,7 @@ class TargetCatalogService:
     def _to_target(self, history: TransferHistory | None) -> SearchTarget | None:
         """把一条成功的本地文件整理历史投影为插件目标。"""
 
-        if history is None:
-            return None
-        path_value = getattr(history, "dest", None)
-        file_data = getattr(history, "dest_fileitem", None)
-        if (
-            getattr(history, "status", False) is not True
-            or getattr(history, "dest_storage", None) != "local"
-            or not isinstance(path_value, str)
-            or not path_value.strip()
-            or not isinstance(file_data, dict)
-            or file_data.get("type") != "file"
-        ):
-            return None
-        raw_type = str(getattr(history, "type", "") or "")
-        media_type = (
-            MediaType.TV
-            if raw_type in {HostMediaType.TV.value, "tv", "TV"}
-            else MediaType.MOVIE
-            if raw_type in {HostMediaType.MOVIE.value, "movie", "MOVIE"}
-            else MediaType.UNKNOWN
-        )
-        try:
-            year_value = getattr(history, "year", None)
-            year = int(str(year_value)) if year_value is not None else None
-        except (TypeError, ValueError):
-            year = None
-        try:
-            tmdb_value = getattr(history, "tmdbid", None)
-            tmdb_id = int(str(tmdb_value)) if tmdb_value is not None else None
-        except (TypeError, ValueError):
-            tmdb_id = None
-        context = SubtitleTarget(
-            title=str(getattr(history, "title", "") or Path(path_value).stem),
-            original_title=getattr(history, "original_title", None),
-            english_title=getattr(history, "en_title", None),
-            year=year,
-            media_type=media_type,
-            season=_parse_number(getattr(history, "seasons", None)),
-            episode=_parse_number(getattr(history, "episodes", None)),
-            tmdb_id=tmdb_id,
-            imdb_id=getattr(history, "imdbid", None),
-            target_path=Path(path_value),
-            target_file_name=str(file_data.get("name") or Path(path_value).name),
-            target_storage="local",
-            target_type="file",
-            target_extension=str(file_data.get("extension") or Path(path_value).suffix).lstrip("."),
-            target_container=file_data.get("container") if isinstance(file_data.get("container"), str) else None,
-        )
-        aliases = tuple(
-            value.strip()
-            for value in (context.english_title, context.original_title)
-            if isinstance(value, str) and value.strip() and value.strip() != context.title
-        )
-        raw_douban = getattr(history, "doubanid", None)
-        return SearchTarget(
-            history_id=int(history.id),
-            context=context,
-            transferred_at=_parse_history_time(getattr(history, "date", None)),
-            match_context=CandidateMatchContext(
-                title=context.title,
-                aliases=aliases,
-                original_title=context.original_title,
-                year=context.year,
-                media_type=context.media_type,
-                tmdb_id=context.tmdb_id,
-                imdb_id=context.imdb_id,
-                douban_id=str(raw_douban).strip() if raw_douban not in (None, "") else None,
-                bangumi_id=_parse_number(getattr(history, "bangumiid", None)),
-                anilist_id=_parse_number(getattr(history, "anilistid", None)),
-            ),
-        )
+        return target_from_history(history)
 
     async def list_targets(
         self,
@@ -325,8 +232,27 @@ class TargetCatalogService:
         history = await self._history_oper.async_get(history_id)
         return self._to_target(history)
 
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
-        """仅在执行文件操作时按当前配置解析实际字幕目标路径。"""
+    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> ResolvedTarget:
+        """仅在执行文件操作时按当前配置解析并冻结实际字幕目标。"""
 
         config = self._config_provider()
-        return resolve_path(target.target_path, getattr(config, "path_mappings", ()))
+        resolution = resolve_path(target.target_path, getattr(config, "path_mappings", ()))
+        return ResolvedTarget(
+            original_path=resolution.original_path,
+            resolved_path=resolution.resolved_path,
+            mapping=resolution.mapping,
+            title=target.title,
+            original_title=target.original_title,
+            english_title=target.english_title,
+            year=target.year,
+            media_type=target.media_type,
+            season=target.season,
+            episode=target.episode,
+            tmdb_id=target.tmdb_id,
+            imdb_id=target.imdb_id,
+            target_file_name=target.target_file_name,
+            target_storage=target.target_storage,
+            target_type=target.target_type,
+            target_extension=target.target_extension,
+            target_container=target.target_container,
+        )

@@ -63,6 +63,7 @@ from ..search import ManualSearch
 from ..source import SourceAdministration
 from ..target import TargetCatalog
 from ..task import TaskOperations
+from .projection import source_item, target_item
 
 CredentialSource = Literal["opensubtitles", "assrt"]
 
@@ -224,7 +225,8 @@ class ApiController:
         task = await self._tasks.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
-        return TaskDetail.model_validate(task.model_dump(mode="json", include=set(TaskDetail.model_fields)))
+        payload = task.model_dump(mode="json", include=set(TaskDetail.model_fields))
+        return TaskDetail.model_validate(payload)
 
     async def delete_task(
         self,
@@ -444,8 +446,8 @@ class ApiController:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return ManualSearchResponse(
             session_id=result.session_id,
-            target=self._search.target_item(result.target),
-            sources=[self._search.source_item(run) for run in result.sources],
+            target=target_item(result.target, self._sources),
+            sources=[source_item(run) for run in result.sources],
         )
 
     async def download_search_candidate(
@@ -484,7 +486,6 @@ class ApiController:
             raise HTTPException(status_code=500, detail="人工字幕任务创建失败")
         return ManualDownloadResponse(
             task_id=result.task.id,
-            reused=result.reused,
             task=TaskListItem.model_validate(
                 result.task.model_dump(mode="json", include=set(TaskListItem.model_fields))
             ),
@@ -551,7 +552,7 @@ class ApiController:
                         str(item.current_subtitle_path) if item.current_subtitle_path is not None else None
                     ),
                     target_history_id=item.target_history_id,
-                    target=self._search.target_item(item.target) if item.target is not None else None,
+                    target=target_item(item.target, self._sources) if item.target is not None else None,
                     preview=self._retarget_preview_response(item.preview) if item.preview is not None else None,
                     executable=item.executable,
                     error_code=item.error_code,

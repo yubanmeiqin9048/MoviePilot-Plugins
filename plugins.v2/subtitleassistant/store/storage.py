@@ -4,23 +4,109 @@ from __future__ import annotations
 
 import asyncio
 import json
+import types
 from copy import deepcopy
 from datetime import UTC, datetime
 from threading import RLock
-from typing import Any
+from typing import Any, Union, get_args, get_origin
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from ..schemas.record import MatchRecord, RecordStatus
+from ..schemas.attribution import FileAttributionMethod
+from ..schemas.record import MatchRecord
 from ..schemas.source import SourceHealth, SourceStatus, SubtitleSource
 from ..schemas.task import SubtitleTask, TaskStatus
 from ..store import StoreInitializationError
+
+_MODEL_UNION_ORIGINS = (Union, types.UnionType)
+
+# 旧数据中已删除的枚举值到当前有效语义的最小兼容映射；仅在一次性迁移时应用。
+_LEGACY_FIELD_VALUES: dict[type[BaseModel], dict[str, dict[Any, Any]]] = {
+    MatchRecord: {
+        "file_attribution_method": {
+            "ai_takeover": FileAttributionMethod.HOST_RECOGNITION.value,
+        }
+    }
+}
+
+
+def _nested_model_shape(annotation: Any) -> tuple[type[BaseModel], bool] | None:
+    """解析字段注解中可剥离的嵌套模型，返回（模型类，是否为列表）。
+
+    只识别直接的模型、``Model | None`` 联合与 ``list[Model]``；``dict`` 等其余注解
+    返回 ``None``，表示该字段的值按原样交给后续严格校验。
+    """
+
+    origin = get_origin(annotation)
+    if origin is list:
+        arguments = get_args(annotation)
+        if not arguments:
+            return None
+        shape = _nested_model_shape(arguments[0])
+        return (shape[0], True) if shape is not None else None
+    if origin in _MODEL_UNION_ORIGINS:
+        for argument in get_args(annotation):
+            shape = _nested_model_shape(argument)
+            if shape is not None:
+                return shape
+        return None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation, False
+    return None
+
+
+def _tolerant_field_value(value: Any, annotation: Any) -> Any:
+    """按字段注解递归剥离嵌套模型中的已删与未知字段。"""
+
+    shape = _nested_model_shape(annotation)
+    if shape is None:
+        return value
+    model, is_list = shape
+    if is_list:
+        if not isinstance(value, list):
+            return value
+        return [_tolerant_payload(model, item) for item in value]
+    return _tolerant_payload(model, value)
+
+
+def _tolerant_payload(model: type[BaseModel], value: Any) -> Any:
+    """只保留模型已声明字段，剥离旧数据中的已删与未知字段。
+
+    顶层取值与已知字段的取值不在这一步剔除或改写类型，以便已知字段的坏值仍在后续
+    严格校验中 fail-closed。
+    """
+
+    if not isinstance(value, dict):
+        return value
+    return {
+        name: _tolerant_field_value(value[name], field.annotation)
+        for name, field in model.model_fields.items()
+        if name in value
+    }
+
+
+def _normalize_legacy_values(model: type[BaseModel], value: Any) -> Any:
+    """把旧数据中已删除的枚举值就地转换为当前有效语义。
+
+    只处理白名单字段与取值，未声明的字段仍由 ``_tolerant_payload`` 一次性剥离；
+    转换后的值继续交给严格校验，不放松运行期 schema。
+    """
+
+    field_values = _LEGACY_FIELD_VALUES.get(model)
+    if not field_values or not isinstance(value, dict):
+        return value
+    for field_name, mapping in field_values.items():
+        current = value.get(field_name)
+        if current in mapping:
+            value[field_name] = mapping[current]
+    return value
 
 
 class PluginDataStore:
     """封装四个版本化 PluginData 分区并提供异步业务访问。"""
 
-    VERSION = 2
+    VERSION = 3
+    MIGRATION_VERSION = 2
     TASKS_KEY = "tasks"
     RECORDS_KEY = "records"
     SOURCE_STATUS_KEY = "source_status"
@@ -45,34 +131,13 @@ class PluginDataStore:
             raw = {key: self._plugin.get_data(key) for key in self._PARTITION_KEYS}
         except Exception as exc:
             raise StoreInitializationError("插件数据分区读取失败") from exc
-        tasks, records, statuses, credentials, missing = self._decode_partitions(raw)
+        tasks, records, statuses, credentials, missing, migrations = self._decode_partitions(raw)
         try:
-            for key in missing:
+            for key in (*missing, *migrations):
                 self._persist_partition_sync(key, self._partition_items(key, tasks, records, statuses, credentials))
         except Exception as exc:
             raise StoreInitializationError("插件数据缺失分区初始化失败") from exc
         self._publish_snapshots(tasks, records, statuses, credentials)
-
-    async def reload(self) -> None:
-        """显式异步重新装载全部分区，并在完整成功后发布新快照。"""
-
-        async with self._async_mutation_lock:
-            try:
-                raw: dict[str, Any] = {}
-                for key in self._PARTITION_KEYS:
-                    raw[key] = await self._plugin.async_get_data(key)
-            except Exception as exc:
-                raise StoreInitializationError("插件数据分区异步读取失败") from exc
-            tasks, records, statuses, credentials, missing = self._decode_partitions(raw)
-            try:
-                for key in missing:
-                    await self._persist_partition(
-                        key,
-                        self._partition_items(key, tasks, records, statuses, credentials),
-                    )
-            except Exception as exc:
-                raise StoreInitializationError("插件数据缺失分区异步初始化失败") from exc
-            self._publish_snapshots(tasks, records, statuses, credentials)
 
     def _decode_partitions(
         self,
@@ -83,14 +148,24 @@ class PluginDataStore:
         dict[str, SourceStatus],
         dict[str, dict[str, str]],
         list[str],
+        list[str],
     ]:
-        """校验原始分区并构造尚未发布的完整内存快照。"""
+        """校验原始分区并构造尚未发布的完整内存快照。
+
+        返回缺失分区与需要一次性迁移的分区键；迁移分区在加载时宽容剥离旧字段，
+        其余分区维持严格校验。
+        """
 
         missing: list[str] = []
-        tasks_raw = self._unwrap_partition(self.TASKS_KEY, raw.get(self.TASKS_KEY), [], missing)
-        records_raw = self._unwrap_partition(self.RECORDS_KEY, raw.get(self.RECORDS_KEY), [], missing)
-        statuses_raw = self._unwrap_partition(self.SOURCE_STATUS_KEY, raw.get(self.SOURCE_STATUS_KEY), [], missing)
-        credentials_raw = self._unwrap_partition(self.CREDENTIALS_KEY, raw.get(self.CREDENTIALS_KEY), {}, missing)
+        migrations: list[str] = []
+        tasks_raw = self._unwrap_partition(self.TASKS_KEY, raw.get(self.TASKS_KEY), [], missing, migrations)
+        records_raw = self._unwrap_partition(self.RECORDS_KEY, raw.get(self.RECORDS_KEY), [], missing, migrations)
+        statuses_raw = self._unwrap_partition(
+            self.SOURCE_STATUS_KEY, raw.get(self.SOURCE_STATUS_KEY), [], missing, migrations
+        )
+        credentials_raw = self._unwrap_partition(
+            self.CREDENTIALS_KEY, raw.get(self.CREDENTIALS_KEY), {}, missing, migrations
+        )
         try:
             if not isinstance(tasks_raw, list):
                 raise TypeError("tasks 分区必须是数组")
@@ -102,29 +177,39 @@ class PluginDataStore:
                 raise TypeError("credentials 分区必须是对象")
             tasks = {
                 item.id: item
-                for item in (
-                    SubtitleTask.model_validate_json(json.dumps(value, ensure_ascii=False)) for value in tasks_raw
-                )
+                for item in self._decode_model_items(SubtitleTask, tasks_raw, self.TASKS_KEY in migrations)
             }
             records = {
                 item.id: item
-                for item in (
-                    MatchRecord.model_validate_json(json.dumps(value, ensure_ascii=False)) for value in records_raw
-                )
+                for item in self._decode_model_items(MatchRecord, records_raw, self.RECORDS_KEY in migrations)
             }
             statuses = {
                 item.source.value: item
-                for item in (
-                    SourceStatus.model_validate_json(json.dumps(value, ensure_ascii=False)) for value in statuses_raw
-                )
+                for item in self._decode_model_items(SourceStatus, statuses_raw, self.SOURCE_STATUS_KEY in migrations)
             }
             credentials = self._validate_credentials(credentials_raw)
         except (ValidationError, TypeError, ValueError) as exc:
             raise StoreInitializationError(f"插件数据结构校验失败：{exc}") from exc
-        return tasks, records, statuses, credentials, missing
+        return tasks, records, statuses, credentials, missing, migrations
 
-    def _unwrap_partition(self, key: str, raw: Any, default: Any, missing: list[str]) -> Any:
-        """解开单个版本化分区，并记录需要初始化的缺失分区。"""
+    @staticmethod
+    def _decode_model_items(model: type[BaseModel], raw_items: list[Any], tolerant: bool) -> list[Any]:
+        """按分区是否迁移决定是否先剥离未知字段，再执行严格 JSON 校验。"""
+
+        payloads = raw_items
+        if tolerant:
+            payloads = [_normalize_legacy_values(model, _tolerant_payload(model, item)) for item in raw_items]
+        return [model.model_validate_json(json.dumps(item, ensure_ascii=False)) for item in payloads]
+
+    def _unwrap_partition(
+        self,
+        key: str,
+        raw: Any,
+        default: Any,
+        missing: list[str],
+        migrations: list[str],
+    ) -> Any:
+        """解开单个版本化分区，并记录缺失分区或需要一次性迁移的分区。"""
 
         if raw is None:
             missing.append(key)
@@ -132,9 +217,12 @@ class PluginDataStore:
         if not isinstance(raw, dict) or "version" not in raw or "items" not in raw:
             raise StoreInitializationError(f"插件数据分区 {key} 结构损坏")
         version = raw.get("version")
-        if version != self.VERSION:
-            raise StoreInitializationError(f"插件数据分区 {key} 版本不受支持：{version}")
-        return deepcopy(raw["items"])
+        if version == self.VERSION:
+            return deepcopy(raw["items"])
+        if version == self.MIGRATION_VERSION:
+            migrations.append(key)
+            return deepcopy(raw["items"])
+        raise StoreInitializationError(f"插件数据分区 {key} 版本不受支持：{version}")
 
     def _publish_snapshots(
         self,
@@ -215,35 +303,12 @@ class PluginDataStore:
 
         return [item.model_dump(mode="json") for item in statuses.values()]
 
-    @staticmethod
-    def _pruned_tasks(tasks: dict[str, SubtitleTask]) -> dict[str, SubtitleTask]:
-        """返回只保留最近 500 条终态任务的候选快照。"""
-
-        terminal = [item for item in tasks.values() if item.is_terminal]
-        if len(terminal) <= 500:
-            return tasks
-        terminal.sort(key=lambda item: item.finished_at or item.created_at, reverse=True)
-        keep = {item.id for item in terminal[:500]}
-        return {key: value for key, value in tasks.items() if not value.is_terminal or key in keep}
-
-    @staticmethod
-    def _pruned_records(records: dict[str, MatchRecord]) -> dict[str, MatchRecord]:
-        """返回只保留最近 1000 条已匹配记录的候选快照。"""
-
-        matched = [item for item in records.values() if item.status is RecordStatus.MATCHED]
-        if len(matched) <= 1000:
-            return records
-        matched.sort(key=lambda item: item.created_at, reverse=True)
-        keep = {item.id for item in matched[:1000]}
-        return {key: value for key, value in records.items() if value.status is not RecordStatus.MATCHED or key in keep}
-
     def save_task_sync(self, task: SubtitleTask) -> None:
-        """在同步宿主生命周期保存任务并应用历史保留规则。"""
+        """在同步宿主生命周期保存任务。"""
 
         with self._lock:
             candidate = dict(self._tasks)
             candidate[task.id] = task.model_copy(deep=True)
-            candidate = self._pruned_tasks(candidate)
             self._persist_partition_sync(self.TASKS_KEY, self._task_values(candidate))
             self._tasks = candidate
 
@@ -254,7 +319,6 @@ class PluginDataStore:
             with self._lock:
                 candidate = dict(self._tasks)
                 candidate[task.id] = task.model_copy(deep=True)
-                candidate = self._pruned_tasks(candidate)
                 items = self._task_values(candidate)
             await self._persist_partition(self.TASKS_KEY, items)
             with self._lock:
@@ -311,12 +375,11 @@ class PluginDataStore:
             return True
 
     def save_record_sync(self, record: MatchRecord) -> None:
-        """在同步宿主生命周期保存记录并应用保留规则。"""
+        """在同步宿主生命周期保存记录。"""
 
         with self._lock:
             candidate = dict(self._records)
             candidate[record.id] = record.model_copy(deep=True)
-            candidate = self._pruned_records(candidate)
             self._persist_partition_sync(self.RECORDS_KEY, self._record_values(candidate))
             self._records = candidate
 
@@ -327,7 +390,6 @@ class PluginDataStore:
             with self._lock:
                 candidate = dict(self._records)
                 candidate[record.id] = record.model_copy(deep=True)
-                candidate = self._pruned_records(candidate)
                 items = self._record_values(candidate)
             await self._persist_partition(self.RECORDS_KEY, items)
             with self._lock:
@@ -469,11 +531,6 @@ class PluginDataStore:
         with self._lock:
             return dict(self._credentials.get(source.value, {}))
 
-    async def get_credentials(self, source: SubtitleSource) -> dict[str, str]:
-        """从当前运行代次的内存快照读取来源长期凭据。"""
-
-        return self.get_credentials_sync(source)
-
     @staticmethod
     def _credentials_configured(
         source: SubtitleSource,
@@ -487,20 +544,6 @@ class PluginDataStore:
             SubtitleSource.ASSRT: ("token",),
         }.get(source, ())
         return bool(required) and all(values.get(key, "").strip() for key in required)
-
-    def update_credentials_sync(self, source: SubtitleSource, values: dict[str, str]) -> bool:
-        """在同步宿主生命周期增量写入来源凭据。"""
-
-        with self._lock:
-            candidate = deepcopy(self._credentials)
-            current = candidate.setdefault(source.value, {})
-            for key, value in values.items():
-                clean = str(value).strip()
-                if clean:
-                    current[key] = clean
-            self._persist_partition_sync(self.CREDENTIALS_KEY, deepcopy(candidate))
-            self._credentials = candidate
-            return self._credentials_configured(source, candidate)
 
     def credentials_configured_sync(self, source: SubtitleSource) -> bool:
         """同步判断当前内存快照中的来源凭据是否完整。"""
@@ -524,15 +567,6 @@ class PluginDataStore:
             with self._lock:
                 self._credentials = candidate
             return self._credentials_configured(source, candidate)
-
-    def clear_credentials_sync(self, source: SubtitleSource) -> None:
-        """在同步宿主生命周期删除来源全部长期凭据。"""
-
-        with self._lock:
-            candidate = deepcopy(self._credentials)
-            candidate.pop(source.value, None)
-            self._persist_partition_sync(self.CREDENTIALS_KEY, deepcopy(candidate))
-            self._credentials = candidate
 
     async def clear_credentials(self, source: SubtitleSource) -> None:
         """异步删除来源凭据，并在持久化成功后发布候选快照。"""
@@ -558,7 +592,6 @@ class PluginDataStore:
                     continue
                 updated = task.model_copy(deep=True)
                 updated.status = TaskStatus.INTERRUPTED
-                updated.stage = None
                 updated.reason_code = "service_interrupted"
                 updated.reason_message = message
                 updated.finished_at = now

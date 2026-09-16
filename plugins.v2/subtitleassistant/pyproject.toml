@@ -1,7 +1,7 @@
 [tool.ty.environment]
-python = "/home/zhang/Documents/MoviePilot/.venv"
 python-version = "3.12"
 python-platform = "linux"
+python = "/home/zhang/Documents/MoviePilot/.venv"
 extra-paths = ["..", "/home/zhang/Documents/MoviePilot"]
 
 [tool.ty.src]

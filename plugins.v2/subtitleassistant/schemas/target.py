@@ -19,6 +19,7 @@ __all__ = [
     "PathMapping",
     "PathMappingResolution",
     "PathMappingSnapshot",
+    "ResolvedTarget",
     "SearchTarget",
     "SubtitleTarget",
 ]
@@ -116,6 +117,26 @@ class PathMappingResolution:
         """判断本次解析是否命中了路径映射。"""
 
         return self.mapping is not None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTarget(PathMappingResolution):
+    """整理历史目标一次解析后冻结的路径与执行目标事实。"""
+
+    title: str = ""
+    original_title: str | None = None
+    english_title: str | None = None
+    year: int | None = None
+    media_type: MediaType = MediaType.UNKNOWN
+    season: int | None = None
+    episode: int | None = None
+    tmdb_id: int | None = None
+    imdb_id: str | None = None
+    target_file_name: str = ""
+    target_storage: str | None = None
+    target_type: str = "file"
+    target_extension: str | None = None
+    target_container: str | None = None
 
 
 @dataclass(slots=True)

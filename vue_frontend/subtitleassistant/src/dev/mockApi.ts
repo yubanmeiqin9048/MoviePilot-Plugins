@@ -23,6 +23,7 @@ export type MockMode =
   | 'targets-empty'
   | 'targets-error'
   | 'search-error'
+  | 'search-source-error'
   | 'filter-recognition-empty'
   | 'filter-source-empty'
   | 'conditions-stale'
@@ -31,7 +32,6 @@ export type MockMode =
   | 'download-submitting'
   | 'empty'
   | 'error'
-  | 'download-reused'
   | 'download-failed'
   | 'download-session-expired'
   | 'download-candidate-unavailable'
@@ -49,13 +49,13 @@ export const mockScenarioOptions: MockScenarioOption[] = [
   { value: 'targets-empty', title: '目标：整理历史为空', description: '目标接口返回空列表，目标区显示空态和刷新动作。' },
   { value: 'targets-error', title: '目标：目标列表加载失败', description: '仅目标列表请求失败，来源和候选区不显示误导性错误。' },
   { value: 'search-error', title: '搜索：请求失败', description: '目标可正常选择，显式搜索请求失败且旧候选不会恢复。' },
+  { value: 'search-source-error', title: '搜索：单个来源异常', description: '仅 OpenSubtitles 返回脱敏错误，其余来源结果仍可展示。' },
   { value: 'filter-recognition-empty', title: '筛选：识别状态无结果', description: '结果仅含未识别候选，切换到“已识别”即可验收筛选空态。' },
   { value: 'filter-source-empty', title: '筛选：字幕源无结果', description: '结果只来自 MoviePilot，切换到无候选来源即可验收筛选空态。' },
   { value: 'conditions-stale', title: '条件变化：旧候选只读', description: '编辑关键词后旧候选仍可读但不能下载，主操作变为按新条件搜索。' },
   { value: 'search-loading', title: '搜索中：清空并等待新响应', description: '搜索请求延迟 1.5 秒，用于观察清空旧候选、骨架和来源进度。' },
   { value: 'target-change-cleanup', title: '更换目标：确认并清理状态', description: '正常结果下更换目标，确认后观察候选、筛选、通知和旧条件清理。' },
   { value: 'download-submitting', title: '提交中：仅锁定当前候选', description: '提交请求延迟 1.2 秒，当前按钮显示提交中，其他候选仍可操作。' },
-  { value: 'download-reused', title: '提交成功：任务复用', description: '返回 reused: true，当前候选显示已有处理中任务已复用。' },
   { value: 'download-failed', title: '提交失败：普通错误', description: '点击 MoviePilot 站点源的“示例字幕候选”触发普通错误，其他候选不被连带阻塞。' },
   { value: 'download-session-expired', title: '提交失败：会话失效', description: '返回 manual_search_session_expired，页面保留目标和关键词并要求重新搜索。' },
   { value: 'download-candidate-unavailable', title: '提交失败：候选不可用', description: '点击 MoviePilot 站点源的“示例字幕候选”触发候选不可用，仅当前候选显示局部错误。' },
@@ -93,7 +93,6 @@ function seedState(): MockState {
       target_history_id: 4103,
       history_target_path: '/legacy/media/剧集/示例剧集/Season 01/Example.Show.S01E03.1080p.WEB-DL.mkv',
       status: 'processing',
-      stage: 'search',
       reason_code: null,
       reason_message: null,
       result_source: null,
@@ -103,7 +102,6 @@ function seedState(): MockState {
       started_at: iso(42_000),
       finished_at: null,
       duration_ms: null,
-      warning_count: 0,
       trigger: 'transfer_event',
     },
     {
@@ -118,7 +116,6 @@ function seedState(): MockState {
       target_history_id: 4102,
       history_target_path: '/media/电影/夜航星/Night.Flight.2023.2160p.mkv',
       status: 'queued',
-      stage: null,
       reason_code: null,
       reason_message: null,
       result_source: null,
@@ -128,7 +125,6 @@ function seedState(): MockState {
       started_at: null,
       finished_at: null,
       duration_ms: null,
-      warning_count: 0,
       trigger: 'transfer_event',
     },
     {
@@ -143,7 +139,6 @@ function seedState(): MockState {
       target_history_id: 4101,
       history_target_path: '/legacy/media/电影/山海之间/Between.Mountains.2022.1080p.mkv',
       status: 'success',
-      stage: null,
       reason_code: null,
       reason_message: null,
       result_source: 'moviepilot',
@@ -153,7 +148,6 @@ function seedState(): MockState {
       started_at: iso(235_000),
       finished_at: iso(228_000),
       duration_ms: 7_000,
-      warning_count: 1,
       trigger: 'transfer_event',
     },
     {
@@ -168,7 +162,6 @@ function seedState(): MockState {
       target_history_id: 4100,
       history_target_path: '/media/电影/未找到字幕的电影/No.Subtitle.Movie.2021.mkv',
       status: 'failed',
-      stage: null,
       reason_code: 'candidate_exhausted',
       reason_message: '候选尝试已耗尽，没有可落盘的简体中文字幕。',
       result_source: null,
@@ -178,7 +171,6 @@ function seedState(): MockState {
       started_at: iso(3_590_000),
       finished_at: iso(3_580_000),
       duration_ms: 10_000,
-      warning_count: 0,
       trigger: 'transfer_event',
     },
   ]
@@ -192,76 +184,16 @@ function seedState(): MockState {
       ? { source_prefix: '/legacy/media', target_prefix: '/media' }
       : null,
     target_file_exists: task.id !== 'task-queued',
-    package_attribution_strategy: 'trust_package',
-    candidate_attribution_snapshot: task.media_type === 'tv'
-      ? { media_type: 'tv', tmdb_id: 12345, imdb_id: null, seasons: [1], episodes: [3, 4], package_scope: 'season_pack', evidence: ['候选标题'] }
-      : { media_type: 'movie', tmdb_id: null, imdb_id: null, seasons: [], episodes: [], package_scope: 'episode', evidence: ['候选标题'] },
-    existing_subtitle_check: { found: false, checked_paths: [task.target_path.replace(/\.mkv$/i, '.chi.zh-cn.ass')] },
-    inventory_result: task.id === 'task-processing' ? { hit: false, staged: 0 } : { hit: false, staged: 0 },
-    stage_traces: task.id === 'task-processing'
-      ? [{ stage: 'preflight', started_at: iso(42_000), finished_at: iso(41_000), duration_ms: 1000, summary: '目标文件通过前置检查' }, { stage: 'search', started_at: iso(40_000), finished_at: null, duration_ms: null, summary: '正在等待字幕源结果' }]
-      : [{ stage: task.status === 'success' ? 'write' : 'search', started_at: task.started_at || task.created_at, finished_at: task.finished_at, duration_ms: task.duration_ms, summary: task.reason_message || '阶段完成' }],
-    source_runs: [
-      {
-        source: 'moviepilot',
-        status: task.status === 'failed' ? 'empty' : 'success',
-        candidate_count: task.status === 'failed' ? 0 : 2,
-        raw_count: task.status === 'failed' ? 0 : 5,
-        admitted_count: task.status === 'failed' ? 0 : 3,
-        media_matched_count: task.status === 'failed' ? 0 : 2,
-        rejected_count: task.status === 'failed' ? 0 : 3,
-        rejection_summary: task.status === 'failed'
-          ? {} as Record<string, number>
-          : { language: 2, media_or_episode_mismatch: 1 },
-        duration_ms: 820,
-        error_summary: null,
-        details: { cache_hit: false, page_count: 1, pagination_complete: true, query: 'Adventure' },
-      },
-      {
-        source: 'assrt',
-        status: task.status === 'failed' ? 'limited' : 'success',
-        candidate_count: task.status === 'failed' ? 0 : 1,
-        raw_count: task.status === 'failed' ? 0 : 4,
-        admitted_count: task.status === 'failed' ? 0 : 2,
-        media_matched_count: task.status === 'failed' ? 0 : 1,
-        rejected_count: task.status === 'failed' ? 0 : 3,
-        rejection_summary: task.status === 'failed'
-          ? {} as Record<string, number>
-          : { machine_translation: 1, media_or_episode_mismatch: 2 },
-        duration_ms: 1200,
-        error_summary: task.status === 'failed' ? '请求频率受限' : null,
-        details: { cache_hit: true, cache_stored_at: iso(120_000), page_count: 1, pagination_complete: true, query: '示例剧集' },
-      },
-      {
-        source: 'opensubtitles',
-        status: 'disabled',
-        candidate_count: 0,
-        raw_count: 0,
-        admitted_count: 0,
-        media_matched_count: 0,
-        rejected_count: 0,
-        rejection_summary: {},
-        duration_ms: null,
-        error_summary: null,
-        details: {},
-      },
-    ],
-    candidate_attempts: task.status === 'failed' ? [{
-      candidate_key: 'demo-candidate-1', source: 'assrt', package_scope: 'episode', language: 'zh-CN', format: 'srt', translation_type: 'human', hearing_impaired: false,
-      attribution_strategy: 'trust_package', candidate_snapshot: { media_type: task.media_type, tmdb_id: null, imdb_id: null, seasons: [], episodes: [], package_scope: 'episode', evidence: ['候选标题'] },
-      extracted_count: 3, current_target_count: 0, same_media_other_episode_count: 1, ambiguous_count: 2, other_media_count: 0, written_count: 0, staged_count: 0, unmatched_count: 0,
-      result: 'no_match', error_summary: '候选包中没有当前目标集',
-    }] : [],
     final_subtitle_path: task.status === 'success' ? `${task.target_path.replace(/\.mkv$/i, '')}.chi.zh-cn.ass` : null,
-    record_ids: task.status === 'success' ? ['record-matched'] : [],
     record_counts: task.status === 'success'
-      ? { matched: 1, staged: 1, unmatched: 0 }
+      ? { matched: 1, staged: 1 }
       : {} as Record<string, number>,
-    warning_summaries: task.warning_count ? ['包内另一个字幕文件已暂存到插件数据目录。'] : [],
-    manual_source: null,
-    manual_candidate_key: null,
-    manual_candidate_summary: {},
-    actual_search_query: null,
+    manual_source: task.trigger === 'manual_candidate' ? 'assrt' : null,
+    manual_candidate_key: task.trigger === 'manual_candidate' ? 'demo-manual-candidate' : null,
+    manual_candidate_summary: task.trigger === 'manual_candidate'
+      ? { source: 'assrt', name: '示例字幕候选', language: '简体中文' }
+      : {},
+    actual_search_query: task.trigger === 'manual_candidate' ? '示例剧集' : null,
   }]))
 
   const records: RecordListItem[] = [
@@ -291,12 +223,8 @@ function seedState(): MockState {
     candidate_key: `demo-${record.id}`,
     candidate_name: record.id === 'record-unmatched' ? null : '示例字幕候选',
     language: 'zh-CN', translation_type: 'human', hearing_impaired: false,
-    candidate_attribution_snapshot: record.media_title ? { media_type: record.media_type, tmdb_id: 67890, imdb_id: null, seasons: record.season == null ? [] : [record.season], episodes: record.episode == null ? [] : [record.episode], package_scope: record.package_scope, evidence: ['候选标题'] } : null,
     logical_source_path: record.id === 'record-staged' ? 'Example.Show.S01.Complete.zip/Season 01/Example.Show.S01E04.zh-cn.srt' : record.subtitle_file_name,
     file_attribution_method: record.id === 'record-matched' ? 'direct_file' : 'trust_package',
-    host_recognition_summary: record.media_title ? { matched: true, identity: 'tmdb:67890' } : { matched: false },
-    season_evidence: record.media_type === 'tv' ? 'path' : 'not_applicable',
-    episode_evidence: record.media_type === 'tv' ? 'path' : 'not_applicable',
     unmatched_reason: record.status === 'unmatched' ? 'media_unrecognized' : null,
     target_file_exists: record.target_path ? false : null,
     staged_at: record.status === 'staged' ? record.created_at : null,
@@ -333,7 +261,7 @@ function seedState(): MockState {
     search_round: 0,
     config: {
       plugin_id: 'SubtitleAssistant', enabled: true, moviepilot_enabled: true, opensubtitles_enabled: false, assrt_enabled: true,
-      opensubtitles_configured: false, assrt_configured: true, allow_machine_translation: false, ai_attribution_takeover_enabled: false, host_ai_enabled: true, max_candidate_attempts: 3,
+      opensubtitles_configured: false, assrt_configured: true, allow_machine_translation: false, max_candidate_attempts: 3,
       source_priority: ['moviepilot', 'assrt', 'opensubtitles'], format_priority: ['ASS', 'SSA', 'SRT', 'SUP'],
       path_mappings: [{ source_prefix: '/legacy/media', target_prefix: '/media' }], package_attribution_strategy: 'trust_package',
       allowed_formats: ['ASS', 'SSA', 'SRT', 'SUP'],
@@ -440,9 +368,11 @@ export function createMockApi() {
             ? 'recognition-empty'
             : state.mode === 'filter-source-empty'
               ? 'source-empty'
-              : ['conditions-stale', 'search-loading'].includes(state.mode) && state.search_round > 1
-                ? 'refreshed'
-              : 'normal'
+              : state.mode === 'search-source-error'
+                ? 'source-error'
+                : ['conditions-stale', 'search-loading'].includes(state.mode) && state.search_round > 1
+                  ? 'refreshed'
+                  : 'normal'
         return mockSearchResponse(target, variant) as T
       }
       if (path.includes('/searches/') && path.endsWith('/downloads')) {
@@ -461,7 +391,7 @@ export function createMockApi() {
         }
         if (state.mode === 'download-rejected') throw mockHttpError(409, '插件当前不接受新任务')
         if (state.mode === 'download-failed' && candidateKey === 'mock-moviepilot') throw mockHttpError(500, '人工字幕任务提交失败')
-        return { task_id: state.tasks[0].id, reused: state.mode === 'download-reused', task: clone(state.tasks[0]) } as T
+        return { task_id: state.tasks[0].id, task: clone(state.tasks[0]) } as T
       }
       if (path.endsWith('/records/batch-retarget-preview')) {
         const mappings = ((payload as { items?: Array<{ record_id: string; target_history_id?: string | number | null }> } | undefined)?.items || [])
@@ -756,7 +686,7 @@ function applyMockRetarget(record: RecordDetail, target: TargetItem, preview: Re
   }
 }
 
-type SearchMockVariant = 'normal' | 'empty' | 'recognition-empty' | 'source-empty' | 'refreshed'
+type SearchMockVariant = 'normal' | 'empty' | 'recognition-empty' | 'source-empty' | 'source-error' | 'refreshed'
 
 function mockSearchResponse(target: TargetItem, variant: SearchMockVariant = 'normal'): SearchResponse {
   const response: SearchResponse = {
@@ -764,11 +694,11 @@ function mockSearchResponse(target: TargetItem, variant: SearchMockVariant = 'no
     target: clone(target),
     sources: [
       {
-        source: 'moviepilot', status: 'success', default_plans: target.search_plans.moviepilot, executed_queries: ['Example', 'Example Show'], matched_query: 'Example Show', candidate_count: 1, duration_ms: 320, error_summary: null, details: { cache: [{ query: 'Example', state: 'miss', hit: false, stored: true, stored_at: null, ttl_seconds: 600 }, { query: 'Example Show', state: 'miss', hit: false, stored: true, stored_at: null, ttl_seconds: 600 }], pagination: [{ query: 'Example', pages_fetched: 1, complete: true, failed_page: null, cached: false }, { query: 'Example Show', pages_fetched: 1, complete: true, failed_page: null, cached: false }] },
-        candidates: [{ candidate_key: 'mock-moviepilot', recognition_status: 'recognized', name: '示例字幕候选', file_name: null, source: 'moviepilot', language: 'zh-CN', format: null, package_scope: 'season_pack', season: target.season, episode: null, seasons: target.season == null ? [] : [target.season], episodes: [], translation_type: 'human', hearing_impaired: false, rating: null, votes: null, downloads: null, uploaded_at: null, query: 'Example', source_details: { site_name: '示例站点' } }],
+        source: 'moviepilot', status: 'success', default_plans: target.search_plans.moviepilot, matched_query: 'Example Show', candidate_count: 1, cache_hit: false, duration_ms: 320, error_code: null, error_summary: null, retry_after_seconds: null,
+        candidates: [{ candidate_key: 'mock-moviepilot', recognition_status: 'recognized', name: '示例字幕候选', file_name: null, source: 'moviepilot', language: 'zh-CN', format: 'UNKNOWN', package_scope: 'season_pack', season: target.season, episode: null, seasons: target.season == null ? [] : [target.season], episodes: [], translation_type: 'human', hearing_impaired: false }],
       },
-      { source: 'opensubtitles', status: 'limited', default_plans: target.search_plans.opensubtitles, executed_queries: ['Example Show'], matched_query: null, candidate_count: 0, duration_ms: 410, error_summary: '来源分页未完整返回，已保留当前可用结果。', details: { cache: [{ query: 'Example Show', state: 'hit', hit: true, stored: false, stored_at: iso(120_000), ttl_seconds: 1800 }], pagination: [{ query: 'Example Show', pages_fetched: 1, complete: false, failed_page: 2, cached: true }] }, candidates: [] },
-      { source: 'assrt', status: 'success', default_plans: target.search_plans.assrt, executed_queries: [target.media_title], matched_query: null, candidate_count: 1, duration_ms: 280, error_summary: null, details: { cache: [{ query: target.media_title, state: 'miss', hit: false, stored: true, stored_at: null, ttl_seconds: 1800 }], pagination: [{ query: target.media_title, pages_fetched: 1, complete: true, failed_page: null, cached: false }] }, candidates: [{ candidate_key: 'mock-assrt-unrecognized', recognition_status: 'unrecognized', name: '范围冲突示例候选', file_name: 'Example.Show.S01E04.zh-Hans.srt', source: 'assrt', language: 'en', format: 'SRT', package_scope: 'episode', season: target.season, episode: target.episode == null ? null : target.episode + 1, seasons: target.season == null ? [] : [target.season], episodes: target.episode == null ? [] : [target.episode + 1], translation_type: 'unknown', hearing_impaired: false, rating: null, votes: null, downloads: null, uploaded_at: null, query: target.media_title, source_details: { native_name: '开发壳范围冲突候选' } }] },
+      { source: 'opensubtitles', status: 'partial', default_plans: target.search_plans.opensubtitles, matched_query: 'Example Show', candidate_count: 0, cache_hit: true, duration_ms: 410, error_code: 'temporary_unavailable', error_summary: '来源分页未完整返回，已保留当前可用结果。', retry_after_seconds: null, candidates: [] },
+      { source: 'assrt', status: 'limited', default_plans: target.search_plans.assrt, matched_query: null, candidate_count: 1, cache_hit: false, duration_ms: 280, error_code: 'limited', error_summary: '来源请求受限，请稍后重试。', retry_after_seconds: 20, candidates: [{ candidate_key: 'mock-assrt-unrecognized', recognition_status: 'unrecognized', name: '范围冲突示例候选', file_name: 'Example.Show.S01E04.zh-Hans.srt', source: 'assrt', language: 'en', format: 'SRT', package_scope: 'episode', season: target.season, episode: target.episode == null ? null : target.episode + 1, seasons: target.season == null ? [] : [target.season], episodes: target.episode == null ? [] : [target.episode + 1], translation_type: 'unknown', hearing_impaired: false }] },
     ],
   }
 
@@ -814,19 +744,37 @@ function mockSearchResponse(target: TargetItem, variant: SearchMockVariant = 'no
     }
   }
 
+  if (variant === 'source-error') {
+    return {
+      ...response,
+      sources: response.sources.map(source => source.source === 'opensubtitles'
+        ? {
+            ...source,
+            status: 'error',
+            matched_query: null,
+            candidate_count: 0,
+            error_code: 'temporary_unavailable',
+            error_summary: '来源暂时不可用，请稍后重试。',
+            retry_after_seconds: null,
+            candidates: [],
+          }
+        : source,
+      ),
+    }
+  }
+
   if (variant === 'refreshed') {
     return {
       ...response,
       session_id: 'mock-search-session-refreshed',
       sources: response.sources.map(source => ({
         ...source,
-        executed_queries: source.executed_queries.map(query => `${query} · 新条件`),
+        default_plans: source.default_plans.map(plan => ({ ...plan, query: plan.query ? `${plan.query} · 新条件` : plan.query })),
         matched_query: source.matched_query ? `${source.matched_query} · 新条件` : null,
         candidates: source.candidates.map(candidate => ({
           ...candidate,
           candidate_key: `${candidate.candidate_key}-refreshed`,
           name: `${candidate.name}（新条件）`,
-          query: candidate.query ? `${candidate.query} · 新条件` : candidate.query,
         })),
       })),
     }

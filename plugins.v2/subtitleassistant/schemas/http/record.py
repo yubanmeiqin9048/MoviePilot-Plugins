@@ -7,14 +7,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field, field_validator, model_validator
+from pydantic import BeforeValidator, Field, model_validator
 
 from ...schemas.attribution import (
-    AI_ATTRIBUTION_EVIDENCE_CODES,
-    AiAttributionConfidence,
-    AiAttributionDecision,
-    AiAttributionOutcome,
-    AttributionEvidence,
     FileAttributionMethod,
     PackageAttributionStrategy,
     UnmatchedReason,
@@ -37,7 +32,7 @@ from ..base import utc_now
 from .base import ApiModel
 from .page import PageSize
 from .target import TargetListItem
-from .task import CandidateAttributionSnapshot, PathMappingSnapshot
+from .task import PathMappingSnapshot
 
 __all__ = [
     "BatchRecordDeleteConfirmation",
@@ -122,68 +117,14 @@ _FileAttributionMethodOptional = Annotated[
     FileAttributionMethod | None,
     BeforeValidator(_enum_parser(FileAttributionMethod)),
 ]
-_AttributionEvidence = Annotated[AttributionEvidence, BeforeValidator(_enum_parser(AttributionEvidence))]
 _UnmatchedReasonOptional = Annotated[UnmatchedReason | None, BeforeValidator(_enum_parser(UnmatchedReason))]
 _TranslationType = Annotated[TranslationType, BeforeValidator(_enum_parser(TranslationType))]
 _PackageStrategy = Annotated[PackageAttributionStrategy, BeforeValidator(_enum_parser(PackageAttributionStrategy))]
-_AiDecision = Annotated[AiAttributionDecision, BeforeValidator(_enum_parser(AiAttributionDecision))]
-_AiConfidenceOptional = Annotated[
-    AiAttributionConfidence | None,
-    BeforeValidator(_enum_parser(AiAttributionConfidence)),
-]
-_AiOutcome = Annotated[AiAttributionOutcome, BeforeValidator(_enum_parser(AiAttributionOutcome))]
 _DateTime = Annotated[datetime, BeforeValidator(_datetime_parser)]
 _DateTimeOptional = Annotated[datetime | None, BeforeValidator(_datetime_parser)]
 _HistoryId = Annotated[int, BeforeValidator(_history_id_parser)]
 _HistoryIdOptional = Annotated[int | None, BeforeValidator(_history_id_parser)]
 _PageSize = Annotated[PageSize, BeforeValidator(_page_size_parser)]
-
-
-_PathMappingSnapshot = PathMappingSnapshot
-
-
-_CandidateAttributionSnapshot = CandidateAttributionSnapshot
-
-
-class AiAttributionAudit(ApiModel):
-    """记录字幕 AI 接管审计的 HTTP 投影。"""
-
-    attempted_at: _DateTime = Field(default_factory=utc_now)
-    strategy_version: str = Field(default="1", max_length=16, pattern=r"^[A-Za-z0-9._-]+$")
-    provider: str | None = Field(default=None, max_length=128)
-    model: str | None = Field(default=None, max_length=128)
-    before_strategy: _PackageStrategy
-    original_unmatched_reason: _UnmatchedReasonOptional = None
-    trigger_reason: str = Field(max_length=64, pattern=r"^[a-z0-9_]+$")
-    outcome: _AiOutcome
-    reason_code: str = Field(max_length=64, pattern=r"^[a-z0-9_]+$")
-    media_type: _MediaType = MediaType.UNKNOWN
-    tmdb_id: int | None = Field(default=None, ge=0, le=2_147_483_647, strict=True)
-    imdb_id: str | None = Field(default=None, max_length=64, pattern=r"^(?:tt)?[0-9]{1,20}$")
-    season: int | None = Field(default=None, ge=0, le=9999, strict=True)
-    episode: int | None = Field(default=None, ge=0, le=9999, strict=True)
-    confidence: _AiConfidenceOptional = None
-    evidence_codes: list[str] = Field(default_factory=list, max_length=12)
-
-    @field_validator("evidence_codes")
-    @classmethod
-    def _validate_evidence_codes(cls, values: list[str]) -> list[str]:
-        """限制审计证据码为固定白名单且不得重复。"""
-
-        if any(code not in AI_ATTRIBUTION_EVIDENCE_CODES for code in values):
-            raise ValueError("AI 审计证据码不在允许集合中")
-        if len(set(values)) != len(values):
-            raise ValueError("AI 审计证据码不能重复")
-        return values
-
-    @property
-    def result(self) -> AiAttributionOutcome:
-        """兼容 API 文档使用的 result 命名。"""
-
-        return self.outcome
-
-
-_AiAttributionAudit = AiAttributionAudit
 
 
 class RetargetHistoryEntry(ApiModel):
@@ -196,11 +137,9 @@ class RetargetHistoryEntry(ApiModel):
     new_history_target_path: str | None = None
     old_target_path: str | None = None
     new_target_path: str
+    new_matched_path_mapping: PathMappingSnapshot | None = None
     old_subtitle_path: str
     new_subtitle_path: str
-
-
-_RetargetHistoryEntry = RetargetHistoryEntry
 
 
 class RecordListItem(ApiModel):
@@ -236,28 +175,21 @@ class RecordDetail(RecordListItem):
     canonical_identity_value: str | None
     tmdb_id: int | None
     imdb_id: str | None
-    matched_path_mapping: _PathMappingSnapshot | None
+    matched_path_mapping: PathMappingSnapshot | None
     target_file_exists: bool | None
     final_subtitle_path: str | None
     source_task_id: str
     consumed_task_id: str | None
     candidate_key: str
     candidate_name: str | None
-    candidate_attribution_snapshot: _CandidateAttributionSnapshot | None
     logical_source_path: str | None
     file_attribution_method: _FileAttributionMethodOptional
-    season_evidence: _AttributionEvidence
-    episode_evidence: _AttributionEvidence
     unmatched_reason: _UnmatchedReasonOptional
-    # 宿主识别摘要是既有 API 的开放投影。HTTP 外层仍严格校验字段
-    # 集合；摘要内容由宿主识别 adapter 定义，不能错误收窄为 JSON 值。
-    host_recognition_summary: dict[str, object]
     language: str
     translation_type: _TranslationType
     hearing_impaired: bool
     staged_at: _DateTimeOptional
-    retarget_history: list[_RetargetHistoryEntry]
-    ai_takeover_audit: _AiAttributionAudit | None = None
+    retarget_history: list[RetargetHistoryEntry]
 
 
 class RecordDeleteRequest(ApiModel):

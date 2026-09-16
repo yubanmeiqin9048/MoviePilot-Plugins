@@ -19,15 +19,13 @@ from ..config import load_config, public_config
 from ..event import SubtitleEvents
 from ..file import ArchiveExtractor, SubtitleFiles
 from ..record import RecordCatalog, RecordCommitter, RecordMaintenance
-from ..schemas.attribution import CandidateMatchContext
 from ..schemas.config import PluginConfig
 from ..schemas.source import SourceHealth, SourceStatus, SubtitleSource
-from ..schemas.target import MediaType, SubtitleTarget
 from ..schemas.task import TaskWorkItem
 from ..search import ManualSearch
 from ..source import SourceAdministration
 from ..store import PluginDataStore, StoreInitializationError
-from ..target import TargetCatalog
+from ..target import TargetCatalog, build_media_context, match_context_from_mediainfo
 from ..task import TaskOperations
 
 _PLUGIN_INSTANCES: weakref.WeakValueDictionary[str, PluginRuntime] = weakref.WeakValueDictionary()
@@ -66,108 +64,6 @@ def _handle_plugin_data_reset(event: Event) -> None:
     runtime = _PLUGIN_INSTANCES.get(str(plugin_id))
     if runtime is not None:
         runtime.reset_data_sync()
-
-
-def build_media_context(target: Any, meta: Any, mediainfo: Any) -> SubtitleTarget | None:
-    """在宿主整理事件边界投影安全的字幕目标。"""
-
-    path_value = getattr(target, "path", None)
-    if not isinstance(path_value, str) or not path_value.strip():
-        return None
-    target_name = str(getattr(target, "name", None) or Path(path_value).name)
-    media_title = str(
-        getattr(mediainfo, "title", None)
-        or getattr(meta, "name", None)
-        or getattr(meta, "cn_name", None)
-        or getattr(meta, "en_name", None)
-        or Path(path_value).stem
-    ).strip()
-    media_type_value = getattr(getattr(mediainfo, "type", None), "name", None) or str(
-        getattr(getattr(mediainfo, "type", None), "value", "")
-    )
-    media_type = MediaType.TV if media_type_value.upper() in {"TV", "电视剧"} else MediaType.MOVIE
-    year_value = getattr(mediainfo, "year", None) or getattr(meta, "year", None)
-    try:
-        year = int(year_value) if year_value not in (None, "") else None
-    except (TypeError, ValueError):
-        year = None
-    season = getattr(mediainfo, "season", None) or getattr(meta, "begin_season", None)
-    episode = getattr(meta, "begin_episode", None)
-    try:
-        season = int(season) if season is not None else None
-    except (TypeError, ValueError):
-        season = None
-    try:
-        episode = int(episode) if episode is not None else None
-    except (TypeError, ValueError):
-        episode = None
-    tmdb_id = getattr(mediainfo, "tmdb_id", None) or getattr(meta, "tmdbid", None)
-    try:
-        tmdb_id = int(tmdb_id) if tmdb_id not in (None, "") else None
-    except (TypeError, ValueError):
-        tmdb_id = None
-    return SubtitleTarget(
-        title=media_title,
-        original_title=getattr(mediainfo, "original_title", None),
-        english_title=getattr(mediainfo, "en_title", None),
-        year=year,
-        media_type=media_type,
-        season=season,
-        episode=episode,
-        tmdb_id=tmdb_id,
-        imdb_id=getattr(mediainfo, "imdb_id", None),
-        target_path=Path(path_value),
-        target_file_name=target_name,
-        target_storage=getattr(target, "storage", None),
-        target_type=str(getattr(target, "type", None) or "file"),
-        target_extension=str(getattr(target, "extension", None) or Path(path_value).suffix).lstrip("."),
-        target_container=getattr(target, "container", None),
-    )
-
-
-def build_match_context(context: SubtitleTarget, mediainfo: Any) -> CandidateMatchContext | None:
-    """在宿主整理事件边界投影候选识别所需事实。"""
-
-    if mediainfo is None:
-        return None
-    aliases: list[str] = []
-    for value in (
-        getattr(mediainfo, "en_title", None),
-        getattr(mediainfo, "original_title", None),
-        *(getattr(mediainfo, "names", None) or []),
-    ):
-        if isinstance(value, str) and value.strip() and value.strip() not in aliases:
-            aliases.append(value.strip())
-    season_years = tuple(
-        (str(season), str(year))
-        for season, year in (getattr(mediainfo, "season_years", None) or {}).items()
-        if year not in (None, "")
-    )
-    raw_douban_id = getattr(mediainfo, "douban_id", None)
-    douban_id = str(raw_douban_id).strip() if raw_douban_id not in (None, "") else None
-    raw_bangumi_id = getattr(mediainfo, "bangumi_id", None)
-    raw_anilist_id = getattr(mediainfo, "anilist_id", None)
-    try:
-        bangumi_id = int(raw_bangumi_id) if raw_bangumi_id not in (None, "") else None
-    except (TypeError, ValueError):
-        bangumi_id = None
-    try:
-        anilist_id = int(raw_anilist_id) if raw_anilist_id not in (None, "") else None
-    except (TypeError, ValueError):
-        anilist_id = None
-    return CandidateMatchContext(
-        title=str(getattr(mediainfo, "title", None) or context.title),
-        aliases=tuple(aliases),
-        original_title=getattr(mediainfo, "original_title", None) or context.original_title,
-        year=context.year,
-        media_type=context.media_type,
-        tmdb_id=context.tmdb_id,
-        imdb_id=context.imdb_id,
-        douban_id=douban_id,
-        bangumi_id=bangumi_id,
-        anilist_id=anilist_id,
-        season_years=season_years,
-    )
 
 
 class RuntimeInitializationError(RuntimeError):
@@ -224,23 +120,19 @@ class PluginRuntime:
             records=store.list_records_sync(),
             format_priority=self.config.format_priority,
             source_priority=[source.value for source in self.config.source_priority],
-            publisher=publisher,
         )
         opensubtitles_credentials = store.get_credentials_sync(SubtitleSource.OPENSUBTITLES)
         assrt_credentials = store.get_credentials_sync(SubtitleSource.ASSRT)
-        allowed_formats = set(settings.RMT_SUBEXT)
         source_service = SourceAdministration.build(
             moviepilot_enabled=self.config.moviepilot_enabled,
             opensubtitles_enabled=self.config.opensubtitles_enabled,
             assrt_enabled=self.config.assrt_enabled,
             opensubtitles_credentials=opensubtitles_credentials,
             assrt_credentials=assrt_credentials,
-            allowed_formats=allowed_formats,
             store=store,
         )
-        # AI 接管适配器只持有当前配置读取器，不保存任务结果；每个批次由适配器
-        # 再次检查插件开关与 MoviePilot 总开关，避免把初始化时状态固化进任务。
-        matcher = FileAttributor(config_provider=lambda: self.config)
+        # 归属 facade 只走规则路径；候选识别与文件归属共享同一实现。
+        matcher = FileAttributor()
         targets = TargetCatalog(config_provider=lambda: self.config)
         archive = ArchiveExtractor()
         coordinator = TaskOperations(
@@ -256,6 +148,7 @@ class PluginRuntime:
             candidate_pool=source_service,
             target_catalog=targets,
             manage_resources=False,
+            publisher=publisher,
         )
         self.store = store
         self.filesystem = filesystem
@@ -336,7 +229,6 @@ class PluginRuntime:
         return [], public_config(
             self.config,
             plugin_id=self._plugin_id,
-            host_ai_enabled=bool(getattr(settings, "AI_AGENT_ENABLE", False)),
             allowed_formats=[str(item).lstrip(".").upper() for item in settings.RMT_SUBEXT],
             opensubtitles_configured=opensubtitles_configured,
             assrt_configured=assrt_configured,
@@ -370,23 +262,29 @@ class PluginRuntime:
         await self.coordinator.enqueue(
             TaskWorkItem(
                 context=context,
-                match_context=build_match_context(context, data.get("mediainfo")),
+                match_context=match_context_from_mediainfo(context, data.get("mediainfo")),
                 target_history_id=history_id,
+                history_target=False,
             )
         )
 
     async def update_source_credentials(self, source: SubtitleSource, values: dict[str, str]) -> bool:
-        """增量保存外部来源凭据并返回配置完整状态。"""
+        """校验并持久化来源凭据，有运行态时按新凭据重建来源层。"""
 
         if self.store is None:
             raise RuntimeError("插件数据尚未初始化")
-        source_service = getattr(self, "source_service", None)
-        if source_service is not None:
-            return await source_service.update_credentials(source, values)
-        return await self.store.update_credentials(source, values)
+        allowed_fields = {
+            SubtitleSource.OPENSUBTITLES: {"api_key", "username", "password"},
+            SubtitleSource.ASSRT: {"token"},
+        }.get(source, set())
+        if not values or set(values) - allowed_fields:
+            raise ValueError("请求包含不属于该字幕源的凭据字段")
+        configured = await self.store.update_credentials(source, values)
+        self._rebuild_sources()
+        return configured
 
     async def clear_source_credentials(self, source: SubtitleSource) -> bool:
-        """删除来源凭据、立即停用来源并保存非敏感开关。"""
+        """删除来源凭据、持久化停用开关并标记来源为已停用。"""
 
         if self.store is None:
             raise RuntimeError("插件数据尚未初始化")
@@ -395,9 +293,8 @@ class PluginRuntime:
             self.config.opensubtitles_enabled = False
         elif source is SubtitleSource.ASSRT:
             self.config.assrt_enabled = False
-        source_service = getattr(self, "source_service", None)
-        if source_service is not None:
-            await source_service.clear_credentials(source)
+        persisted = bool(self._host.update_config(self.config.saved_payload(), plugin_id=self._plugin_id))
+        self._rebuild_sources()
         await self.store.save_source_status(
             SourceStatus(
                 source=source,
@@ -406,7 +303,37 @@ class PluginRuntime:
                 health=SourceHealth.DISABLED,
             )
         )
-        return bool(self._host.update_config(self.config.saved_payload(), plugin_id=self._plugin_id))
+        return persisted
+
+    def _source_enabled_map(self) -> dict[SubtitleSource, bool]:
+        """返回三个来源当前的启用开关。"""
+
+        return {
+            SubtitleSource.MOVIEPILOT: self.config.moviepilot_enabled,
+            SubtitleSource.OPENSUBTITLES: self.config.opensubtitles_enabled,
+            SubtitleSource.ASSRT: self.config.assrt_enabled,
+        }
+
+    def _source_credentials_map(self) -> dict[SubtitleSource, dict[str, str]]:
+        """返回持久化分区中的非敏感来源凭据快照。"""
+
+        if self.store is None:
+            return {}
+        return {
+            SubtitleSource.OPENSUBTITLES: self.store.get_credentials_sync(SubtitleSource.OPENSUBTITLES),
+            SubtitleSource.ASSRT: self.store.get_credentials_sync(SubtitleSource.ASSRT),
+        }
+
+    def _rebuild_sources(self) -> None:
+        """以当前开关与凭据整体重建来源运行实例集；无运行态时仅延迟传播。"""
+
+        source_service = self.source_service
+        if source_service is None:
+            return
+        source_service.rebuild(
+            enabled=self._source_enabled_map(),
+            credentials=self._source_credentials_map(),
+        )
 
     def reset_data_sync(self) -> None:
         """同步等待插件数据目录与分区在宿主删除前清理完成。"""

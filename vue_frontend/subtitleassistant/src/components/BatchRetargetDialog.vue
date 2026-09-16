@@ -14,7 +14,14 @@ import {
   type RecordListItem,
   type TargetItem,
 } from '@/types'
-import { historyId, historyLabel, mediaLabel, shortPath } from '@/types/presentation'
+import {
+  commonDirectory,
+  historyFileName,
+  historyId,
+  historyLabel,
+  mediaLabel,
+  relativeToDirectory,
+} from '@/types/presentation'
 
 interface BatchRow {
   record: RecordListItem
@@ -53,6 +60,8 @@ const collator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: '
 const { smAndDown } = useDisplay()
 const titleId = `subtitleassistant-batch-retarget-${useId()}`
 const { captureFocus, restoreFocus } = useDialogFocusReturn()
+const { captureFocus: capturePickerFocus, restoreFocus: restorePickerFocus } = useDialogFocusReturn()
+const mobilePickerTitleId = `subtitleassistant-batch-target-${useId()}`
 const rows = ref<BatchRow[]>([])
 const showCompleted = ref(false)
 const previewing = ref(false)
@@ -61,6 +70,7 @@ const generalError = ref('')
 const sortKey = ref<SortKey | null>(null)
 const sortDirection = ref<'asc' | 'desc'>('asc')
 const openPickerId = ref('')
+const mobilePickerId = ref('')
 /**
  * 「待处理优先」只在打开批次和提交之后各取一次快照。
  * 若每次改目标都重排，刚修好的行会立刻跳出待处理档，用户会丢失当前位置。
@@ -87,21 +97,10 @@ const blockedCount = computed(() => pendingRows.value.filter(row => !isReady(row
 const visibleRows = computed(() => showCompleted.value ? sortedRows.value : sortedRows.value.filter(row => !row.completed))
 
 /** 多条记录写入同一目录时把公共前缀提到表头写一次，行内只留差异部分。 */
-const commonDirectory = computed(() => {
-  const directories = rows.value
-    .map(row => row.preview?.preview?.final_subtitle_path)
-    .filter((path): path is string => Boolean(path))
-    .map(path => path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))))
-  if (directories.length < 2) return ''
-  let prefix = directories[0]
-  for (const directory of directories.slice(1)) {
-    while (prefix && !directory.startsWith(prefix)) {
-      prefix = prefix.slice(0, Math.max(prefix.lastIndexOf('/'), prefix.lastIndexOf('\\')))
-    }
-    if (!prefix) return ''
-  }
-  return prefix
-})
+const destinationRoot = computed(() => commonDirectory(
+  rows.value.map(row => row.preview?.preview?.final_subtitle_path),
+))
+const mobilePickerRow = computed(() => rows.value.find(row => row.record.id === mobilePickerId.value) || null)
 
 /**
  * 未选择排序时按「待处理优先」排：缺目标或预检不通过的在最前，已完成的在最后。
@@ -165,12 +164,26 @@ function sourceLabel(row: BatchRow): string {
 }
 
 function destinationText(row: BatchRow): string {
-  const path = row.preview?.preview?.final_subtitle_path
-  if (!path) return ''
-  if (commonDirectory.value && path.startsWith(commonDirectory.value)) {
-    return path.slice(commonDirectory.value.length + 1) || path
-  }
-  return shortPath(path)
+  return relativeToDirectory(row.preview?.preview?.final_subtitle_path, destinationRoot.value)
+}
+
+function sourcePath(row: BatchRow): string {
+  return row.preview?.current_subtitle_path || row.record.path || ''
+}
+
+function targetLabel(row: BatchRow): string {
+  return row.target && historyId(row.target) != null ? historyLabel(row.target) : '选择整理历史…'
+}
+
+/** 媒体名相同的两条整理历史按钮文案会完全一样；补一行目标文件名才能关掉弹层后复核。 */
+function targetFileName(row: BatchRow): string {
+  return row.target && historyId(row.target) != null ? historyFileName(row.target) : ''
+}
+
+function openMobilePicker(row: BatchRow): void {
+  if (saving.value || row.completed) return
+  capturePickerFocus()
+  mobilePickerId.value = row.record.id
 }
 
 function rowError(row: BatchRow): string {
@@ -211,6 +224,7 @@ watch(() => props.modelValue, open => {
   if (!open) {
     previewRequest += 1
     openPickerId.value = ''
+    mobilePickerId.value = ''
     return
   }
   captureFocus()
@@ -219,6 +233,7 @@ watch(() => props.modelValue, open => {
   sortKey.value = null
   sortDirection.value = 'asc'
   openPickerId.value = ''
+  mobilePickerId.value = ''
   captureTriageOrder()
   generalError.value = inputError.value
   if (inputError.value) return
@@ -268,6 +283,7 @@ async function previewAll(options: { preserveGeneralError?: boolean; resortTriag
 
 function updateTarget(recordId: string, target: HistoryRow | null): void {
   openPickerId.value = ''
+  mobilePickerId.value = ''
   rows.value = rows.value.map(row => row.record.id === recordId
     ? { ...row, target, preview: null, error: '', executionError: '' }
     : row)
@@ -278,6 +294,7 @@ function removeRow(row: BatchRow): void {
   if (saving.value || row.completed) return
   previewRequest += 1
   openPickerId.value = ''
+  mobilePickerId.value = ''
   rows.value = rows.value.filter(item => item.record.id !== row.record.id)
   triageOrder.value = triageOrder.value.filter(id => id !== row.record.id)
   emit('remove', row.record.id)
@@ -370,8 +387,8 @@ function handleDialogUpdate(open: boolean): void {
 
         <template v-if="rows.length">
           <div class="toolbar">
-            <p v-if="commonDirectory" class="toolbar__prefix">
-              共同目录 <code :title="commonDirectory">{{ commonDirectory }}</code>
+            <p v-if="destinationRoot" class="toolbar__prefix">
+              共同目录 <code :title="destinationRoot">{{ destinationRoot }}</code>
               <span>表中只显示相对该目录的差异</span>
             </p>
             <VSpacer />
@@ -445,45 +462,70 @@ function handleDialogUpdate(open: boolean): void {
                   </td>
                   <td class="cell-source" data-label="来源媒体">
                     {{ sourceLabel(row) }}
-                    <span class="cell-source__path" :title="row.preview?.current_subtitle_path || row.record.path">
-                      {{ shortPath(row.preview?.current_subtitle_path || row.record.path) }}
+                    <span class="cell-source__path" :title="sourcePath(row)">
+                      {{ sourcePath(row) || '未记录路径' }}
                     </span>
                   </td>
                   <td class="cell-target" data-label="改配到">
-                    <VMenu
-                      v-if="!row.completed"
-                      :model-value="openPickerId === row.record.id"
-                      :close-on-content-click="false"
-                      location="bottom start"
-                      min-width="min(32rem, 92vw)"
-                      @update:model-value="open => openPickerId = open ? row.record.id : ''"
-                    >
-                      <template #activator="{ props: activator }">
-                        <button
-                          v-bind="activator"
-                          type="button"
-                          class="target-button"
-                          :class="{ 'target-button--empty': !row.target || historyId(row.target) == null }"
-                          :disabled="saving"
-                        >
-                          <span>{{ row.target && historyId(row.target) != null ? historyLabel(row.target) : '选择整理历史…' }}</span>
-                          <VIcon icon="mdi-menu-down" size="18" />
-                        </button>
-                      </template>
-                      <VCard class="target-panel">
-                        <TargetSelector
-                          :model-value="row.target"
-                          :api="api"
-                          :plugin-id="pluginId"
-                          :show-heading="false"
-                          :disabled="saving"
-                          searchable
-                          compact
-                          fill-height
-                          @update:model-value="updateTarget(row.record.id, $event)"
-                        />
-                      </VCard>
-                    </VMenu>
+                    <template v-if="!row.completed">
+                      <!--
+                        height 必须走 VMenu 的 prop：它写成 .v-overlay__content 的行内样式，
+                        而写在 .target-panel 上会被 .v-menu>.v-overlay__content>.v-card{height:100%}
+                        按特异性压掉，弹层就会跟着内容从半屏长到满屏并重新定位。
+                      -->
+                      <VMenu
+                        v-if="!smAndDown"
+                        :model-value="openPickerId === row.record.id"
+                        :close-on-content-click="false"
+                        location="bottom start"
+                        min-width="min(32rem, 92vw)"
+                        height="min(24rem, 70dvh)"
+                        @update:model-value="open => openPickerId = open ? row.record.id : ''"
+                      >
+                        <template #activator="{ props: activator }">
+                          <button
+                            v-bind="activator"
+                            type="button"
+                            class="target-button"
+                            :class="{ 'target-button--empty': !row.target || historyId(row.target) == null }"
+                            :disabled="saving"
+                          >
+                            <span class="target-button__text">
+                              <span class="target-button__label">{{ targetLabel(row) }}</span>
+                              <span v-if="targetFileName(row)" class="target-button__file">{{ targetFileName(row) }}</span>
+                            </span>
+                            <VIcon icon="mdi-menu-down" size="18" />
+                          </button>
+                        </template>
+                        <VCard class="target-panel">
+                          <TargetSelector
+                            :model-value="row.target"
+                            :api="api"
+                            :plugin-id="pluginId"
+                            :show-heading="false"
+                            :disabled="saving"
+                            searchable
+                            compact
+                            fill-height
+                            @update:model-value="updateTarget(row.record.id, $event)"
+                          />
+                        </VCard>
+                      </VMenu>
+                      <button
+                        v-else
+                        type="button"
+                        class="target-button"
+                        :class="{ 'target-button--empty': !row.target || historyId(row.target) == null }"
+                        :disabled="saving"
+                        @click="openMobilePicker(row)"
+                      >
+                        <span class="target-button__text">
+                          <span class="target-button__label">{{ targetLabel(row) }}</span>
+                          <span v-if="targetFileName(row)" class="target-button__file">{{ targetFileName(row) }}</span>
+                        </span>
+                        <VIcon icon="mdi-chevron-right" size="18" />
+                      </button>
+                    </template>
                     <span v-else class="target-button target-button--static">{{ row.target ? historyLabel(row.target) : '—' }}</span>
                   </td>
                   <td class="cell-destination" data-label="改配后字幕">
@@ -521,6 +563,50 @@ function handleDialogUpdate(open: boolean): void {
         </VBtn>
       </VCardActions>
     </VCard>
+
+    <!--
+      窄屏不用锚定下拉：形态在打开前由屏宽决定，不会等数据到达才知道该占多大。
+      选中即应用并关闭，回到表格能直接看到预检结果。
+    -->
+    <VDialog
+      v-if="smAndDown"
+      :model-value="Boolean(mobilePickerRow)"
+      fullscreen
+      scrollable
+      retain-focus
+      :aria-labelledby="mobilePickerTitleId"
+      @update:model-value="open => { if (!open) mobilePickerId = '' }"
+      @after-leave="restorePickerFocus"
+    >
+      <VCard class="mobile-picker">
+        <VCardTitle class="mobile-picker__title">
+          <div>
+            <span :id="mobilePickerTitleId">选择整理历史</span>
+            <small>{{ mobilePickerRow?.record.subtitle_file_name }}</small>
+          </div>
+          <VBtn
+            icon="mdi-close"
+            variant="text"
+            aria-label="关闭整理历史选择"
+            @click="mobilePickerId = ''"
+          />
+        </VCardTitle>
+        <VCardText class="mobile-picker__content">
+          <TargetSelector
+            v-if="mobilePickerRow"
+            :model-value="mobilePickerRow.target"
+            :api="api"
+            :plugin-id="pluginId"
+            :show-heading="false"
+            :disabled="saving"
+            searchable
+            compact
+            fill-height
+            @update:model-value="updateTarget(mobilePickerId, $event)"
+          />
+        </VCardText>
+      </VCard>
+    </VDialog>
   </VDialog>
 </template>
 
@@ -563,7 +649,8 @@ function handleDialogUpdate(open: boolean): void {
 .tone-error { color: rgb(var(--v-theme-error)); }
 .tone-muted { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); }
 .cell-source { max-width: 13rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; }
-.cell-source__path { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 判断改配目标要看完整路径，尤其是决定路径映射是否命中的库根前缀；换行而不是截断。 */
+.cell-source__path { display: block; overflow-wrap: anywhere; }
 .cell-destination code { font-size: 0.75rem; overflow-wrap: anywhere; }
 .cell-actions { width: 2.75rem; }
 .muted { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); }
@@ -575,10 +662,22 @@ function handleDialogUpdate(open: boolean): void {
 .target-button:hover:not(:disabled) { border-color: rgba(var(--v-theme-primary), 0.6); background: rgba(var(--v-theme-primary), 0.06); }
 .target-button:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 1px; }
 .target-button:disabled { cursor: default; opacity: 0.6; }
-.target-button > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.target-button__text { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; }
+.target-button__label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.target-button__file { max-width: 100%; overflow: hidden; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.6875rem; text-overflow: ellipsis; white-space: nowrap; }
 .target-button--empty { border-color: rgba(var(--v-theme-warning), 0.7); color: rgb(var(--v-theme-warning)); background: rgba(var(--v-theme-warning), 0.07); }
 .target-button--static { border-style: dashed; cursor: default; }
-.target-panel { display: flex; block-size: min(24rem, 70dvh); flex-direction: column; padding: 0.625rem; }
+/* 高度由 VMenu 的 height prop 给出，这里只排内部；写 block-size 会被 Vuetify 的 .v-card 压掉。 */
+.target-panel { display: flex; flex-direction: column; padding: 0.625rem; }
+
+.mobile-picker { display: flex; max-block-size: 100dvh; flex-direction: column; overflow: hidden; }
+.mobile-picker__title { display: flex; flex: 0 0 auto; align-items: flex-start; justify-content: space-between; gap: 1rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); white-space: normal; }
+.mobile-picker__title > div { min-width: 0; flex: 1 1 auto; }
+.mobile-picker__title > :deep(.v-btn) { flex: 0 0 auto; }
+.mobile-picker__title span, .mobile-picker__title small { display: block; }
+.mobile-picker__title span { font-size: 1rem; font-weight: 650; }
+.mobile-picker__title small { margin-top: 0.25rem; overflow-wrap: anywhere; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; font-weight: 400; line-height: 1.5; }
+.mobile-picker__content { display: flex; min-block-size: 0; flex: 1 1 auto; flex-direction: column; overflow: hidden !important; padding: 0.875rem 1rem; }
 
 .dialog-actions { flex: 0 0 auto; padding: 0.75rem 1.25rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .action-summary { min-width: 0; overflow: hidden; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; text-overflow: ellipsis; white-space: nowrap; }
@@ -619,7 +718,7 @@ function handleDialogUpdate(open: boolean): void {
   /* 目标是主控件，占满整行；截断它等于把关键信息藏起来。 */
   .cell-target { padding-block: 0.35rem !important; }
   .target-button { width: 100%; }
-  .target-button > span { white-space: normal; }
+  .target-button__label { white-space: normal; }
   /* 移出按钮脱离文档流，宽度不能被上面的块级规则接管。 */
   .batch-table tbody td.cell-actions { position: absolute; top: 0.35rem; right: 0.35rem; width: auto; padding: 0; }
 }

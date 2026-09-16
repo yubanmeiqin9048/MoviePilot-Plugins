@@ -3,25 +3,35 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlparse
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from app.core.config import settings
 from app.utils.http import AsyncRequestUtils
 
-from ..schemas.base import elapsed_ms, utc_now
+from ..schemas.base import utc_now
 from ..schemas.candidate import PackageScope, SubtitleCandidate, TranslationType
 from ..schemas.source import (
     CandidateHandle,
     DownloadedAsset,
-    OpaqueCandidateHandle,
-    SourceHealth,
-    SourceStatus,
+    OpenSubtitlesDownloadHandle,
+    SourceErrorCode,
     SubtitleSource,
 )
 from ..schemas.target import MediaType, SubtitleTarget
+from .base import (
+    SourceCachePort,
+    SourcePage,
+    SourcePlan,
+    SourcePlanKind,
+    SourcePlanQuery,
+    SourceProbe,
+    SubtitleSourceBase,
+)
 from .common import (
     SourceLimitedError,
     SourceRequestError,
@@ -31,70 +41,63 @@ from .common import (
     safe_file_name,
     subtitle_format,
 )
-from .pool import (
-    CandidatePage,
-    CandidatePoolQueryError,
-    CandidatePoolQueryLimitedError,
-    SourceQuery,
-    SourceQueryPlan,
-)
 
 
-class OpenSubtitlesSource:
+class _OpenSubtitlesRawPage(BaseModel):
+    """OpenSubtitles adapter 私有的原始分页 envelope。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    data: list[JsonValue] = Field(default_factory=list)
+    total_pages: int | None = None
+
+
+class _OpenSubtitlesRawItem(BaseModel):
+    """OpenSubtitles 单项原始候选的私有校验模型。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    id: int | str | None = None
+    attributes: dict[str, JsonValue]
+
+
+class _OpenSubtitlesRawFile(BaseModel):
+    """OpenSubtitles 候选文件定位的私有校验模型。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    file_id: int | str | None = None
+    file_name: str | None = None
+
+
+class OpenSubtitlesSource(SubtitleSourceBase):
     """按媒体 ID、英文标题串行查询 OpenSubtitles 来源候选池。"""
 
     source = SubtitleSource.OPENSUBTITLES
     BASE_URL = "https://api.opensubtitles.com/api/v1"
     USER_AGENT = "MoviePilot SubtitleAssistant/0.1.0"
-
-    @staticmethod
-    def _opaque_payload(handle: CandidateHandle) -> dict[str, Any] | None:
-        """解码 OpenSubtitles 来源的内部下载句柄。"""
-
-        if not isinstance(handle.opaque, OpaqueCandidateHandle):
-            return None
-        try:
-            payload = json.loads(handle.opaque.token)
-        except (TypeError, ValueError):
-            return None
-        return payload if isinstance(payload, dict) else None
+    CACHE_TTL_SECONDS = 30 * 60
 
     def __init__(
         self,
         enabled: bool,
         credentials: dict[str, str],
-        allowed_formats: set[str],
+        cache: SourceCachePort | None = None,
     ) -> None:
         """创建 OpenSubtitles 来源适配器。"""
 
-        self.enabled = enabled
+        super().__init__(enabled=enabled, cache=cache)
         self._credentials = dict(credentials)
-        self._allowed_formats = {item.upper().lstrip(".") for item in allowed_formats}
         self._jwt: str | None = None
+        self._base_url = self.BASE_URL
         self._cooldown_until: datetime | None = None
         self._login_lock = asyncio.Lock()
-        self._last_details: dict[str, Any] = {}
-        self._credential_generation = 0
 
     @property
     def configured(self) -> bool:
         """判断下载所需长期凭据是否完整。"""
 
         return all(self._credentials.get(key, "").strip() for key in ("api_key", "username", "password"))
-
-    async def replace_credentials(self, credentials: dict[str, str]) -> None:
-        """替换运行期凭据并推进来源查询配置代次。"""
-
-        self._credentials = dict(credentials)
-        self._jwt = None
-        self._cooldown_until = None
-        self._credential_generation += 1
-
-    @property
-    def configuration_generation(self) -> int:
-        """返回影响来源候选缓存身份的凭据配置代次。"""
-
-        return self._credential_generation
 
     def _headers(self, authenticated: bool = False) -> dict[str, str]:
         """构造不写入日志的 OpenSubtitles 请求头。"""
@@ -109,6 +112,30 @@ class OpenSubtitlesSource:
             headers["Authorization"] = f"Bearer {self._jwt}"
         return headers
 
+    @staticmethod
+    def _normalize_base_url(value: Any) -> str | None:
+        """校验登录响应中的 API 主机并归一为 `/api/v1` 根地址。"""
+
+        if not isinstance(value, str) or not value.strip():
+            return None
+        raw = value.strip()
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            return None
+        if parsed.query or parsed.fragment:
+            return None
+        path = parsed.path.rstrip("/")
+        if path in ("", "/api/v1"):
+            path = "/api/v1"
+        else:
+            return None
+        return f"https://{parsed.netloc}{path}"
+
+    def _api_url(self, path: str) -> str:
+        """拼接当前登录会话选定的 API 根地址。"""
+
+        return f"{self._base_url}{path}"
+
     def _ensure_available(self) -> None:
         """在明确冷却期内跳过后续来源请求。"""
 
@@ -119,7 +146,8 @@ class OpenSubtitlesSource:
     def _mark_limited(self, response: Any) -> datetime:
         """根据 Retry-After 或默认六十秒进入冷却。"""
 
-        retry_after = response.headers.get("Retry-After") if response is not None else None
+        headers = getattr(response, "headers", {}) if response is not None else {}
+        retry_after = headers.get("Retry-After") if headers is not None else None
         try:
             seconds = max(1, int(retry_after if retry_after is not None else 60))
         except (TypeError, ValueError):
@@ -204,25 +232,39 @@ class OpenSubtitlesSource:
             return defaults, [(custom, "custom", custom_params)]
         return defaults, plan
 
-    def query_plan(
-        self,
-        context: SubtitleTarget,
-        custom_query: str | None,
-    ) -> SourceQueryPlan:
+    @staticmethod
+    def _identity_query(params: dict[str, Any]) -> str | None:
+        """从 OpenSubtitles 请求参数提取实际查询值：标题词或媒体 ID。"""
+
+        title = params.get("query")
+        if isinstance(title, str) and title:
+            return title
+        for key in ("parent_imdb_id", "parent_tmdb_id", "imdb_id", "tmdb_id"):
+            value = params.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
+    def _plan(self, context: SubtitleTarget, custom_query: str | None) -> SourcePlan:
         """根据媒体 ID、英文标题或自定义关键词生成有序查询计划。"""
 
-        defaults, plan = self._query_plan(context, custom_query)
+        _defaults, plan = self._query_plan(context, custom_query)
+        kinds: dict[str, SourcePlanKind] = {
+            "media_id": "id",
+            "english_title": "title",
+            "custom": "filename",
+        }
         queries = [
-            SourceQuery(
+            SourcePlanQuery(
                 label=label,
                 identity={"params": params},
-                query_type=query_type,
+                kind=kinds[query_type],
+                query=self._identity_query(params),
             )
             for label, query_type, params in plan
         ]
-        return SourceQueryPlan(
+        return SourcePlan(
             queries=queries,
-            default_queries=defaults,
             configured=self.configured,
         )
 
@@ -248,8 +290,8 @@ class OpenSubtitlesSource:
     def _normalize_pool(
         self,
         payload: dict[str, Any],
-        query: SourceQuery,
-    ) -> tuple[list[CandidateHandle], int, dict[str, int]]:
+        query: SourcePlanQuery,
+    ) -> tuple[list[CandidateHandle], int, dict[str, int], int]:
         """把单页响应归一为自动过滤前的来源候选池。"""
 
         params = query.identity.get("params")
@@ -257,10 +299,18 @@ class OpenSubtitlesSource:
         result: list[CandidateHandle] = []
         raw_count = 0
         rejected: dict[str, int] = {}
-        for item in payload.get("data") or []:
-            if not isinstance(item, dict):
+        malformed_count = 0
+        for item_value in payload.get("data") or []:
+            try:
+                item = _OpenSubtitlesRawItem.model_validate(item_value).model_dump()
+            except ValidationError:
+                malformed_count += 1
                 continue
-            attributes = item.get("attributes") or {}
+            attributes_value = item.get("attributes")
+            if not isinstance(attributes_value, dict):
+                malformed_count += 1
+                continue
+            attributes = cast(dict[str, Any], attributes_value)
             translation = TranslationType.HUMAN
             if bool(attributes.get("ai_translated")):
                 translation = TranslationType.AI
@@ -268,6 +318,9 @@ class OpenSubtitlesSource:
                 translation = TranslationType.MACHINE
             tmdb_id, imdb_id = self._candidate_ids(attributes, is_tv)
             feature = attributes.get("feature_details") or {}
+            if not isinstance(feature, dict):
+                malformed_count += 1
+                continue
             season = feature.get("season_number")
             episode = feature.get("episode_number")
             season_digits = str(season or "")
@@ -277,12 +330,14 @@ class OpenSubtitlesSource:
                 package_scope = PackageScope.SEASON_PACK
             files = attributes.get("files") or []
             if not files:
-                raw_count += 1
                 rejected["download_locator"] = rejected.get("download_locator", 0) + 1
-            for file_info in files:
-                if not isinstance(file_info, dict):
+            resource_id = str(item.get("id") or "").strip()
+            for file_value in files:
+                try:
+                    file_info = _OpenSubtitlesRawFile.model_validate(file_value).model_dump()
+                except ValidationError:
+                    malformed_count += 1
                     continue
-                raw_count += 1
                 try:
                     file_id = int(file_info.get("file_id"))
                 except (TypeError, ValueError):
@@ -291,9 +346,13 @@ class OpenSubtitlesSource:
                 if file_id <= 0:
                     rejected["download_locator"] = rejected.get("download_locator", 0) + 1
                     continue
+                if not resource_id:
+                    malformed_count += 1
+                    continue
+                raw_count += 1
                 file_name = str(file_info.get("file_name") or "")
                 candidate = SubtitleCandidate(
-                    stable_key=f"opensubtitles:{item.get('id')}:{file_info.get('file_id')}",
+                    candidate_key=f"opensubtitles:{resource_id}:{file_id}",
                     source=self.source,
                     name=str(attributes.get("release") or file_name or item.get("id") or "OpenSubtitles"),
                     file_name=file_name or None,
@@ -317,12 +376,10 @@ class OpenSubtitlesSource:
                 result.append(
                     CandidateHandle(
                         candidate=candidate,
-                        opaque=OpaqueCandidateHandle(
-                            token=json.dumps({"file_id": file_id}, separators=(",", ":"), sort_keys=True)
-                        ),
+                        download_handle=OpenSubtitlesDownloadHandle(file_id=file_id),
                     )
                 )
-        return result, raw_count, rejected
+        return result, raw_count, rejected, malformed_count
 
     async def _request_page(self, params: dict[str, Any], page: int) -> dict[str, Any]:
         """请求并校验一页 OpenSubtitles 搜索响应。"""
@@ -330,63 +387,63 @@ class OpenSubtitlesSource:
         self._ensure_available()
         request_params = {**params, "page": page}
         request = AsyncRequestUtils(headers=self._headers(), **_proxy_kwargs(settings.PROXY))
-        response = await request.get_res(f"{self.BASE_URL}/subtitles", params=request_params)
-        try:
-            if response is None:
-                raise SourceRequestError("OpenSubtitles 搜索请求失败")
-            if response.status_code == 429:
-                raise SourceLimitedError("OpenSubtitles 搜索暂时受限", retry_at=self._mark_limited(response))
-            if response.status_code >= 400:
-                raise SourceRequestError(f"OpenSubtitles 搜索返回 HTTP {response.status_code}")
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise SourceRequestError("OpenSubtitles 搜索响应结构无效")
-            return payload
-        except ValueError as exc:
-            raise SourceRequestError("OpenSubtitles 搜索响应无法解析") from exc
-        finally:
-            if response is not None:
-                await response.aclose()
+        for attempt in range(2):
+            response = await request.get_res(self._api_url("/subtitles"), params=request_params)
+            try:
+                if response is not None and response.status_code in {406, 429}:
+                    raise SourceLimitedError("OpenSubtitles 搜索暂时受限", retry_at=self._mark_limited(response))
+                if response is not None and response.status_code >= 500:
+                    if attempt == 0:
+                        continue
+                    raise SourceRequestError(
+                        "OpenSubtitles 搜索服务暂时不可用",
+                        SourceErrorCode.TEMPORARY_UNAVAILABLE,
+                    )
+                if response is None:
+                    raise SourceRequestError("OpenSubtitles 搜索请求失败")
+                if response.status_code in {401, 403}:
+                    raise SourceRequestError("OpenSubtitles 搜索凭据无效", SourceErrorCode.INVALID_CREDENTIALS)
+                if response.status_code >= 400:
+                    raise SourceRequestError("OpenSubtitles 搜索请求无效", SourceErrorCode.INVALID_REQUEST)
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise SourceRequestError("OpenSubtitles 搜索响应结构无效", SourceErrorCode.MALFORMED_RESPONSE)
+                return payload
+            except ValueError as exc:
+                raise SourceRequestError("OpenSubtitles 搜索响应无法解析", SourceErrorCode.MALFORMED_RESPONSE) from exc
+            finally:
+                if response is not None:
+                    await response.aclose()
+        raise SourceRequestError("OpenSubtitles 搜索服务暂时不可用", SourceErrorCode.TEMPORARY_UNAVAILABLE)
 
-    async def fetch_page(self, query: SourceQuery, page_number: int) -> CandidatePage:
-        """执行一页 OpenSubtitles 查询并归一化为安全候选。"""
+    async def _fetch_page(self, query: SourcePlanQuery, page: int) -> SourcePage:
+        """执行一次 OpenSubtitles 请求并归一化为安全候选页。"""
 
         params = query.identity.get("params")
         if not isinstance(params, dict):
             raise SourceRequestError("OpenSubtitles 查询参数无效")
         try:
-            payload = await self._request_page(dict(params), page_number)
+            payload = await self._request_page(dict(params), page)
         except SourceLimitedError as exc:
             if exc.retry_at:
                 self._last_details["limited_until"] = exc.retry_at.isoformat()
-            raise CandidatePoolQueryLimitedError(str(exc)) from exc
-        except SourceRequestError as exc:
-            raise CandidatePoolQueryError(str(exc)) from exc
-        handles, raw_count, rejected = self._normalize_pool(payload, query)
+            raise
         try:
-            total_pages = max(1, int(payload.get("total_pages") or 1))
+            raw_page = _OpenSubtitlesRawPage.model_validate(payload)
+        except ValidationError as exc:
+            raise SourceRequestError("OpenSubtitles 响应结构无效", SourceErrorCode.MALFORMED_RESPONSE) from exc
+        handles, raw_count, rejected, malformed_count = self._normalize_pool(raw_page.model_dump(), query)
+        try:
+            total_pages = max(1, int(raw_page.total_pages or 1))
         except (TypeError, ValueError):
             total_pages = 1
-        return CandidatePage(
+        return SourcePage(
             candidates=handles,
             raw_count=raw_count,
-            download_locator_excluded=rejected.get("download_locator", 0),
-            has_next=page_number < total_pages,
+            download_locator_excluded_count=rejected.get("download_locator", 0),
+            malformed_count=malformed_count,
+            has_next=page < total_pages,
         )
-
-    def is_valid_download_locator(self, handle: CandidateHandle) -> bool:
-        """判断候选句柄是否包含有效的 OpenSubtitles file ID。"""
-
-        if handle.candidate.source is not self.source:
-            return False
-        payload = self._opaque_payload(handle)
-        if payload is None:
-            return False
-        file_id = payload.get("file_id")
-        try:
-            return int(file_id) > 0 if isinstance(file_id, (str, int, float)) else False
-        except (TypeError, ValueError):
-            return False
 
     async def _login(self, force: bool = False) -> str:
         """合并并发登录并把 JWT 仅保存在当前运行内存。"""
@@ -413,6 +470,10 @@ class OpenSubtitlesSource:
                 token = payload.get("token") if isinstance(payload, dict) else None
                 if not isinstance(token, str) or not token:
                     raise SourceRequestError("OpenSubtitles 登录响应缺少会话")
+                base_url = self._normalize_base_url(payload.get("base_url") if isinstance(payload, dict) else None)
+                if base_url is None:
+                    raise SourceRequestError("OpenSubtitles 登录响应缺少合法 API 地址")
+                self._base_url = base_url
                 self._jwt = token
                 return token
             except ValueError as exc:
@@ -429,7 +490,7 @@ class OpenSubtitlesSource:
             headers=self._headers(authenticated=True),
             **_proxy_kwargs(settings.PROXY),
         )
-        response = await request.post_res(f"{self.BASE_URL}/download", json={"file_id": file_id})
+        response = await request.post_res(self._api_url("/download"), json={"file_id": file_id})
         try:
             if response is None:
                 raise SourceRequestError("OpenSubtitles 下载授权请求失败")
@@ -463,41 +524,33 @@ class OpenSubtitlesSource:
     async def download(self, handle: CandidateHandle, directory: Path) -> DownloadedAsset:
         """获取最新临时链接并下载字幕文件。"""
 
-        payload = self._opaque_payload(handle)
-        if payload is None or payload.get("file_id") is None:
+        if not isinstance(handle.download_handle, OpenSubtitlesDownloadHandle):
             raise SourceRequestError("OpenSubtitles 候选缺少有效下载句柄")
-        file_id = int(payload["file_id"])
+        file_id = handle.download_handle.file_id
         link, file_name = await self._download_link(file_id)
-        path = await download_file(AsyncRequestUtils(**_proxy_kwargs(settings.PROXY)), link, directory, file_name)
+        request = AsyncRequestUtils(**_proxy_kwargs(settings.PROXY))
+        try:
+            path = await download_file(request, link, directory, file_name)
+        except SourceRequestError as exc:
+            if exc.status_code != 410:
+                raise
+            link, file_name = await self._download_link(file_id)
+            path = await download_file(request, link, directory, file_name)
         return DownloadedAsset(path=path, file_name=file_name)
 
-    async def refresh(self, manual: bool = False) -> SourceStatus:
+    async def _probe(self, manual: bool) -> SourceProbe | None:
         """重新登录验证长期凭据，不调用下载接口。"""
 
         del manual
-        status = SourceStatus(source=self.source, enabled=self.enabled, configured=self.configured)
-        if not self.enabled or not self.configured:
-            status.health = SourceHealth.DISABLED
-            return status
-        started = utc_now()
-        status.last_checked_at = started
         try:
             await self._login(force=True)
-            status.health = SourceHealth.HEALTHY
-            status.last_success_at = utc_now()
-            status.details = {**self._last_details, "session_active": bool(self._jwt)}
-        except SourceLimitedError as exc:
-            status.health = SourceHealth.LIMITED
-            status.last_error_at = utc_now()
-            status.last_error_summary = str(exc)
-            status.details = {**self._last_details, "session_active": bool(self._jwt)}
-        except Exception:  # noqa: BLE001 - 外部字幕源异常必须收敛为安全状态
-            status.health = SourceHealth.ERROR
-            status.last_error_at = utc_now()
-            status.last_error_summary = "OpenSubtitles 登录验证失败"
-            status.details = {**self._last_details, "session_active": False}
-        status.last_duration_ms = elapsed_ms(started)
-        return status
+        except SourceLimitedError:
+            self._last_details["session_active"] = bool(self._jwt)
+            raise
+        except Exception as exc:
+            self._last_details["session_active"] = False
+            raise SourceRequestError("OpenSubtitles 登录验证失败") from exc
+        return None
 
     async def close(self) -> None:
         """清除内存 JWT。"""

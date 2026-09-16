@@ -40,11 +40,8 @@ def _normalize_prefix(value: str | Path, field_name: str) -> str:
     return normalized
 
 
-PathMappingInput = PathMapping | Mapping[str, Any]
-
-
 def validate_path_mappings(
-    values: Iterable[PathMappingInput] | None,
+    values: Iterable[PathMapping | Mapping[str, Any]] | None,
 ) -> tuple[PathMapping, ...]:
     """校验并规范化路径映射配置。
 
@@ -126,7 +123,6 @@ def resolve_path(
 
 
 __all__ = [
-    "PathMappingInput",
     "PathMappingResolution",
     "PathMappingValidationError",
     "resolve_path",
