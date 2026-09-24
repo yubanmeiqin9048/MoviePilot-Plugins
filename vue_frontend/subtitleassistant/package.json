@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
     "typecheck": "vue-tsc --noEmit",
     "build": "vite build"
   },
@@ -13,7 +12,6 @@
     "vuetify": "3.7.3"
   },
   "devDependencies": {
-    "@mdi/font": "^7.4.47",
     "@originjs/vite-plugin-federation": "^1.4.1",
     "@vitejs/plugin-vue": "^5.2.4",
     "typescript": "^5.7.2",

@@ -80,10 +80,14 @@ const batchRetargetOpen = ref(false)
 const retargetSessionRecords = ref<RecordListItem[]>([])
 const retargetSessionUsesSelection = ref(false)
 const selectedRecords = ref<Map<string, RecordListItem>>(new Map())
+const selectingAll = ref(false)
+const selectAllNotice = ref('')
+const selectAllError = ref('')
 const batchOperationNotice = ref('')
 const tableFrame = ref<HTMLElement | null>(null)
 let listRequest = 0
 let detailRequest = 0
+let selectAllRequest = 0
 
 const isDesktop = computed(() => mdAndUp.value)
 const hasFilters = computed(() => Boolean(search.value || status.value))
@@ -101,6 +105,13 @@ const selectionCountLabel = computed(() => isDesktop.value
 const currentPageSelected = computed(() => items.value.filter(item => selectedRecords.value.has(item.id)).length)
 const allCurrentPageSelected = computed(() => Boolean(items.value.length) && currentPageSelected.value === items.value.length)
 const someCurrentPageSelected = computed(() => currentPageSelected.value > 0 && !allCurrentPageSelected.value)
+const allMatchingSelected = computed(() => Boolean(total.value) && selectedCount.value >= total.value)
+const selectAllDisabled = computed(() => !allMatchingSelected.value && total.value > MAX_RECORD_BATCH_SIZE)
+const selectAllTooltip = computed(() => allMatchingSelected.value
+  ? '取消全选当前筛选结果'
+  : total.value > MAX_RECORD_BATCH_SIZE
+    ? `当前筛选结果共 ${total.value} 条，超过一次最多处理 ${MAX_RECORD_BATCH_SIZE} 条的上限，请先缩小筛选范围`
+    : `全选当前筛选结果（最多 ${MAX_RECORD_BATCH_SIZE} 条）`)
 
 watch(
   () => props.active,
@@ -114,6 +125,10 @@ watch([search, status], () => {
   scrollTableToTop()
   page.value = 1
   items.value = []
+  selectAllRequest += 1
+  selectingAll.value = false
+  selectAllNotice.value = ''
+  selectAllError.value = ''
   if (props.active) void loadPage({ requestedPage: 1 })
 })
 
@@ -285,11 +300,17 @@ function clearFilters(): void {
   status.value = ''
 }
 
+function applySelection(next: Map<string, RecordListItem>): void {
+  selectedRecords.value = next
+  selectAllNotice.value = ''
+  selectAllError.value = ''
+}
+
 function setRecordSelected(item: RecordListItem, selected: boolean): void {
   const next = new Map(selectedRecords.value)
   if (selected) next.set(item.id, item)
   else next.delete(item.id)
-  selectedRecords.value = next
+  applySelection(next)
 }
 
 function setCurrentPageSelected(selected: boolean): void {
@@ -298,11 +319,64 @@ function setCurrentPageSelected(selected: boolean): void {
     if (selected) next.set(item.id, item)
     else next.delete(item.id)
   }
-  selectedRecords.value = next
+  applySelection(next)
 }
 
 function clearRecordSelection(): void {
   selectedRecords.value = new Map()
+  selectAllRequest += 1
+  selectingAll.value = false
+  selectAllNotice.value = ''
+  selectAllError.value = ''
+}
+
+function toggleSelectAllMatching(): void {
+  if (allMatchingSelected.value) {
+    clearRecordSelection()
+    return
+  }
+  void selectAllMatching()
+}
+
+async function selectAllMatching(): Promise<void> {
+  if (selectingAll.value || !props.active) return
+  const requestId = ++selectAllRequest
+  selectingAll.value = true
+  selectAllError.value = ''
+  selectAllNotice.value = ''
+  try {
+    const collected = new Map<string, RecordListItem>()
+    let expectedTotal = 0
+    for (let nextPage = 1; ; nextPage += 1) {
+      const response = await listRecords(props.api, props.pluginId, {
+        page: nextPage,
+        pageSize: MAX_RECORD_BATCH_SIZE,
+        search: search.value,
+        status: status.value,
+      })
+      if (requestId !== selectAllRequest) return
+      expectedTotal = response.total
+      for (const item of response.items) collected.set(item.id, item)
+      if (collected.size > MAX_RECORD_BATCH_SIZE || !response.items.length || collected.size >= response.total) break
+    }
+    if (!collected.size) {
+      selectAllError.value = '当前筛选条件下没有可选择的匹配记录。'
+      return
+    }
+    if (collected.size > MAX_RECORD_BATCH_SIZE) {
+      selectAllError.value = `当前筛选条件共 ${collected.size} 条记录，超过一次最多处理 ${MAX_RECORD_BATCH_SIZE} 条的上限。请先缩小搜索或状态筛选范围，再执行全选。`
+      return
+    }
+    selectedRecords.value = collected
+    if (collected.size < expectedTotal) {
+      selectAllNotice.value = `已选择 ${collected.size} 条，仍有 ${expectedTotal - collected.size} 条记录未被选中，请刷新列表后重试全选。`
+    }
+  } catch (requestError) {
+    if (requestId !== selectAllRequest) return
+    selectAllError.value = getErrorMessage(requestError, '全选匹配记录失败')
+  } finally {
+    if (requestId === selectAllRequest) selectingAll.value = false
+  }
 }
 
 function removeFromBatch(recordId: string): void {
@@ -393,9 +467,23 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
         <div class="view-header-actions">
           <div v-if="selectedCount" class="selection-actions selection-actions--header" role="status" aria-live="polite">
             <span class="selection-count">{{ selectionCountLabel }}</span>
-            <VBtn variant="text" size="small" prepend-icon="mdi-close" @click="clearRecordSelection">清空</VBtn>
-            <VBtn color="primary" size="small" prepend-icon="mdi-swap-horizontal-bold" :disabled="Boolean(selectionLimitError)" @click="openBatchRetarget">批量改配</VBtn>
+            <VBtn color="secondary" variant="tonal" size="small" prepend-icon="mdi-close" @click="clearRecordSelection">清空</VBtn>
+            <VBtn color="primary" variant="tonal" size="small" prepend-icon="mdi-swap-horizontal-bold" :disabled="Boolean(selectionLimitError)" @click="openBatchRetarget">批量改配</VBtn>
             <VBtn color="error" variant="tonal" size="small" prepend-icon="mdi-delete-outline" :disabled="Boolean(selectionLimitError)" @click="openBatchDelete">批量删除</VBtn>
+            <VTooltip v-if="!isDesktop" :text="selectAllTooltip">
+              <template #activator="{ props: tooltipProps }">
+                <VBtn
+                  v-bind="tooltipProps"
+                  color="secondary"
+                  variant="tonal"
+                  size="small"
+                  :prepend-icon="allMatchingSelected ? 'mdi-checkbox-multiple-blank-outline' : 'mdi-checkbox-multiple-marked-outline'"
+                  :loading="selectingAll"
+                  :disabled="selectingAll || selectAllDisabled"
+                  @click="toggleSelectAllMatching"
+                >{{ allMatchingSelected ? '取消全选' : '全选' }}</VBtn>
+              </template>
+            </VTooltip>
           </div>
           <VTooltip v-else text="刷新匹配记录">
             <template #activator="{ props: tooltipProps }">
@@ -412,6 +500,8 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
     </div>
 
     <VAlert v-if="selectionLimitError" type="error" variant="tonal" density="compact" class="mb-3">{{ selectionLimitError }}</VAlert>
+    <VAlert v-if="selectAllError" type="error" variant="tonal" density="compact" class="mb-3">{{ selectAllError }}</VAlert>
+    <VAlert v-if="selectAllNotice" type="warning" variant="tonal" density="compact" class="mb-3">{{ selectAllNotice }}</VAlert>
     <VAlert v-if="batchOperationNotice" type="warning" variant="tonal" density="compact" class="mb-3">
       <div class="inline-alert">
         <span>{{ batchOperationNotice }}</span>

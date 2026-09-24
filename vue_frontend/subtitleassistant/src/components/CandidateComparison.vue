@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 
 import EmptyState from '@/components/EmptyState.vue'
 import SearchDetailsDialog from '@/components/SearchDetailsDialog.vue'
@@ -30,7 +31,65 @@ const props = defineProps<{
 
 const emit = defineEmits<{ download: [candidate: SubtitleCandidate] }>()
 
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
+
 const detailsOpen = ref(false)
+const page = ref(1)
+const pageSize = ref(20)
+const { mdAndUp } = useDisplay()
+
+// 候选在会话内一次性返回，分页只切分本地列表：桌面端翻页，窄屏累加。
+const isDesktop = computed(() => mdAndUp.value)
+const totalPages = computed(() => Math.max(1, Math.ceil(props.candidates.length / pageSize.value)))
+const pagedCandidates = computed(() => (isDesktop.value
+  ? props.candidates.slice((page.value - 1) * pageSize.value, page.value * pageSize.value)
+  : props.candidates.slice(0, page.value * pageSize.value)))
+const canLoadMore = computed(() => !isDesktop.value && pagedCandidates.value.length < props.candidates.length)
+const rangeStart = computed(() => (props.candidates.length ? (isDesktop.value ? page.value - 1 : 0) * pageSize.value + 1 : 0))
+const rangeEnd = computed(() => Math.min(props.candidates.length, rangeStart.value - 1 + pagedCandidates.value.length))
+const paginationSummary = computed(() => props.candidates.length
+  ? `当前 ${rangeStart.value}-${rangeEnd.value} / ${props.candidates.length}`
+  : '共 0 个候选')
+
+watch(() => props.candidates, () => {
+  page.value = 1
+})
+
+watch(pageSize, () => {
+  page.value = 1
+})
+
+watch(isDesktop, () => {
+  page.value = 1
+})
+
+function loadMore(): void {
+  if (canLoadMore.value) page.value += 1
+}
+
+// 结果工具栏在桌面端冻结；表头粘贴位置需要它的实际高度，随指标行折行动态测量。
+const toolbarElement = ref<HTMLElement | null>(null)
+const toolbarHeight = ref(0)
+let toolbarObserver: ResizeObserver | null = null
+
+function measureToolbar(): void {
+  const element = toolbarElement.value
+  if (element) toolbarHeight.value = element.offsetHeight
+}
+
+onMounted(() => {
+  measureToolbar()
+  const element = toolbarElement.value
+  if (element && typeof ResizeObserver !== 'undefined') {
+    toolbarObserver = new ResizeObserver(measureToolbar)
+    toolbarObserver.observe(element)
+  }
+})
+
+onBeforeUnmount(() => {
+  toolbarObserver?.disconnect()
+  toolbarObserver = null
+})
 
 const executedSourceCount = computed(() => props.sources
   .filter(group => !['disabled', 'unconfigured'].includes(group.status)).length)
@@ -57,12 +116,12 @@ const candidateGroups = computed(() => [
   {
     status: 'recognized' as const,
     label: '已识别候选',
-    candidates: props.candidates.filter(candidate => candidate.recognition_status === 'recognized'),
+    candidates: pagedCandidates.value.filter(candidate => candidate.recognition_status === 'recognized'),
   },
   {
     status: 'unrecognized' as const,
     label: '未识别候选',
-    candidates: props.candidates.filter(candidate => candidate.recognition_status === 'unrecognized'),
+    candidates: pagedCandidates.value.filter(candidate => candidate.recognition_status === 'unrecognized'),
   },
 ].filter(group => group.candidates.length > 0))
 
@@ -103,11 +162,38 @@ function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
   const episodeMismatch = episodes.length > 0 && props.target.episode != null && !episodes.includes(props.target.episode)
   return seasonMismatch || episodeMismatch
 }
+
+/**
+ * 候选是否已提交下载。
+ * 提交成功后按钮自身承载该状态,桌面端与窄屏都不再额外占一行提示。
+ */
+function isDownloaded(candidate: SubtitleCandidate): boolean {
+  return props.downloadFeedback[candidate.candidate_key] === 'queued'
+}
+
+/** 按钮文案:提交中优先,其次为终态「已下载」,否则为可执行的「下载」。 */
+function candidateActionText(candidate: SubtitleCandidate): string {
+  if (props.loadingCandidates[candidate.candidate_key]) return '提交中'
+  return isDownloaded(candidate) ? '已下载' : '下载'
+}
+
+function candidateActionIcon(candidate: SubtitleCandidate): string {
+  return isDownloaded(candidate) ? 'mdi-check' : 'mdi-download'
+}
+
+function candidateActionLabel(candidate: SubtitleCandidate): string {
+  if (props.loadingCandidates[candidate.candidate_key]) return `正在提交 ${candidate.name}`
+  return isDownloaded(candidate) ? `${candidate.name} 已加入下载队列` : `下载 ${candidate.name}`
+}
 </script>
 
 <template>
-  <section class="candidate-results" aria-labelledby="candidate-results-title">
-    <div class="results-toolbar">
+  <section
+    class="candidate-results"
+    aria-labelledby="candidate-results-title"
+    :style="{ '--candidate-toolbar-height': `${toolbarHeight}px` }"
+  >
+    <div ref="toolbarElement" class="results-toolbar">
       <div class="results-heading">
         <div class="results-heading__title">
           <h3 id="candidate-results-title">候选结果</h3>
@@ -205,34 +291,56 @@ function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
                 <VAlert v-if="props.downloadErrors[candidate.candidate_key]" type="error" variant="tonal" density="compact" class="download-error">
                   {{ props.downloadErrors[candidate.candidate_key] }}
                 </VAlert>
-                <VAlert
-                  v-else-if="props.downloadFeedback[candidate.candidate_key] === 'queued'"
-                  type="success"
-                  variant="tonal"
-                  density="compact"
-                  class="download-feedback"
-                  role="status"
-                >
+                <span v-if="isDownloaded(candidate)" class="sr-only" role="status" aria-live="polite">
                   已加入下载队列
-                </VAlert>
+                </span>
                 <VBtn
                   class="candidate-download-button"
-                  color="primary"
+                  :class="{ 'candidate-download-button--done': isDownloaded(candidate) }"
+                  :color="isDownloaded(candidate) ? 'success' : 'primary'"
                   variant="tonal"
                   size="small"
-                  prepend-icon="mdi-download"
-                  :aria-label="props.loadingCandidates[candidate.candidate_key] ? '正在提交 ' + candidate.name : '下载 ' + candidate.name"
+                  :prepend-icon="candidateActionIcon(candidate)"
+                  :aria-label="candidateActionLabel(candidate)"
                   :loading="Boolean(props.loadingCandidates[candidate.candidate_key])"
-                  :disabled="props.downloadDisabled || Boolean(props.loadingCandidates[candidate.candidate_key])"
+                  :disabled="props.downloadDisabled || Boolean(props.loadingCandidates[candidate.candidate_key]) || isDownloaded(candidate)"
                   @click="emit('download', candidate)"
                 >
-                  {{ props.loadingCandidates[candidate.candidate_key] ? '提交中' : '下载' }}
+                  {{ candidateActionText(candidate) }}
                 </VBtn>
               </div>
             </td>
           </tr>
         </tbody>
       </table>
+      <div class="candidate-pagination">
+        <span class="candidate-pagination__summary" role="status" aria-live="polite">{{ paginationSummary }}</span>
+        <VPagination
+          v-if="isDesktop"
+          v-model="page"
+          :length="totalPages"
+          :total-visible="5"
+          density="comfortable"
+          aria-label="候选结果分页"
+        />
+        <VSelect
+          v-if="isDesktop"
+          v-model="pageSize"
+          :items="PAGE_SIZE_OPTIONS"
+          label="每页"
+          density="compact"
+          hide-details
+          class="candidate-pagination__size"
+        />
+        <VBtn
+          v-else-if="canLoadMore"
+          variant="tonal"
+          prepend-icon="mdi-chevron-down"
+          @click="loadMore"
+        >
+          加载更多
+        </VBtn>
+      </div>
     </div>
   </section>
 </template>
@@ -432,13 +540,34 @@ function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
   font-size: 0.6875rem;
 }
 
-.download-feedback {
-  margin: 0;
+.candidate-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+  padding: 0.6rem 1rem;
+  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+
+.candidate-pagination__summary {
+  min-width: 0;
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
   font-size: 0.6875rem;
 }
 
+.candidate-pagination__size {
+  flex: 0 0 7rem;
+  max-width: 7rem;
+}
+
+/* 文案在「下载 / 提交中 / 已下载」之间切换,统一按最长终态留宽,避免列内抖动。 */
 .candidate-download-button {
-  min-width: 4.75rem;
+  min-width: 6rem;
+}
+
+/* 终态按钮仍需被读作成功而非禁用:Vuetify 默认 0.26 透明度会埋掉绿色,这里回调到可读区间。 */
+.candidate-download-button--done {
+  opacity: 1 !important;
 }
 
 .sr-only {
@@ -452,10 +581,35 @@ function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
   border: 0;
 }
 
+/* 桌面端滚动容器是工作台视图自身：工具栏与表头依次冻结，表头让出工具栏实测高度。 */
+@media (min-width: 960px) {
+  .results-toolbar {
+    position: sticky;
+    z-index: 3;
+    inset-block-start: 0;
+    border-start-start-radius: 0.45rem;
+    border-start-end-radius: 0.45rem;
+    background-color: rgb(var(--v-theme-surface));
+    background-image: linear-gradient(
+      rgba(var(--v-theme-on-surface), 0.04),
+      rgba(var(--v-theme-on-surface), 0.04)
+    );
+  }
+
+  .candidate-table thead th {
+    inset-block-start: var(--candidate-toolbar-height, 0px);
+  }
+}
+
 @media (max-width: 800px) {
   .results-toolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .candidate-pagination {
+    justify-content: center;
+    flex-wrap: wrap;
   }
 
   .candidate-table-wrap {

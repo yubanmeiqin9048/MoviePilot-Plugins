@@ -373,5 +373,3 @@ export interface StandardResponse {
 export interface CredentialUpdateResponse extends StandardResponse {
   data?: { configured?: boolean }
 }
-
-export type ThemeName = 'light' | 'dark' | 'purple' | 'transparent'
