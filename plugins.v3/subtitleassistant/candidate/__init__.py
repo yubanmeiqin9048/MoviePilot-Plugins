@@ -8,7 +8,7 @@ from .admission import (
     normalized_imdb_id,
 )
 from .language import candidate_is_allowed, has_simplified_chinese, normalize_format_priority
-from .ranking import candidate_from_record, candidate_rank, sort_candidates
+from .ranking import candidate_from_record, candidate_rank, record_rank, sort_candidates
 
 __all__ = [
     "REJECTION_REASON_NAMES",
@@ -21,5 +21,6 @@ __all__ = [
     "has_simplified_chinese",
     "normalize_format_priority",
     "normalized_imdb_id",
+    "record_rank",
     "sort_candidates",
 ]

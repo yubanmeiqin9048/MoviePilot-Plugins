@@ -8,12 +8,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import Field, JsonValue
+from pydantic import Field
 
 from .base import StrictModel, new_id, utc_now
-from .candidate import PackageScope
 from .event import SubtitleWrittenOperation
-from .source import CandidateHandle, SubtitleSource
+from .source import CandidateHandle
 from .target import MediaType, PathMappingSnapshot, SubtitleTarget
 
 if TYPE_CHECKING:
@@ -76,7 +75,7 @@ class _CandidateAttemptRetention(StrEnum):
 
 
 class SubtitleTask(StrictModel):
-    """持久化的字幕任务：身份与目标、终态结论、时间与手动上下文。"""
+    """持久化的字幕任务：身份与目标、终态结论与时间。"""
 
     id: str = Field(default_factory=new_id)
     trigger: TaskTrigger = TaskTrigger.TRANSFER_EVENT
@@ -98,21 +97,11 @@ class SubtitleTask(StrictModel):
     status: TaskStatus = TaskStatus.QUEUED
     reason_code: str | None = None
     reason_message: str | None = None
-    result_source: SubtitleSource | None = None
-    result_package_scope: PackageScope | None = None
-    result_format: str | None = None
-    final_subtitle_path: Path | None = None
-    record_counts: dict[str, int] = Field(default_factory=dict)
 
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None
     duration_ms: int | None = None
-
-    manual_source: SubtitleSource | None = None
-    manual_candidate_key: str | None = None
-    manual_candidate_summary: dict[str, JsonValue] = Field(default_factory=dict)
-    actual_search_query: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -135,7 +124,6 @@ class TaskWorkItem:
     target_history_id: int | None = None
     history_target: bool | None = None
     manual_handle: CandidateHandle | None = None
-    actual_search_query: str | None = None
     attempt_operation: SubtitleWrittenOperation | None = None
     attempt_retention: Literal["preserve", "discard"] | None = None
     task_id: str | None = None

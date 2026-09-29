@@ -145,7 +145,6 @@ class PluginRuntime:
             inventory=record_committer,
             media_extensions=settings.RMT_MEDIAEXT,
             attributor=matcher,
-            candidate_pool=source_service,
             target_catalog=targets,
             manage_resources=False,
             publisher=publisher,

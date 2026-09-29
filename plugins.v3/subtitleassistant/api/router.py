@@ -12,11 +12,11 @@ from fastapi import Body, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
-from app.schemas import Response
-from app.sdk._legacy.user import (
+from app.api.dependencies.auth import (
     get_current_active_manage_user_async,
     get_current_active_superuser_async,
 )
+from app.schemas import Response
 
 from ..record import RecordCatalog, RecordFilePort, RecordMaintenance
 from ..schemas.http.page import PageSize

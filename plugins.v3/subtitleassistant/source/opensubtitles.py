@@ -39,7 +39,6 @@ from .common import (
     download_file,
     parse_datetime,
     safe_file_name,
-    subtitle_format,
 )
 
 
@@ -356,10 +355,8 @@ class OpenSubtitlesSource(SubtitleSourceBase):
                     source=self.source,
                     name=str(attributes.get("release") or file_name or item.get("id") or "OpenSubtitles"),
                     file_name=file_name or None,
-                    format=subtitle_format(file_name) or "UNKNOWN",
                     language=str(attributes.get("language") or ""),
                     translation_type=translation,
-                    hearing_impaired=bool(attributes.get("hearing_impaired")),
                     foreign_parts_only=bool(attributes.get("foreign_parts_only")),
                     package_scope=package_scope,
                     season=int(season_digits) if season_digits.isdigit() else None,

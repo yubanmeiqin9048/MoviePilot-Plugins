@@ -129,7 +129,6 @@ class MatchRecord(StrictModel):
     unmatched_reason: UnmatchedReason | None = None
     language: str
     translation_type: TranslationType = TranslationType.UNKNOWN
-    hearing_impaired: bool = False
     exact_id_match: bool = False
     site_priority: int | None = None
     trusted: bool = False

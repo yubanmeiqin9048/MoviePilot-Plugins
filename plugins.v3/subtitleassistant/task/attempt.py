@@ -33,7 +33,7 @@ from ..schemas.record import (
     MatchRecord,
     RecordStatus,
 )
-from ..schemas.source import CandidateHandle, DownloadedAsset, SubtitleSource
+from ..schemas.source import CandidateHandle, DownloadedAsset
 from ..schemas.target import (
     MediaType,
     PathMappingSnapshot,
@@ -128,13 +128,6 @@ class CandidateAttemptArchivePort(Protocol):
         """解包下载结果并返回受支持的字幕文件。"""
 
 
-class CandidateAttemptSourcePort(Protocol):
-    """候选尝试所需的字幕源下载能力。"""
-
-    async def download(self, handle: CandidateHandle, directory: Path) -> DownloadedAsset:
-        """下载候选到指定临时目录。"""
-
-
 _PHASE_RESULTS: Mapping[_AttemptPhase, AttemptResult] = {
     _AttemptPhase.DOWNLOAD: AttemptResult.DOWNLOAD_FAILED,
     _AttemptPhase.EXTRACT: AttemptResult.EXTRACT_FAILED,
@@ -164,8 +157,7 @@ class CandidateAttemptService:
         sources: SourceAdministration,
         config: PluginConfig,
         inventory: RecordCommitter,
-        attributor: AttributionService | None = None,
-        source_adapters: Mapping[SubtitleSource, CandidateAttemptSourcePort] | None = None,
+        attributor: AttributionService,
         *,
         task_label: TaskLabel | None = None,
         candidate_label: CandidateLabel | None = None,
@@ -175,11 +167,7 @@ class CandidateAttemptService:
         self.filesystem = filesystem
         self.archive = archive
         self.matcher = matcher
-        if attributor is None:
-            raise TypeError("候选流水线必须注入文件归属实现")
         self.attributor = attributor
-        self._source_downloader = sources
-        self._source_adapters = source_adapters
         self.sources = sources
         self.config = config
         self.inventory = inventory
@@ -240,17 +228,7 @@ class CandidateAttemptService:
         try:
             active_phase = _AttemptPhase.DOWNLOAD
             logger.info(f"{self._task_label(request.task_id)}开始下载{self._candidate_label(candidate)}")
-            downloader = getattr(self._source_downloader, "download", None)
-            if callable(downloader):
-                asset = await downloader(handle, candidate_dir)
-            else:
-                getter = getattr(self._source_downloader, "__getitem__", None)
-                if callable(getter):
-                    asset = await getter(candidate.source).download(handle, candidate_dir)
-                elif self._source_adapters is not None:
-                    asset = await self._source_adapters[candidate.source].download(handle, candidate_dir)
-                else:
-                    raise TypeError("来源下载能力未装配")
+            asset = await self.sources.download(handle, candidate_dir)
             logger.info(
                 f"{self._task_label(request.task_id)}已下载{self._candidate_label(candidate)}，得到文件“{asset.file_name}”"
             )
@@ -491,20 +469,12 @@ class CandidateAttemptService:
                 )
             else:
                 file_request = FileAttributionRequest(
-                    path=extracted.physical_path,
                     logical_source_path=Path(extracted.logical_source_path),
                     target=context,
                     candidate_snapshot=snapshot,
                     strategy=request.package_attribution_strategy,
                 )
-                batch = await self.attributor.attribute_requests(
-                    context,
-                    candidate,
-                    snapshot,
-                    [file_request],
-                    request.package_attribution_strategy,
-                    evidence_by_key={},
-                )
+                batch = await self.attributor.attribute_requests([file_request])
                 evidence = next(iter(batch.evidence_by_key.values()), None)
                 if evidence is None:
                     raise RuntimeError("文件归属能力未返回证据")
@@ -620,7 +590,6 @@ class CandidateAttemptService:
             unmatched_reason=evidence.unmatched_reason,
             language=candidate.language,
             translation_type=candidate.translation_type,
-            hearing_impaired=candidate.hearing_impaired,
             exact_id_match=candidate.exact_id_match,
             site_priority=candidate.site_priority,
             trusted=candidate.trusted,

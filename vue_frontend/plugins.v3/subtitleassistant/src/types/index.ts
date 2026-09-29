@@ -86,9 +86,6 @@ export interface TaskListItem {
   status: TaskStatus
   reason_code: string | null
   reason_message: string | null
-  result_source: SubtitleSource | null
-  result_package_scope: PackageScope | null
-  result_format: string | null
   created_at: string
   started_at: string | null
   finished_at: string | null
@@ -102,12 +99,6 @@ export interface TaskDetail extends TaskListItem {
   target_storage: string | null
   matched_path_mapping?: PathMapping | null
   target_file_exists?: boolean | null
-  final_subtitle_path: string | null
-  record_counts: Record<string, number>
-  manual_source: SubtitleSource | null
-  manual_candidate_key: string | null
-  manual_candidate_summary: Record<string, unknown>
-  actual_search_query: string | null
 }
 
 export interface PageResponse<T> {
@@ -178,7 +169,6 @@ export interface RecordDetail extends RecordListItem {
   candidate_name: string | null
   language: string
   translation_type: TranslationType
-  hearing_impaired: boolean
   logical_source_path?: string | null
   file_attribution_method?: FileAttributionMethod | null
   unmatched_reason?: UnmatchedReason | null
@@ -242,14 +232,12 @@ export interface SubtitleCandidate {
   file_name: string | null
   source: SubtitleSource
   language: string | null
-  format: string
   package_scope: PackageScope
   season: number | null
   episode: number | null
   seasons: number[]
   episodes: number[]
   translation_type: TranslationType
-  hearing_impaired: boolean
 }
 
 export interface SearchSourceGroup {

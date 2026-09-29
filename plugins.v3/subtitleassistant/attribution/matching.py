@@ -15,10 +15,8 @@ from ..schemas.attribution import (
     AttributionEvidence,
     CandidateAttributionSnapshot,
     CandidateMatchContext,
-    FileAttributionBatchResult,
     FileAttributionEvidence,
     FileAttributionMethod,
-    FileAttributionRequest,
     PackageAttributionStrategy,
     UnmatchedReason,
 )
@@ -700,7 +698,6 @@ class MoviePilotMatcher:
 
     async def attribute_file(
         self,
-        path: Path,
         logical_source_path: Path,
         context: SubtitleTarget,
         snapshot: CandidateAttributionSnapshot,
@@ -708,37 +705,6 @@ class MoviePilotMatcher:
     ) -> FileAttributionEvidence:
         """按任务策略识别一个包内具体字幕文件。"""
 
-        del path
         if strategy is PackageAttributionStrategy.TRUST_PACKAGE:
             return self._trust_package_attribution(logical_source_path, context, snapshot)
         return await self._host_recognition_attribution(logical_source_path, context)
-
-    async def attribute_requests(
-        self,
-        context: SubtitleTarget,
-        candidate: SubtitleCandidate,
-        snapshot: CandidateAttributionSnapshot,
-        requests: list[FileAttributionRequest],
-        strategy: PackageAttributionStrategy,
-        *,
-        evidence_by_key: dict[str, FileAttributionEvidence] | None = None,
-    ) -> FileAttributionBatchResult:
-        """通过一般化请求批量返回常规文件归属证据。"""
-
-        del candidate, evidence_by_key
-        result = FileAttributionBatchResult(request_count=len(requests), submitted_count=len(requests))
-        for index, request in enumerate(requests, start=1):
-            try:
-                evidence = await self.attribute_file(
-                    request.path,
-                    request.logical_source_path,
-                    context,
-                    snapshot,
-                    strategy,
-                )
-            except Exception:  # noqa: BLE001 - 单文件归属失败必须隔离
-                result.error_count += 1
-                result.reason_summary["adapter_error"] = result.reason_summary.get("adapter_error", 0) + 1
-                continue
-            result.evidence_by_key[f"file_{index:04d}"] = evidence
-        return result

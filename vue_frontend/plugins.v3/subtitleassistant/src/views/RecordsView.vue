@@ -658,7 +658,6 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
               <DetailRow label="包范围">{{ packageLabels[detail.package_scope] }}</DetailRow>
               <DetailRow label="语言标记">{{ detail.language }}</DetailRow>
               <DetailRow label="翻译类型">{{ translationLabels[detail.translation_type] }}</DetailRow>
-              <DetailRow label="听障字幕">{{ detail.hearing_impaired ? '是（SDH/CC）' : '否' }}</DetailRow>
               <DetailRow label="文件归属方式">{{ detail.file_attribution_method ? fileAttributionLabels[detail.file_attribution_method] : '未记录' }}</DetailRow>
               <DetailRow v-if="detail.unmatched_reason" label="未匹配原因">{{ unmatchedReasonLabels[detail.unmatched_reason] }}</DetailRow>
             </dl></VExpansionPanelText>

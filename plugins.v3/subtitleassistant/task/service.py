@@ -6,9 +6,9 @@ import asyncio
 import os
 import sys
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from anyio import Path as AsyncPath
 
@@ -52,7 +52,6 @@ from .attempt import (
     CandidateAttemptRequest,
     CandidateAttemptResult,
     CandidateAttemptService,
-    CandidateAttemptSourcePort,
     FailureResultRetention,
 )
 
@@ -119,13 +118,6 @@ class _TaskArchivePort(Protocol):
         """终止当前归档解包。"""
 
 
-class _TaskSourcePort(Protocol):
-    """任务停止时所需的来源资源释放操作。"""
-
-    async def close(self) -> None:
-        """关闭来源运行态资源。"""
-
-
 class _TaskTargetPort(Protocol):
     """任务执行所需的字幕目标路径解析能力。"""
 
@@ -157,12 +149,11 @@ class TaskOperations:
         filesystem: _TaskFilePort,
         archive: _TaskArchivePort,
         matcher: AttributionService,
-        sources: SourceAdministration | Mapping[SubtitleSource, _TaskSourcePort],
+        sources: SourceAdministration,
         config: PluginConfig,
         inventory: RecordCommitter,
         media_extensions: Sequence[str],
         attributor: AttributionService,
-        candidate_pool: SourceAdministration,
         publisher: SubtitleEventPublisher,
         target_catalog: _TaskTargetPort | None = None,
         manage_resources: bool = True,
@@ -179,20 +170,16 @@ class TaskOperations:
         self._config = config
         self._inventory = inventory
         self._media_extensions = frozenset(f".{value.lower().lstrip('.')}" for value in media_extensions)
-        self._candidate_pool = candidate_pool
         self._manage_resources = manage_resources
         self._publisher = publisher
         self._candidate_attempt = CandidateAttemptService(
             filesystem=self._filesystem,
             archive=self._archive,
             matcher=self._matcher,
-            sources=self._candidate_pool,
+            sources=self._sources,
             config=self._config,
             inventory=self._inventory,
-            # 生产归属实现通过统一批量 facade 注入；仅提供旧式
-            # attribute_file 的测试/宿主替身由候选模块在组合边界适配。
             attributor=self._attribution,
-            source_adapters=cast(Mapping[SubtitleSource, CandidateAttemptSourcePort] | None, self._sources),
             candidate_label=self._candidate_label,
         )
         self._strategy = config.package_attribution_strategy
@@ -255,15 +242,6 @@ class TaskOperations:
         path_key = self._path_key(item.context.target_path)
         history_target = self._is_history_target(item)
         manual_handle = item.manual_handle
-        manual_fields: dict[str, Any] = {}
-        if manual_handle is not None:
-            manual_fields = {
-                "trigger": TaskTrigger.MANUAL_CANDIDATE,
-                "manual_source": manual_handle.candidate.source,
-                "manual_candidate_key": manual_handle.candidate.candidate_key,
-                "manual_candidate_summary": manual_handle.candidate.model_dump(mode="json"),
-                "actual_search_query": item.actual_search_query,
-            }
         async with self._lock:
             existing_id = self._active_paths.get(path_key)
             if existing_id is not None:
@@ -285,7 +263,7 @@ class TaskOperations:
                 target_history_id=item.target_history_id,
                 history_target_path=item.context.target_path if history_target else None,
                 target_storage=item.context.target_storage,
-                **manual_fields,
+                trigger=TaskTrigger.MANUAL_CANDIDATE if manual_handle else TaskTrigger.TRANSFER_EVENT,
             )
             await self._store.save_task(task)
             if manual_handle is not None:
@@ -471,20 +449,10 @@ class TaskOperations:
     async def _search_sources(self, task: SubtitleTask, item: TaskWorkItem) -> list[CandidateHandle]:
         """查询共享来源批次，在准入处执行自动漏斗并与当前目标匹配。"""
 
-        batch = await self._candidate_pool.query(item.context)
-        configured_sources = self._sources.keys() if isinstance(self._sources, Mapping) else ()
-        sources_to_visit = [
-            source for source in SubtitleSource if source in batch.sources or source in configured_sources
-        ]
+        batch = await self._sources.query(item.context)
         handles: list[CandidateHandle] = []
         self._source_conclusions = []
-        for source in sources_to_visit:
-            result = batch.sources.get(source)
-            if result is None:
-                await self._save_source_failure(source, f"{SOURCE_NAMES[source]}查询结果缺失")
-                logger.error(f"{self._task_label(task)}查询{SOURCE_NAMES[source]}时缺少共享来源结果")
-                self._source_conclusions.append(f"{SOURCE_NAMES[source]}查询结果缺失")
-                continue
+        for source, result in batch.sources.items():
             self._source_conclusions.append(f"{SOURCE_NAMES[source]}：{describe_source_run(result)}")
 
             candidates, rejection_summary = admit_automatic_candidates(
@@ -522,12 +490,12 @@ class TaskOperations:
             await self._save_source_status(source, result, summary)
         if handles:
             logger.info(
-                f"{self._task_label(task)}已汇总 {len(sources_to_visit)} 个字幕来源的处理结果，"
+                f"{self._task_label(task)}已汇总 {len(batch.sources)} 个字幕来源的处理结果，"
                 f"共获得 {len(handles)} 个适用于当前目标的候选"
             )
         else:
             logger.warning(
-                f"{self._task_label(task)}已汇总 {len(sources_to_visit)} 个字幕来源的处理结果，但没有获得适用于当前目标的候选"
+                f"{self._task_label(task)}已汇总 {len(batch.sources)} 个字幕来源的处理结果，但没有获得适用于当前目标的候选"
             )
         return handles
 
@@ -604,23 +572,6 @@ class TaskOperations:
             return "没有可用的合格简中字幕候选"
         return "没有可用的合格简中字幕候选；各来源结论：" + "；".join(self._source_conclusions)
 
-    def _source_status_snapshot(self, source: SubtitleSource) -> SourceStatus | None:
-        """读取来源 facade 提供的当前配置与运行详情。"""
-
-        snapshot = getattr(self._sources, "status_snapshot", None)
-        if callable(snapshot):
-            return cast(SourceStatus, snapshot(source))
-        if isinstance(self._sources, Mapping):
-            adapter = self._sources.get(source)
-            runtime_details = getattr(adapter, "runtime_details", dict)
-            return SourceStatus(
-                source=source,
-                enabled=bool(getattr(adapter, "enabled", False)),
-                configured=bool(getattr(adapter, "configured", adapter is not None)),
-                details=runtime_details() if callable(runtime_details) else {},
-            )
-        return None
-
     async def _persist_source_status(
         self,
         source: SubtitleSource,
@@ -640,14 +591,10 @@ class TaskOperations:
 
         existing = {item.source: item for item in await self._store.list_source_statuses()}.get(source)
         status = existing or SourceStatus(source=source)
-        snapshot = self._source_status_snapshot(source)
-        if snapshot is not None:
-            status.enabled = bool(snapshot.enabled) if unavailable else snapshot.enabled
-            status.configured = False if unavailable else snapshot.configured
-            status.details = {**status.details, **snapshot.details}
-        elif unavailable:
-            status.enabled = False
-            status.configured = False
+        snapshot = self._sources.status_snapshot(source)
+        status.enabled = snapshot.enabled
+        status.configured = False if unavailable else snapshot.configured
+        status.details = {**status.details, **snapshot.details}
         status.health = health
         status.last_checked_at = utc_now()
         if success:
@@ -789,40 +736,21 @@ class TaskOperations:
                 target_file_exists=task.target_file_exists,
             )
         )
-        await self._finalize_candidate_attempt(task, handle.candidate, result)
+        self._log_candidate_attempt(task, handle.candidate, result)
         if result.result is AttemptResult.INTERRUPTED:
             await self._publish_committed_files(task, operation, result.committed_files)
             raise asyncio.CancelledError
         return result
 
-    async def _finalize_candidate_attempt(
+    def _log_candidate_attempt(
         self,
         task: SubtitleTask,
         candidate: SubtitleCandidate,
         result: CandidateAttemptResult,
     ) -> None:
-        """累计记录计数、保存任务快照并输出一次候选结论。"""
+        """输出候选处理结论，不在任务中保存产物副本。"""
 
-        for record in result.records:
-            task.record_counts[record.status.value] = task.record_counts.get(record.status.value, 0) + 1
-        if result.records:
-            first_record = result.records[0]
-            task.final_subtitle_path = first_record.final_subtitle_path
-            task.result_source = candidate.source
-            task.result_package_scope = candidate.package_scope
-            task.result_format = first_record.format
         written_count = sum(1 for record in result.committed_media_records if record.status is RecordStatus.MATCHED)
-        try:
-            await self._save(task)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if written_count == 0:
-                raise
-            logger.error(
-                f"{self._task_label(task)}候选结果快照保存失败，已提交文件事实仍将继续发布；"
-                f"异常类型为 {type(exc).__name__}"
-            )
         log = (
             logger.warning
             if result.result is not AttemptResult.SUCCESS or result.error_summary and written_count > 0
@@ -885,15 +813,6 @@ class TaskOperations:
                     SubtitleWrittenOperation.INVENTORY_CONSUMPTION,
                     inventory.committed_files,
                 )
-                first_record = inventory_records[0]
-                task.result_source = first_record.source
-                task.result_package_scope = first_record.package_scope
-                task.result_format = first_record.format
-                task.final_subtitle_path = first_record.final_subtitle_path
-                task.record_counts[RecordStatus.MATCHED.value] = task.record_counts.get(
-                    RecordStatus.MATCHED.value,
-                    0,
-                ) + len(inventory_records)
                 await self._finish_task(task, TaskStatus.SUCCESS, "staged_inventory_consumed", "已消费字幕库存并落盘")
                 return
             handles = await self._search_sources(task, item)
@@ -909,7 +828,6 @@ class TaskOperations:
                 handles,
                 key=lambda handle: candidate_rank(
                     handle.candidate,
-                    self._config.format_priority,
                     [source.value for source in self._config.source_priority],
                 ),
             )
@@ -961,10 +879,7 @@ class TaskOperations:
     async def refresh_sources(self, manual: bool = True) -> list[SourceStatus]:
         """并发刷新三个字幕源且互不连带失败。"""
 
-        refresher = getattr(self._sources, "refresh", None)
-        if callable(refresher):
-            return await refresher(manual=manual)
-        return []
+        return await self._sources.refresh(manual=manual)
 
     def stop_sync(self, reason: str = "插件已停用，未完成任务已中断") -> None:
         """同步停止接收事件、取消 worker 并标记未完成任务。"""
@@ -996,12 +911,6 @@ class TaskOperations:
             else:
                 asyncio.run_coroutine_threadsafe(self._cleanup_runtime(), cleanup_loop)
 
-    async def _close_sources(self) -> None:
-        """异步关闭全部字幕源。"""
-
-        source_map = cast(Mapping[SubtitleSource, _TaskSourcePort], self._sources)
-        await asyncio.gather(*(source.close() for source in source_map.values()), return_exceptions=True)
-
     async def _cleanup_runtime(self) -> None:
         """终止解包并关闭全部字幕源。"""
 
@@ -1011,11 +920,10 @@ class TaskOperations:
         if not self._manage_resources:
             return
         await self._archive.cancel()
-        await self._close_sources()
         try:
-            await self._candidate_pool.close()
-        except Exception as exc:  # noqa: BLE001 - 查询缓存关闭失败不能覆盖任务结果
-            logger.error(f"共享字幕候选池缓存关闭失败：{type(exc).__name__}")
+            await self._sources.close()
+        except Exception as exc:  # noqa: BLE001 - 来源关闭失败不能覆盖任务结果
+            logger.error(f"字幕来源关闭失败：{type(exc).__name__}")
 
     async def shutdown(self, reason: str = "插件已停用，未完成任务已中断") -> None:
         """异步停止并等待运行资源释放。"""

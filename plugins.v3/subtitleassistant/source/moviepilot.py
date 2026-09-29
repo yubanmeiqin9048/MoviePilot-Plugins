@@ -41,7 +41,6 @@ from .common import (
     download_file,
     parse_datetime,
     safe_file_name,
-    subtitle_format,
 )
 
 
@@ -163,10 +162,8 @@ class MoviePilotSource(SubtitleSourceBase):
             source=self.source,
             name=title,
             file_name=str(file_name or "") or None,
-            format=subtitle_format(str(file_name or "")) or "UNKNOWN",
             language=str(self._field(item, "language", "") or ""),
             translation_type=translation,
-            hearing_impaired=any(token in marker for token in ("sdh", "cc", "听障")),
             foreign_parts_only=any(token in marker for token in ("foreign_parts_only", "foreign parts only", "仅外语")),
             site_id=site_id,
             site_priority=self._integer(self._field(item, "site_order")),

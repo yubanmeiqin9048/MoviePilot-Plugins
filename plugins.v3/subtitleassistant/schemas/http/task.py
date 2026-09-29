@@ -7,10 +7,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated
 
-from pydantic import BeforeValidator, JsonValue
+from pydantic import BeforeValidator
 
-from ...schemas.candidate import PackageScope
-from ...schemas.source import SubtitleSource
 from ...schemas.target import MediaType
 from ...schemas.task import TaskStatus, TaskTrigger
 from .base import ApiModel
@@ -62,8 +60,6 @@ def _page_size_parser(value: object) -> object:
 _TaskTrigger = Annotated[TaskTrigger, BeforeValidator(_enum_parser(TaskTrigger))]
 _MediaType = Annotated[MediaType, BeforeValidator(_enum_parser(MediaType))]
 _TaskStatus = Annotated[TaskStatus, BeforeValidator(_enum_parser(TaskStatus))]
-_SubtitleSourceOptional = Annotated[SubtitleSource | None, BeforeValidator(_enum_parser(SubtitleSource))]
-_PackageScopeOptional = Annotated[PackageScope | None, BeforeValidator(_enum_parser(PackageScope))]
 _DateTime = Annotated[datetime, BeforeValidator(_datetime_parser)]
 _DateTimeOptional = Annotated[datetime | None, BeforeValidator(_datetime_parser)]
 _PageSize = Annotated[PageSize, BeforeValidator(_page_size_parser)]
@@ -93,9 +89,6 @@ class TaskListItem(ApiModel):
     status: _TaskStatus
     reason_code: str | None
     reason_message: str | None
-    result_source: _SubtitleSourceOptional
-    result_package_scope: _PackageScopeOptional
-    result_format: str | None
     created_at: _DateTime
     started_at: _DateTimeOptional
     finished_at: _DateTimeOptional
@@ -110,12 +103,6 @@ class TaskDetail(TaskListItem):
     target_storage: str | None
     matched_path_mapping: PathMappingSnapshot | None
     target_file_exists: bool | None
-    final_subtitle_path: str | None
-    record_counts: dict[str, int]
-    manual_source: _SubtitleSourceOptional
-    manual_candidate_key: str | None
-    manual_candidate_summary: dict[str, JsonValue]
-    actual_search_query: str | None
 
 
 class TaskPage(ApiModel):

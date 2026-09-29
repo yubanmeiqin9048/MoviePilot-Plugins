@@ -105,8 +105,8 @@ def _normalize_legacy_values(model: type[BaseModel], value: Any) -> Any:
 class PluginDataStore:
     """封装四个版本化 PluginData 分区并提供异步业务访问。"""
 
-    VERSION = 3
-    MIGRATION_VERSION = 2
+    VERSION = 5
+    MIGRATION_VERSIONS = (2, 3, 4)
     TASKS_KEY = "tasks"
     RECORDS_KEY = "records"
     SOURCE_STATUS_KEY = "source_status"
@@ -219,7 +219,7 @@ class PluginDataStore:
         version = raw.get("version")
         if version == self.VERSION:
             return deepcopy(raw["items"])
-        if version == self.MIGRATION_VERSION:
+        if version in self.MIGRATION_VERSIONS:
             migrations.append(key)
             return deepcopy(raw["items"])
         raise StoreInitializationError(f"插件数据分区 {key} 版本不受支持：{version}")

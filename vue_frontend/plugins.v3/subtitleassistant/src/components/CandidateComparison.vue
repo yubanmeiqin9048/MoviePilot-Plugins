@@ -141,19 +141,6 @@ function candidateRange(candidate: SubtitleCandidate): string {
   return range || packageLabels[candidate.package_scope]
 }
 
-function candidateFormat(candidate: SubtitleCandidate): string {
-  if (candidate.format.toUpperCase() === 'UNKNOWN') return '格式：未知'
-  return `格式：${candidate.format.toUpperCase()}`
-}
-
-function candidateLanguageFacts(candidate: SubtitleCandidate): string {
-  return [
-    translationLabels[candidate.translation_type],
-    `听障：${candidate.hearing_impaired ? '是' : '否'}`,
-    candidateFormat(candidate),
-  ].filter(Boolean).join(' · ')
-}
-
 function candidateTargetMismatch(candidate: SubtitleCandidate): boolean {
   if (!props.target || props.target.media_type !== 'tv') return false
   const seasons = candidate.seasons.length ? candidate.seasons : (candidate.season == null ? [] : [candidate.season])
@@ -280,7 +267,7 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
             <td data-label="语言 / 类型" class="candidate-language">
               <span class="candidate-field-label">语言 / 类型</span>
               <strong class="candidate-value">{{ candidate.language || '语言未标记' }}</strong>
-              <small class="candidate-note">{{ candidateLanguageFacts(candidate) }}</small>
+              <small class="candidate-note">{{ translationLabels[candidate.translation_type] }}</small>
             </td>
             <td data-label="来源" class="candidate-source">
               <span class="candidate-field-label">来源</span>

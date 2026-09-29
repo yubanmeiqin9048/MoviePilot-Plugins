@@ -50,10 +50,8 @@ class SubtitleCandidate(StrictModel):
     source: SubtitleSource
     name: str
     file_name: str | None = None
-    format: str
     language: str
     translation_type: TranslationType = TranslationType.UNKNOWN
-    hearing_impaired: bool = False
     foreign_parts_only: bool = False
     package_scope: PackageScope = PackageScope.UNKNOWN
     year: int | None = None

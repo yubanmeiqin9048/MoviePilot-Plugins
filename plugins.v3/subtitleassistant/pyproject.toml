@@ -1,10 +1,13 @@
 [project]
-name = "subtitleassistant"
-version = "1.4.1"
-dependencies = ["yake"]
+name = "moviepilot-plugin-subtitleassistant"
+dynamic = ["version"]
+requires-python = ">=3.14"
+dependencies = [
+    "yake",
+]
 
 [tool.ty.environment]
-python-version = "3.12"
+python-version = "3.14"
 python-platform = "linux"
 
 [tool.ty.src]
@@ -18,7 +21,7 @@ exclude = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py314"
 extend-exclude = [
     ".docs",
     ".pytest_cache",

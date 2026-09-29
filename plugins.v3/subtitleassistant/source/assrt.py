@@ -36,7 +36,6 @@ from .common import (
     parse_datetime,
     raise_for_status,
     safe_file_name,
-    subtitle_format,
 )
 from .limiter import SlidingWindowLimiter
 
@@ -246,7 +245,6 @@ class AssrtSource(SubtitleSourceBase):
                 source=self.source,
                 name=str(item.get("native_name") or item.get("videoname") or subtitle_id),
                 file_name=None,
-                format=subtitle_format(None, str(item.get("subtype") or "")) or "UNKNOWN",
                 language=marker,
                 translation_type=translation,
                 package_scope=PackageScope.UNKNOWN,

@@ -89,14 +89,12 @@ class ManualCandidateItem(ApiModel):
     name: str
     file_name: str | None = None
     language: str | None = None
-    format: str = Field(min_length=1)
     package_scope: _PackageScope
     season: int | None = None
     episode: int | None = None
     seasons: list[int] = Field(default_factory=list)
     episodes: list[int] = Field(default_factory=list)
     translation_type: _TranslationType
-    hearing_impaired: bool
 
 
 class ManualSourceResult(ApiModel):

@@ -33,20 +33,11 @@ SEARCH_SESSION_TTL_SECONDS = 30 * 60
 
 
 @dataclass(slots=True)
-class SessionCandidate:
-    """搜索会话内可提交到下载队列的完整候选。"""
-
-    handle: CandidateHandle
-    recognition_status: CandidateRecognitionStatus
-    actual_query: str | None = None
-
-
-@dataclass(slots=True)
 class ManualSearchSession:
     """由宿主短期缓存保存的人工搜索会话。"""
 
     target: SearchTarget
-    candidates: dict[str, SessionCandidate]
+    candidates: dict[str, CandidateHandle]
 
 
 class ManualSearchCachePort(Protocol):
@@ -171,21 +162,10 @@ class ManualSearchService:
             handles_by_run.append(handles)
         session_id = new_id() if any(run.candidates for run in runs) else None
         if session_id:
-            candidates: dict[str, SessionCandidate] = {}
-            for run, recognitions, handles in zip(
-                runs,
-                recognitions_by_run,
-                handles_by_run,
-                strict=True,
-            ):
-                for recognition, handle in zip(recognitions, handles, strict=True):
-                    candidate_key = handle.candidate.candidate_key
-                    if candidate_key not in candidates:
-                        candidates[candidate_key] = SessionCandidate(
-                            handle=handle,
-                            recognition_status=recognition.status,
-                            actual_query=run.matched_query,
-                        )
+            candidates: dict[str, CandidateHandle] = {}
+            for handles in handles_by_run:
+                for handle in handles:
+                    candidates.setdefault(handle.candidate.candidate_key, handle)
             session = ManualSearchSession(target=target, candidates=candidates)
             await self._cache.set(
                 self._session_key(session_id),
@@ -229,8 +209,7 @@ class ManualSearchService:
                 match_context=session.target.match_context,
                 target_history_id=session.target.history_id,
                 history_target=True,
-                manual_handle=candidate.handle,
-                actual_search_query=candidate.actual_query,
+                manual_handle=candidate,
             )
         )
         if task is None:

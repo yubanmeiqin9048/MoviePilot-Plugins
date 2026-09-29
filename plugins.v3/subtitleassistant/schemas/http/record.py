@@ -187,7 +187,6 @@ class RecordDetail(RecordListItem):
     unmatched_reason: _UnmatchedReasonOptional
     language: str
     translation_type: _TranslationType
-    hearing_impaired: bool
     staged_at: _DateTimeOptional
     retarget_history: list[RetargetHistoryEntry]
 

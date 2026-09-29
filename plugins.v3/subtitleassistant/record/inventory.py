@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from app.sdk.logging import logger
 
-from ..candidate import candidate_from_record, candidate_rank
+from ..candidate import record_rank
 from ..schemas.base import utc_now
 from ..schemas.record import FileLocation, InventoryConsumeResult, MatchRecord, RecordStatus
 from ..schemas.target import PathMappingSnapshot, SubtitleTarget
@@ -192,11 +192,10 @@ class SubtitleInventory:
             ranked = sorted(
                 records,
                 key=lambda record: (
-                    candidate_rank(
-                        candidate_from_record(record),
+                    record_rank(
+                        record,
                         self._format_priority,
                         self._source_priority,
-                        include_format=True,
                     ),
                     record.id,
                 ),

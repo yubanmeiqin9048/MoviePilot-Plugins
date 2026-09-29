@@ -123,7 +123,6 @@ class CandidateMatchContext:
 class FileAttributionRequest:
     """任务提交给文件归属 facade 的一般化单文件输入。"""
 
-    path: Path
     logical_source_path: Path
     target: SubtitleTarget
     candidate_snapshot: CandidateAttributionSnapshot

@@ -61,22 +61,14 @@ def _source_quality(candidate: SubtitleCandidate) -> tuple[Any, ...]:
 
 def candidate_rank(
     candidate: SubtitleCandidate,
-    format_priority: list[str],
     source_priority: list[str],
-    *,
-    include_format: bool = False,
 ) -> tuple[Any, ...]:
-    """返回候选排序键；库存消费可显式启用真实文件格式优先级。"""
+    """返回不依赖文件格式的搜索候选排序键。"""
 
     source_values = [str(item).lower() for item in source_priority]
-    format_position = (
-        _position(candidate.format.upper(), [item.upper() for item in format_priority]) if include_format else 0
-    )
     return (
         _TRANSLATION_ORDER[candidate.translation_type],
-        1 if candidate.hearing_impaired else 0,
         _PACKAGE_ORDER[candidate.package_scope],
-        format_position,
         0 if candidate.exact_id_match else 1,
         _position(candidate.source.value, source_values),
         *_source_quality(candidate),
@@ -86,12 +78,11 @@ def candidate_rank(
 
 def sort_candidates(
     candidates: list[SubtitleCandidate],
-    format_priority: list[str],
     source_priority: list[str],
 ) -> list[SubtitleCandidate]:
     """按统一质量规则稳定排序字幕候选。"""
 
-    return sorted(candidates, key=lambda item: candidate_rank(item, format_priority, source_priority))
+    return sorted(candidates, key=lambda item: candidate_rank(item, source_priority))
 
 
 def candidate_from_record(record: MatchRecord) -> SubtitleCandidate:
@@ -102,10 +93,8 @@ def candidate_from_record(record: MatchRecord) -> SubtitleCandidate:
         source=record.source,
         name=record.candidate_name or record.subtitle_file_name,
         file_name=record.subtitle_file_name,
-        format=record.format,
         language=record.language,
         translation_type=record.translation_type,
-        hearing_impaired=record.hearing_impaired,
         package_scope=record.package_scope,
         season=record.season,
         episode=record.episode,
@@ -119,4 +108,19 @@ def candidate_from_record(record: MatchRecord) -> SubtitleCandidate:
         download_count=record.download_count,
         uploaded_at=record.uploaded_at,
         revision=record.revision,
+    )
+
+
+def record_rank(
+    record: MatchRecord,
+    format_priority: list[str],
+    source_priority: list[str],
+) -> tuple[Any, ...]:
+    """在库存记录的质量排序中加入真实文件格式优先级。"""
+
+    rank = candidate_rank(candidate_from_record(record), source_priority)
+    return (
+        *rank[:2],
+        _position(record.format.upper(), [item.upper() for item in format_priority]),
+        *rank[2:],
     )

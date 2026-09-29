@@ -12,16 +12,12 @@ import StateChip from '@/components/StateChip.vue'
 import { useDebouncedValue } from '@/composables/useDebouncedValue'
 import type { PluginApi, TaskDetail, TaskListItem, TaskStatus } from '@/types'
 import {
-  displayValue,
   elapsedDuration,
   formatDate,
   formatDuration,
-  friendlyKey,
   isTerminalTask,
   mediaLabel,
   mediaTypeLabels,
-  packageLabels,
-  sourceLabels,
   taskStates,
   taskTriggerLabels,
 } from '@/types/presentation'
@@ -285,26 +281,15 @@ function clearFilters(): void {
 }
 
 function resultText(item: TaskListItem): string {
-  if (item.status === 'success') {
-    return [
-      item.result_source ? sourceLabels[item.result_source] : '',
-      item.result_package_scope ? packageLabels[item.result_package_scope] : '',
-      item.result_format || '',
-    ].filter(Boolean).join(' · ') || '字幕已落盘'
-  }
   if (item.status === 'queued') return '等待处理'
   if (item.status === 'processing') return '正在处理'
-  return item.reason_message || item.reason_code || '未记录原因'
+  return item.reason_message || item.reason_code || (item.status === 'success' ? '处理完成' : '未记录原因')
 }
 
 function taskTime(item: TaskListItem): string {
   const start = item.started_at || item.created_at
   const duration = item.status === 'processing' ? elapsedDuration(item.started_at) : formatDuration(item.duration_ms)
   return `${formatDate(start)} · ${duration}`
-}
-
-function detailEntries(value: Record<string, unknown>): Array<[string, unknown]> {
-  return Object.entries(value || {})
 }
 </script>
 
@@ -389,7 +374,7 @@ function detailEntries(value: Record<string, unknown>): Array<[string, unknown]>
                 <th>目标文件</th>
                 <th>状态</th>
                 <th>触发</th>
-                <th>结果</th>
+                <th>结论</th>
                 <th>时间</th>
                 <th class="actions-column">操作</th>
               </tr>
@@ -546,28 +531,6 @@ function detailEntries(value: Record<string, unknown>): Array<[string, unknown]>
                 <DetailRow label="媒体类型">{{ mediaTypeLabels[detail.media_type] }}</DetailRow>
                 <DetailRow label="TMDB ID">{{ detail.tmdb_id ?? '未记录' }}</DetailRow>
                 <DetailRow label="IMDb ID">{{ detail.imdb_id || '未记录' }}</DetailRow>
-              </dl>
-            </VExpansionPanelText>
-          </VExpansionPanel>
-
-          <VExpansionPanel>
-            <VExpansionPanelTitle>结果</VExpansionPanelTitle>
-            <VExpansionPanelText>
-              <dl>
-                <DetailRow label="最终字幕"><CopyValue :value="detail.final_subtitle_path" label="字幕路径" /></DetailRow>
-                <DetailRow label="结果来源">{{ detail.result_source ? sourceLabels[detail.result_source] : '无' }}</DetailRow>
-                <DetailRow label="结果格式">{{ detail.result_format || '未记录' }}</DetailRow>
-                <DetailRow label="结果范围">{{ detail.result_package_scope ? packageLabels[detail.result_package_scope] : '未记录' }}</DetailRow>
-                <DetailRow v-for="(count, key) in detail.record_counts" :key="key" :label="friendlyKey(key)">{{ count }}</DetailRow>
-              </dl>
-              <VAlert v-if="detail.trigger === 'manual_candidate'" type="info" variant="tonal" density="compact" class="mt-3">
-                这是人工字幕搜索选定候选后的下载任务；库存查询与自动准入筛选不会在此任务中重复执行。
-              </VAlert>
-              <dl v-if="detail.trigger === 'manual_candidate'" class="manual-summary mt-3">
-                <DetailRow v-if="detail.manual_source" label="人工来源">{{ sourceLabels[detail.manual_source] }}</DetailRow>
-                <DetailRow v-if="detail.actual_search_query" label="实际搜索词">{{ detail.actual_search_query }}</DetailRow>
-                <DetailRow v-if="detail.manual_candidate_key" label="候选键"><CopyValue :value="detail.manual_candidate_key" label="候选键" /></DetailRow>
-                <DetailRow v-for="[key, value] in detailEntries(detail.manual_candidate_summary)" :key="key" :label="friendlyKey(key)">{{ displayValue(value) }}</DetailRow>
               </dl>
             </VExpansionPanelText>
           </VExpansionPanel>

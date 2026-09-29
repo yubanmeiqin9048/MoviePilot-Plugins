@@ -158,23 +158,3 @@ def response_file_name(headers: Any, url: str, fallback: str) -> str:
     parsed_path = urlparse(url).path
     url_name = "" if parsed_path.endswith("/") else unquote(Path(parsed_path).name)
     return safe_file_name(url_name, fallback)
-
-
-def subtitle_format(file_name: str | None, subtype: str | None = None) -> str:
-    """从文件名或来源格式名称归一出宿主扩展名。"""
-
-    suffix = Path(file_name or "").suffix.lstrip(".").upper()
-    if suffix:
-        return suffix
-    normalized = (subtype or "").strip().lower()
-    aliases = {
-        "subrip": "SRT",
-        "srt": "SRT",
-        "advanced substation alpha": "ASS",
-        "ass": "ASS",
-        "substation alpha": "SSA",
-        "ssa": "SSA",
-        "sup": "SUP",
-        "pgs": "SUP",
-    }
-    return aliases.get(normalized, normalized.upper())

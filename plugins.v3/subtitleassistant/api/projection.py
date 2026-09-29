@@ -52,14 +52,12 @@ def source_item(view: ManualSourceView) -> ManualSourceResult:
             name=candidate.name,
             file_name=candidate.file_name,
             language=candidate.language or None,
-            format=candidate.format or "UNKNOWN",
             package_scope=candidate.package_scope,
             season=candidate.season,
             episode=candidate.episode,
             seasons=list(candidate.seasons),
             episodes=list(candidate.episodes),
             translation_type=candidate.translation_type,
-            hearing_impaired=candidate.hearing_impaired,
         )
 
     run = view.run
