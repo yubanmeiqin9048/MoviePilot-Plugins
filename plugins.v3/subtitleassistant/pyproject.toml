@@ -1,0 +1,43 @@
+[project]
+name = "subtitleassistant"
+version = "1.4.1"
+dependencies = ["yake"]
+
+[tool.ty.environment]
+python-version = "3.12"
+python-platform = "linux"
+
+[tool.ty.src]
+exclude = [
+    ".docs",
+    ".pytest_cache",
+    "**/__pycache__",
+    "frontend",
+    "tests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [
+    ".docs",
+    ".pytest_cache",
+    "**/__pycache__",
+    "frontend",
+    "tests",
+]
+
+[tool.ruff.lint]
+extend-select = ["B", "W", "PERF", "UP", "I", "SIM"]
+ignore = ["SIM105"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]

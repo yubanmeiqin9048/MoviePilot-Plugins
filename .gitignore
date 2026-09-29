@@ -14,6 +14,9 @@ dist/
 !plugins.v2/*/frontend/dist/
 !plugins.v2/*/frontend/dist/assets/
 !plugins.v2/*/frontend/dist/assets/**
+!plugins.v3/*/frontend/dist/
+!plugins.v3/*/frontend/dist/assets/
+!plugins.v3/*/frontend/dist/assets/**
 downloads/
 eggs/
 .eggs/
@@ -77,9 +80,11 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
-# The v2 release staging directory contains publishable plugin files.
+# The v2 and v3 release staging directories contain publishable plugin files.
 !plugins.v2/subtitleassistant/target/
 !plugins.v2/subtitleassistant/target/**
+!plugins.v3/subtitleassistant/target/
+!plugins.v3/subtitleassistant/target/**
 
 # Jupyter Notebook
 .ipynb_checkpoints
