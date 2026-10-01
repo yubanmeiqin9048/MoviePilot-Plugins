@@ -122,7 +122,7 @@ class _TaskTargetPort(Protocol):
     """任务执行所需的字幕目标路径解析能力。"""
 
     def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
-        """解析整理历史目标的实际字幕路径。"""
+        """解析本地媒体目标的实际字幕路径。"""
 
 
 TRIGGER_NAMES = {
@@ -299,6 +299,7 @@ class TaskOperations:
 
         while self._accepting:
             item = await self._queue.get()
+            path_key = self._path_key(item.context.target_path)
             try:
                 task = await self._store.get_task(item.task_id) if item.task_id else None
                 if task is not None:
@@ -317,10 +318,9 @@ class TaskOperations:
                 )
             finally:
                 self._queue.task_done()
-                key = self._path_key(item.context.target_path)
                 async with self._lock:
-                    if self._active_paths.get(key) == item.task_id:
-                        self._active_paths.pop(key, None)
+                    if self._active_paths.get(path_key) == item.task_id:
+                        self._active_paths.pop(path_key, None)
 
     async def _save(self, task: SubtitleTask) -> None:
         """持久化任务快照。"""
@@ -401,17 +401,18 @@ class TaskOperations:
             return False
         return True
 
-    async def _prepare_history_target(self, task: SubtitleTask, item: TaskWorkItem) -> None:
-        """通过唯一目标目录 seam 解析并冻结本次执行的实际路径。"""
+    async def _prepare_target(self, task: SubtitleTask, item: TaskWorkItem) -> None:
+        """实时事件与历史目标都在文件操作前解析并冻结本次实际路径。"""
 
-        if not self._is_history_target(item):
+        if item.context.target_storage != "local" or item.context.target_type != "file":
             return
         history_path = task.history_target_path or item.context.target_path
         resolver = getattr(self._target_catalog, "resolve_actual_subtitle_path", None)
         if not callable(resolver):
             raise TypeError("字幕目标能力未提供实际路径解析")
         resolution = resolver(item.context.model_copy(update={"target_path": history_path}))
-        task.history_target_path = resolution.original_path
+        if self._is_history_target(item) or resolution.mapping_applied:
+            task.history_target_path = resolution.original_path
         task.target_path = resolution.resolved_path
         task.matched_path_mapping = self._mapping_snapshot(resolution)
         task.target_file_exists = await AsyncPath(task.target_path).is_file()
@@ -442,8 +443,8 @@ class TaskOperations:
         await self._save(task)
         if resolution.mapping is not None:
             logger.info(
-                f"{self._task_label(task)}执行时应用整理历史路径映射："
-                f"历史路径为“{resolution.original_path}”，实际路径为“{resolution.resolved_path}”"
+                f"{self._task_label(task)}执行时应用路径映射："
+                f"原始路径为“{resolution.original_path}”，实际路径为“{resolution.resolved_path}”"
             )
 
     async def _search_sources(self, task: SubtitleTask, item: TaskWorkItem) -> list[CandidateHandle]:
@@ -773,8 +774,8 @@ class TaskOperations:
         task.started_at = utc_now()
         await self._save(task)
         try:
+            await self._prepare_target(task, item)
             if item.manual_handle is not None:
-                await self._prepare_history_target(task, item)
                 item.attempt_operation = SubtitleWrittenOperation.MANUAL_CANDIDATE
                 item.attempt_retention = FailureResultRetention.PRESERVE.value
                 candidate_result = await self._try_candidate(task, item, item.manual_handle)
@@ -802,7 +803,6 @@ class TaskOperations:
                         f"人工选择的字幕处理失败：{candidate_result.error_summary or '没有得到可落盘字幕'}",
                     )
                 return
-            await self._prepare_history_target(task, item)
             if not await self._preflight(task, item):
                 return
             inventory = await self._consume_inventory(task, item)

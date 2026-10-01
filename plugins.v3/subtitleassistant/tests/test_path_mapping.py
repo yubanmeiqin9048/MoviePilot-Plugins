@@ -134,3 +134,21 @@ def test_resolve_path_accepts_literal_brackets_in_media_name() -> None:
     result = resolve_path("/history/Show [1080p]/Episode [01].mkv", mappings)
 
     assert result.resolved_path == Path("/current/Show [1080p]/Episode [01].mkv")
+
+
+def test_path_mapping_preserves_symbolic_link_prefixes(tmp_path: Path) -> None:
+    """映射按配置中的目录文本匹配，不把符号链接前缀改成物理目录。"""
+
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    source = tmp_path / "history"
+    source.symlink_to(physical, target_is_directory=True)
+    destination = tmp_path / "current"
+    destination.symlink_to(physical, target_is_directory=True)
+    mapping = PathMapping(source, destination)
+
+    result = resolve_path(source / "Show.mkv", (mapping,))
+
+    assert mapping.as_dict() == {"source_prefix": str(source), "target_prefix": str(destination)}
+    assert result.resolved_path == destination / "Show.mkv"
+    assert result.mapping == mapping

@@ -39,6 +39,7 @@ from app.plugins.subtitleassistant.schemas.task import (
     TaskWorkItem,
 )
 from app.plugins.subtitleassistant.task import TaskOperations
+from app.plugins.subtitleassistant.target import TargetCatalog
 
 pytestmark = pytest.mark.anyio
 
@@ -488,6 +489,7 @@ def _workflow_case(
         media_extensions=["mkv"],
         attributor=attributor or matcher,
         publisher=_NoopPublisher(),
+        target_catalog=TargetCatalog(),
     )
     return coordinator, context, handle, filesystem, store, source
 

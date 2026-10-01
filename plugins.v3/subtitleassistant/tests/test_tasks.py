@@ -488,15 +488,6 @@ class _TargetCatalog:
         return PathMappingResolution(original_path=target.target_path, resolved_path=target.target_path)
 
 
-class _FailingTargetCatalog(_TargetCatalog):
-    """测试实时整理事件不应访问的路径解析 facade。"""
-
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
-        """如果实时目标误调用解析能力则立即失败。"""
-
-        raise AssertionError(f"实时整理目标不应解析路径：{target.target_path}")
-
-
 class _LogCapture:
     """收集协调器结构化日志文本。"""
 
@@ -675,7 +666,7 @@ def _coordinator(
         inventory=active_inventory,
         media_extensions=["mkv"],
         attributor=active_matcher,
-        target_catalog=target_catalog,
+        target_catalog=target_catalog or TargetCatalog(config_provider=lambda: active_config),
         publisher=publisher or _CapturePublisher(),
         manage_resources=manage_resources,
     )
@@ -738,16 +729,37 @@ async def test_transfer_complete_uses_transfer_target_and_builds_safe_context() 
     assert (item.context.tmdb_id, item.context.imdb_id) == (987, "tt1234567")
 
 
-async def test_live_transfer_target_does_not_resolve_history_path(
+@pytest.mark.parametrize("history_id", [None, 73])
+@pytest.mark.parametrize("video_exists", [False, True])
+async def test_live_transfer_checks_mapped_video_and_existing_subtitle(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    history_id: int | None,
+    video_exists: bool,
 ) -> None:
-    """实时整理目标即使带有历史编号也直接使用事件路径。"""
+    """实时事件无论有无历史编号，都在映射目录检查视频及已有字幕。"""
 
-    item = _work_item(tmp_path, "live-event")
-    item.target_history_id = 73
+    original_root = tmp_path / "original"
+    current_root = tmp_path / "current"
+    await AsyncPath(current_root).mkdir()
+    item = _work_item(original_root, "live-event")
+    original_path = item.context.target_path
+    actual_path = current_root / original_path.name
+    if video_exists:
+        await AsyncPath(actual_path).write_bytes(b"video")
+    await AsyncPath(actual_path.with_suffix(".chi.zh-cn.srt")).write_text("已有字幕")
+    item.target_history_id = history_id
     item.history_target = False
-    coordinator = _coordinator(tmp_path, target_catalog=_FailingTargetCatalog(()))
+    config = _config()
+    config.path_mappings = (PathMapping(original_root, current_root),)
+    pool = _TaskCandidatePool({})
+    inventory = _TaskInventory()
+    coordinator = _coordinator(
+        tmp_path,
+        filesystem=SubtitleFiles(tmp_path / "plugin-data", {"srt"}),
+        target_catalog=TargetCatalog(config_provider=lambda: config),
+        inventory=inventory,
+        candidate_pool=pool,
+    )
     task = SubtitleTask(
         media_title=item.context.title,
         target_file_name=item.context.target_file_name,
@@ -755,58 +767,51 @@ async def test_live_transfer_target_does_not_resolve_history_path(
         target_history_id=item.target_history_id,
     )
 
-    async def stop_before_filesystem_checks(_task: SubtitleTask, _item: TaskWorkItem) -> bool:
-        """只验证实时目标没有进入路径解析。"""
-
-        await coordinator._finish_task(_task, TaskStatus.FAILED, "test_stop", "测试结束")
-        return False
-
-    monkeypatch.setattr(coordinator, "_preflight", stop_before_filesystem_checks)
-
     await coordinator._process(task, item)
 
-    assert task.status is TaskStatus.FAILED
-    assert task.target_path == item.context.target_path
-    assert task.history_target_path is None
+    assert task.status is (TaskStatus.SKIPPED if video_exists else TaskStatus.FAILED)
+    assert task.reason_code == ("existing_standard_subtitle" if video_exists else "target_missing")
+    assert task.target_path == actual_path
+    assert task.history_target_path == original_path
+    assert task.target_file_exists is video_exists
+    assert task.matched_path_mapping is not None
+    assert pool.query_calls == []
+    assert inventory.consume_calls == []
 
 
-async def test_historical_automatic_target_resolves_once_before_inventory(
+@pytest.mark.parametrize("history_target", [False, True])
+async def test_automatic_target_resolves_once_before_inventory(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    history_target: bool,
 ) -> None:
-    """自动整理历史目标在库存消费前解析一次并复用实际路径。"""
+    """实时和历史自动目标都在前置检查及库存消费前解析一次。"""
 
     history_root = tmp_path / "history"
     current_root = tmp_path / "current"
     await AsyncPath(current_root).mkdir(parents=True)
-    history_target = history_root / "Show.S01E01.mkv"
-    actual_target = current_root / history_target.name
+    history_path = history_root / "Show.S01E01.mkv"
+    actual_target = current_root / history_path.name
+    await AsyncPath(actual_target).write_bytes(b"video")
     item = _work_item(tmp_path, "historical")
-    item.context = item.context.model_copy(update={"target_path": history_target})
+    item.context = item.context.model_copy(update={"target_path": history_path})
     item.target_history_id = 91
-    item.history_target = True
+    item.history_target = history_target
     catalog = _TargetCatalog((PathMapping(history_root, current_root),))
     inventory = _TaskInventory(InventoryConsumeResult(matched=True, record=_inventory_record(item.context)))
     coordinator = _coordinator(tmp_path, target_catalog=catalog, inventory=inventory)
     task = SubtitleTask(
         media_title=item.context.title,
         target_file_name=item.context.target_file_name,
-        target_path=history_target,
+        target_path=history_path,
         target_history_id=item.target_history_id,
     )
 
-    async def pass_preflight(_task: SubtitleTask, _item: TaskWorkItem) -> bool:
-        """让测试聚焦于路径解析与库存消费边界。"""
-
-        return True
-
-    monkeypatch.setattr(coordinator, "_preflight", pass_preflight)
-
     await coordinator._process(task, item)
 
-    assert catalog.calls == [history_target]
+    assert task.status is TaskStatus.SUCCESS
+    assert catalog.calls == [history_path]
     assert inventory.consume_calls == [(actual_target, task.id)]
-    assert task.history_target_path == history_target
+    assert task.history_target_path == history_path
     assert task.target_path == actual_target
     assert task.matched_path_mapping is not None
 
@@ -835,7 +840,7 @@ async def test_historical_target_allows_missing_video_when_mapped_parent_is_avai
         target_history_id=item.target_history_id,
     )
 
-    await coordinator._prepare_history_target(task, item)
+    await coordinator._prepare_target(task, item)
 
     assert await coordinator._preflight(task, item) is True
     assert task.target_file_exists is False
@@ -852,6 +857,7 @@ async def test_historical_manual_target_without_catalog_is_assembly_failure(
     item.history_target = True
     item.manual_handle = _candidate("manual-without-catalog")
     coordinator = _coordinator(tmp_path)
+    coordinator._target_catalog = None
     task = SubtitleTask(
         trigger=TaskTrigger.MANUAL_CANDIDATE,
         media_title=item.context.title,
@@ -2215,7 +2221,7 @@ async def test_task_coordinator_publishes_multiple_manual_and_inventory_records(
 
         return _candidate_result(manual_records, _handle.candidate)
 
-    monkeypatch.setattr(manual_coordinator, "_prepare_history_target", prepare_manual)
+    monkeypatch.setattr(manual_coordinator, "_prepare_target", prepare_manual)
     monkeypatch.setattr(manual_coordinator, "_try_candidate", succeed_manual)
     await manual_coordinator._process(manual_task, manual_item)
 
@@ -2376,7 +2382,7 @@ async def test_task_coordinator_publishes_manual_candidate_and_inventory_once(
 
         return _candidate_result([manual_record], _handle.candidate)
 
-    monkeypatch.setattr(manual_coordinator, "_prepare_history_target", prepare_manual)
+    monkeypatch.setattr(manual_coordinator, "_prepare_target", prepare_manual)
     monkeypatch.setattr(manual_coordinator, "_try_candidate", succeed_manual)
     await manual_coordinator._process(manual_task, manual_item)
 
@@ -2477,7 +2483,7 @@ async def test_task_coordinator_does_not_publish_failed_manual_candidate(
 
         return _candidate_result([], _handle.candidate)
 
-    monkeypatch.setattr(coordinator, "_prepare_history_target", prepare_manual)
+    monkeypatch.setattr(coordinator, "_prepare_target", prepare_manual)
     monkeypatch.setattr(coordinator, "_try_candidate", fail_candidate)
 
     await coordinator._process(task, item)
@@ -2546,16 +2552,22 @@ async def test_shutdown_cancels_current_and_marks_current_and_queued_tasks_inter
     assert source.close_calls == 1
 
 
-async def test_manual_download_maps_history_path_at_execution_and_allows_missing_video(
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("history_id", [None, 91])
+async def test_download_maps_target_path_at_execution(
     tmp_path: Path,
+    manual: bool,
+    history_id: int | None,
 ) -> None:
-    """人工下载执行时应用路径映射，目标视频缺失但父目录可写仍可落盘。"""
+    """自动事件及人工下载都映射落盘、保存原路径并发布实际路径。"""
 
     history_root = tmp_path / "history"
     current_root = tmp_path / "current"
     await AsyncPath(current_root).mkdir(parents=True)
     history_target = history_root / "Show.S01E01.mkv"
     resolved_target = current_root / history_target.name
+    if not manual:
+        await AsyncPath(resolved_target).write_bytes(b"video")
 
     async def download(_handle: CandidateHandle, directory: Path) -> DownloadedAsset:
         """生成一个直接字幕文件，不经过归档策略。"""
@@ -2570,6 +2582,15 @@ async def test_manual_download_maps_history_path_at_execution_and_allows_missing
     config = _config()
     config.path_mappings = (PathMapping(str(history_root), str(current_root)),)
     filesystem = SubtitleFiles(tmp_path / "plugin-data", {"srt"})
+    handle = _candidate("direct")
+    pool = _TaskCandidatePool(
+        {SubtitleSource.MOVIEPILOT: source},
+        results={
+            SubtitleSource.MOVIEPILOT: SourceSearchResult(
+                source=SubtitleSource.MOVIEPILOT, status="success", candidates=[handle]
+            )
+        },
+    )
     coordinator = _coordinator(
         tmp_path,
         store=store,
@@ -2578,9 +2599,9 @@ async def test_manual_download_maps_history_path_at_execution_and_allows_missing
         sources={SubtitleSource.MOVIEPILOT: source},
         config=config,
         publisher=publisher,
-        target_catalog=_TargetCatalog(config.path_mappings),
+        target_catalog=TargetCatalog(config_provider=lambda: config),
+        candidate_pool=pool,
     )
-    handle = _candidate("manual-direct")
     context = SubtitleTarget(
         title="Show",
         media_type=MediaType.TV,
@@ -2593,36 +2614,69 @@ async def test_manual_download_maps_history_path_at_execution_and_allows_missing
     )
     item = TaskWorkItem(
         context=context,
-        target_history_id=91,
+        target_history_id=history_id,
+        history_target=True,
         manual_handle=handle,
     )
 
-    enqueue_result = await coordinator.enqueue(item)
+    if manual:
+        enqueue_result = await coordinator.enqueue(item)
+        assert enqueue_result is not None
+        task_id = enqueue_result.id
+    else:
+        runtime = object.__new__(PluginRuntime)
+        runtime._enabled = True
+        runtime.coordinator = coordinator
+        await runtime.on_transfer_complete(
+            Event(
+                EventType.TransferComplete,
+                {
+                    "transferinfo": SimpleNamespace(
+                        target_item=SimpleNamespace(
+                            path=str(history_target),
+                            name=history_target.name,
+                            storage="local",
+                            type="file",
+                            extension="mkv",
+                        )
+                    ),
+                    "meta": SimpleNamespace(name="Show", begin_season=1, begin_episode=1),
+                    "mediainfo": SimpleNamespace(title="Show", tmdb_id=123, type=SimpleNamespace(name="TV")),
+                    "transfer_history_id": history_id,
+                },
+            )
+        )
+        task_id = next(iter(store.tasks))
     await coordinator._queue.join()
 
-    assert enqueue_result is not None
-    task_id = enqueue_result.id
     task = store.tasks[task_id]
     assert task.status is TaskStatus.SUCCESS
-    assert task.target_history_id == 91
+    assert task.target_history_id == history_id
     assert task.history_target_path == history_target
     assert task.target_path == resolved_target
-    assert task.target_file_exists is False
+    assert task.target_file_exists is (not manual)
     assert task.matched_path_mapping is not None
     record = next(iter(store.records.values()))
     assert record.final_subtitle_path is not None
     assert await AsyncPath(record.final_subtitle_path).is_file()
-    assert record.target_history_id == 91
+    assert record.target_history_id == history_id
     assert record.history_target_path == history_target
     assert record.target_path == resolved_target
-    assert record.target_file_exists is False
+    assert record.target_file_exists is (not manual)
+    assert record.matched_path_mapping == task.matched_path_mapping
+    assert record.final_subtitle_path.parent == current_root
+    assert not await AsyncPath(history_root).exists()
     assert record.file_attribution_method is FileAttributionMethod.DIRECT_FILE
     assert len(publisher.events) == 1
-    assert publisher.events[0].operation is SubtitleWrittenOperation.MANUAL_CANDIDATE
+    assert publisher.events[0].operation is (
+        SubtitleWrittenOperation.MANUAL_CANDIDATE if manual else SubtitleWrittenOperation.AUTOMATIC_CANDIDATE
+    )
     assert publisher.events[0].record_id == record.id
     assert publisher.events[0].task_id == task.id
     assert publisher.events[0].target_path == resolved_target
     assert publisher.events[0].subtitle_path == record.final_subtitle_path
+    assert coordinator._active_paths == {}
+    assert [target.target_path for target in pool.query_calls] == ([] if manual else [resolved_target])
     await coordinator.shutdown()
 
 

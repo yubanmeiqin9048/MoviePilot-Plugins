@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -85,14 +86,14 @@ class PathMapping:
     target_prefix: Path
 
     def __post_init__(self) -> None:
-        """规范化两个绝对目录前缀并拒绝同路径。"""
+        """按目录文本规范化绝对前缀，不解析符号链接，并拒绝同路径。"""
 
         source = Path(self.source_prefix).expanduser()
         target = Path(self.target_prefix).expanduser()
         if not source.is_absolute() or not target.is_absolute():
             raise ValueError("路径映射前缀必须是绝对路径")
-        source = source.resolve(strict=False)
-        target = target.resolve(strict=False)
+        source = Path(os.path.normpath(source))
+        target = Path(os.path.normpath(target))
         if source == target:
             raise ValueError("路径映射前缀不能相同")
         object.__setattr__(self, "source_prefix", source)
