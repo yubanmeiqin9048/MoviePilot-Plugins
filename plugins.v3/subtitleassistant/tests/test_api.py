@@ -665,7 +665,7 @@ async def test_batch_retarget_submit_returns_409_with_full_preflight() -> None:
         started=False,
     )
     payload = BatchRetargetSubmitRequest.model_validate(
-        {"items": [{"record_id": "record-one", "target_history_id": 7}]}
+        {"items": [{"record_id": "record-one", "target_history_id": 7, "expected_final_subtitle_path": "/media/one.chi.zh-cn.srt"}]}
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -712,8 +712,8 @@ async def test_batch_retarget_submit_returns_partial_success_results() -> None:
     payload = BatchRetargetSubmitRequest.model_validate(
         {
             "items": [
-                {"record_id": "record-one", "target_history_id": 7},
-                {"record_id": "record-two", "target_history_id": 8},
+                {"record_id": "record-one", "target_history_id": 7, "expected_final_subtitle_path": "/media/one.chi.zh-cn.srt"},
+                {"record_id": "record-two", "target_history_id": 8, "expected_final_subtitle_path": "/media/two.chi.zh-cn.srt"},
             ]
         }
     )

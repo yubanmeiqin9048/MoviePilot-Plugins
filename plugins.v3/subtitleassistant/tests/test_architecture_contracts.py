@@ -142,7 +142,7 @@ SCHEMA_EXPORTS = {
         "PathMapping",
         "PathMappingResolution",
         "PathMappingSnapshot",
-        "ResolvedTarget",
+        "SubtitleDestination",
         "SearchTarget",
         "SubtitleTarget",
     },
@@ -177,6 +177,7 @@ HTTP_SCHEMA_EXPORTS = {
         "RecordPage",
         "RetargetPreviewResponse",
         "RetargetRequest",
+        "RetargetSubmitRequest",
     },
     "search": {
         "ManualCandidateItem",

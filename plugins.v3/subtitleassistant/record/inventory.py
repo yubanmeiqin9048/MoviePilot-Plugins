@@ -14,7 +14,7 @@ from app.sdk.logging import logger
 from ..candidate import record_rank
 from ..schemas.base import utc_now
 from ..schemas.record import FileLocation, InventoryConsumeResult, MatchRecord, RecordStatus
-from ..schemas.target import PathMappingSnapshot, SubtitleTarget
+from ..schemas.target import PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 from .lock import ReentrantAsyncLock
 
 if TYPE_CHECKING:
@@ -177,6 +177,7 @@ class SubtitleInventory:
         history_target_path: Path | str | None = None,
         matched_path_mapping: PathMappingSnapshot | None = None,
         target_file_exists: bool | None = None,
+        destination: SubtitleDestination | None = None,
     ) -> InventoryConsumeResult:
         """精确命中并消费当前媒体所有可提交的暂存字幕文件。"""
 
@@ -204,23 +205,24 @@ class SubtitleInventory:
             warnings: list[str] = []
             for selected in ranked:
                 original = selected.model_copy(deep=True)
-                destination: Path | None = None
+                written_path: Path | None = None
                 try:
                     source = await self._filesystem.plugin_file_path(str(selected.path))
-                    destination = await self._filesystem.write_media_subtitle(
+                    written_path = await self._filesystem.write_media_subtitle(
                         source,
-                        Path(context.target_path),
+                        context.target_path,
+                        destination,
                     )
                     now = utc_now()
                     selected.status = RecordStatus.MATCHED
                     selected.location = FileLocation.MEDIA_DIRECTORY
-                    selected.path = Path(destination)
+                    selected.path = Path(written_path)
                     selected.target_history_id = target_history_id
                     selected.history_target_path = normalized_history_target_path
                     selected.target_path = context.target_path
                     selected.matched_path_mapping = matched_path_mapping
                     selected.target_file_exists = target_file_exists
-                    selected.final_subtitle_path = Path(destination)
+                    selected.final_subtitle_path = Path(written_path)
                     selected.consumed_task_id = task_id
                     selected.consumed_at = now
                     selected.updated_at = now
@@ -233,9 +235,9 @@ class SubtitleInventory:
                         await self._store.save_record(original)
                     except BaseException as rollback_exc:  # noqa: BLE001 - 取消期间的回滚失败也必须记录
                         rollback_errors.append(rollback_exc)
-                    if destination is not None:
+                    if written_path is not None:
                         try:
-                            await self._filesystem.delete_subtitle_file(destination)
+                            await self._filesystem.delete_subtitle_file(written_path)
                         except BaseException as rollback_exc:  # noqa: BLE001 - 取消期间的回滚失败也必须记录
                             rollback_errors.append(rollback_exc)
                     if rollback_errors:

@@ -14,6 +14,7 @@ from app.plugins.subtitleassistant.schemas.attribution import FileAttributionMet
 from app.plugins.subtitleassistant.schemas.record import FileLocation, MatchRecord, RecordStatus
 from app.plugins.subtitleassistant.schemas.source import SourceHealth, SourceStatus, SubtitleSource
 from app.plugins.subtitleassistant.schemas.task import SubtitleTask, TaskStatus
+from app.plugins.subtitleassistant.schemas.target import PathMappingSnapshot
 from app.plugins.subtitleassistant.store import PluginDataStore, StoreInitializationError
 
 
@@ -670,3 +671,38 @@ def test_record_hearing_flag_is_removed_once_during_migration(version: int) -> N
     plugin.save_calls.clear()
     PluginDataStore(plugin).initialize()
     assert plugin.save_calls == []
+
+
+@pytest.mark.anyio
+async def test_old_mapping_snapshots_and_subtitle_paths_are_not_recomputed() -> None:
+    """旧版本记录按原快照读取，新保存目录字段缺失不触发路径重算或文件迁移。"""
+
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    task = _task("old-task", TaskStatus.SUCCESS, now)
+    task.history_target_path = Path("/old-media/Test.S01E01.mkv")
+    task.target_path = Path("/old-output/Test.S01E01.mkv")
+    mapping = PathMappingSnapshot(source_prefix=Path("/old-media"), target_prefix=Path("/old-output"))
+    task.matched_path_mapping = mapping
+    payload = task.model_dump(mode="json", exclude={"subtitle_directory"})
+    record = _record("old-record", RecordStatus.MATCHED, now)
+    record.history_target_path = task.history_target_path
+    record.target_path = task.target_path
+    record.matched_path_mapping = mapping
+    record.path = Path("/old-output/Test.S01E01.chi.zh-cn.srt")
+    record.final_subtitle_path = record.path
+    partitions = _valid_partitions()
+    partitions[PluginDataStore.TASKS_KEY] = _partition([payload])
+    partitions[PluginDataStore.RECORDS_KEY] = _partition([record.model_dump(mode="json")])
+    plugin = FakePlugin(partitions)
+    store = PluginDataStore(plugin)
+
+    store.initialize()
+
+    loaded_task = await store.get_task(task.id)
+    loaded_record = await store.get_record(record.id)
+    assert loaded_task is not None and loaded_task.subtitle_directory is None
+    assert loaded_task.target_path == task.target_path
+    assert loaded_task.matched_path_mapping == mapping
+    assert loaded_record == record
+    assert plugin.save_calls == []
+    assert plugin.async_save_calls == []

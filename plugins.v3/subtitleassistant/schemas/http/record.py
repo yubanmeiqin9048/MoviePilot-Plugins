@@ -54,6 +54,7 @@ __all__ = [
     "RecordPage",
     "RetargetPreviewResponse",
     "RetargetRequest",
+    "RetargetSubmitRequest",
 ]
 
 
@@ -261,6 +262,12 @@ class RetargetRequest(ApiModel):
     target_history_id: _HistoryId
 
 
+class RetargetSubmitRequest(RetargetRequest):
+    """携带用户已确认字幕保存位置的改配提交请求。"""
+
+    expected_final_subtitle_path: str = Field(min_length=1, max_length=4096)
+
+
 class RetargetPreviewResponse(ApiModel):
     """改配目标弹窗的服务端路径预览。"""
 
@@ -285,11 +292,10 @@ class BatchRetargetPreviewRequest(ApiModel):
     items: list[BatchRetargetPreviewMapping] = Field(min_length=1, max_length=100)
 
 
-class BatchRetargetSubmitMapping(ApiModel):
+class BatchRetargetSubmitMapping(RetargetSubmitRequest):
     """批量改配提交中的一条已确认记录目标配对。"""
 
     record_id: str = Field(min_length=1, max_length=128)
-    target_history_id: _HistoryId
 
 
 class BatchRetargetSubmitRequest(ApiModel):

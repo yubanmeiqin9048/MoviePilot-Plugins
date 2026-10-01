@@ -35,8 +35,10 @@ class SubtitleAssistant(_PluginBase):
         self._runtime: PluginRuntime | None = None
 
     def init_plugin(self, config: Mapping[str, object] | None = None) -> None:
-        """停止旧运行态并通过唯一组合根装配新运行态。"""
+        """仅修改字幕映射时保留运行任务，其余配置通过组合根重新装配。"""
 
+        if self._runtime is not None and self._runtime.update_path_mappings(config):
+            return
         self.stop_service()
         try:
             self._runtime = build_runtime(self, config)

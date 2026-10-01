@@ -20,8 +20,8 @@ __all__ = [
     "PathMapping",
     "PathMappingResolution",
     "PathMappingSnapshot",
-    "ResolvedTarget",
     "SearchTarget",
+    "SubtitleDestination",
     "SubtitleTarget",
 ]
 
@@ -72,7 +72,7 @@ class SubtitleTarget(StrictModel):
 
 
 class PathMappingSnapshot(StrictModel):
-    """一次任务或改配实际命中的整理历史路径映射。"""
+    """一次任务或改配实际命中的字幕保存目录映射快照。"""
 
     source_prefix: Path
     target_prefix: Path
@@ -80,7 +80,7 @@ class PathMappingSnapshot(StrictModel):
 
 @dataclass(frozen=True, slots=True)
 class PathMapping:
-    """一组历史本地目录前缀到当前本地目录前缀的规则值。"""
+    """一组媒体目录前缀到字幕保存目录前缀的规则值。"""
 
     source_prefix: Path
     target_prefix: Path
@@ -107,7 +107,7 @@ class PathMapping:
 
 @dataclass(frozen=True, slots=True)
 class PathMappingResolution:
-    """一次历史目标路径解析后的结果。"""
+    """一次目录前缀替换的纯规则结果。"""
 
     original_path: Path
     resolved_path: Path
@@ -121,23 +121,17 @@ class PathMappingResolution:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedTarget(PathMappingResolution):
-    """整理历史目标一次解析后冻结的路径与执行目标事实。"""
+class SubtitleDestination:
+    """一次执行固定的字幕保存目录，不携带或改写媒体事实。"""
 
-    title: str = ""
-    original_title: str | None = None
-    english_title: str | None = None
-    year: int | None = None
-    media_type: MediaType = MediaType.UNKNOWN
-    season: int | None = None
-    episode: int | None = None
-    tmdb_id: int | None = None
-    imdb_id: str | None = None
-    target_file_name: str = ""
-    target_storage: str | None = None
-    target_type: str = "file"
-    target_extension: str | None = None
-    target_container: str | None = None
+    directory: Path
+    mapping: PathMapping | None = None
+
+    @property
+    def required_root(self) -> Path:
+        """返回必须事先存在、不能自动创建的保存根目录。"""
+
+        return self.mapping.target_prefix if self.mapping else self.directory
 
 
 @dataclass(slots=True)

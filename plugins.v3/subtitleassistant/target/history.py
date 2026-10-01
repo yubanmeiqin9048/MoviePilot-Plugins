@@ -17,7 +17,7 @@ from app.sdk.queries import (
 )
 
 from ..schemas.config import PluginConfig
-from ..schemas.target import ResolvedTarget, SearchTarget, SubtitleTarget
+from ..schemas.target import SearchTarget, SubtitleDestination, SubtitleTarget
 from .mapping import resolve_path
 from .projection import target_from_history
 
@@ -84,7 +84,7 @@ def _history_filter(value: str | None) -> TransferHistoryFilter:
 
 
 class TargetCatalogService:
-    """拥有整理历史分页、目标投影与实际字幕路径解析。"""
+    """拥有整理历史分页、目标投影与字幕保存目录解析。"""
 
     def __init__(
         self,
@@ -160,27 +160,12 @@ class TargetCatalogService:
         history = await self._history_query.async_get_transfer_history(history_id)
         return self._to_target(history)
 
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> ResolvedTarget:
-        """仅在执行文件操作时按当前配置解析并冻结实际字幕目标。"""
+    def resolve_subtitle_destination(self, target: SubtitleTarget) -> SubtitleDestination:
+        """按当前配置解析字幕保存目录，保持媒体上下文不变。"""
 
         config = self._config_provider()
-        resolution = resolve_path(target.target_path, getattr(config, "path_mappings", ()))
-        return ResolvedTarget(
-            original_path=resolution.original_path,
-            resolved_path=resolution.resolved_path,
+        resolution = resolve_path(target.target_path.parent, config.path_mappings)
+        return SubtitleDestination(
+            directory=resolution.resolved_path,
             mapping=resolution.mapping,
-            title=target.title,
-            original_title=target.original_title,
-            english_title=target.english_title,
-            year=target.year,
-            media_type=target.media_type,
-            season=target.season,
-            episode=target.episode,
-            tmdb_id=target.tmdb_id,
-            imdb_id=target.imdb_id,
-            target_file_name=target.target_file_name,
-            target_storage=target.target_storage,
-            target_type=target.target_type,
-            target_extension=target.target_extension,
-            target_container=target.target_container,
         )

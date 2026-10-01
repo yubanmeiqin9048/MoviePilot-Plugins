@@ -66,7 +66,7 @@ _PageSize = Annotated[PageSize, BeforeValidator(_page_size_parser)]
 
 
 class PathMappingSnapshot(ApiModel):
-    """任务目标实际命中的整理历史路径映射投影。"""
+    """任务执行时命中的字幕保存目录映射快照。"""
 
     source_prefix: str
     target_prefix: str
@@ -103,6 +103,7 @@ class TaskDetail(TaskListItem):
     target_storage: str | None
     matched_path_mapping: PathMappingSnapshot | None
     target_file_exists: bool | None
+    subtitle_directory: str | None = None
 
 
 class TaskPage(ApiModel):

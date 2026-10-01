@@ -6,6 +6,7 @@ import pytest
 from anyio import Path as AsyncPath
 from app.plugins.subtitleassistant.file import SubtitleFiles
 from app.plugins.subtitleassistant.schemas.record import RecordStatus
+from app.plugins.subtitleassistant.schemas.target import PathMapping, SubtitleDestination
 
 pytestmark = pytest.mark.anyio
 
@@ -168,3 +169,98 @@ async def test_save_plugin_file_rejects_matched_status(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="暂存或未匹配"):
         await filesystem.save_plugin_file(source, "record-1", RecordStatus.MATCHED)
+
+
+async def test_mapped_subtitle_directory_is_previewed_without_creation_and_written_without_video(tmp_path: Path) -> None:
+    """预检不创建目录，实际保存仅创建映射根下的相对目录且不依赖视频。"""
+
+    media_root = tmp_path / "media"
+    save_root = tmp_path / "subtitles"
+    await AsyncPath(save_root).mkdir()
+    media = media_root / "Show" / "Season 01" / "E01.mkv"
+    source = tmp_path / "download.srt"
+    await AsyncPath(source).write_bytes(b"subtitle")
+    destination = SubtitleDestination(save_root / "Show" / "Season 01", PathMapping(media_root, save_root))
+    filesystem = SubtitleFiles(tmp_path / "plugin", {"srt"})
+
+    assert await filesystem.target_directory_status(media, destination) == (True, None)
+    assert not await AsyncPath(destination.directory).exists()
+    written = await filesystem.write_media_subtitle(source, media, destination)
+
+    assert written == save_root / "Show" / "Season 01" / "E01.chi.zh-cn.srt"
+    assert await AsyncPath(written).read_bytes() == b"subtitle"
+    assert not await AsyncPath(media_root).exists()
+    assert not await AsyncPath(destination.directory / media.name).exists()
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+async def test_missing_save_root_is_not_created_or_replaced_with_media_directory(tmp_path: Path, mapped: bool) -> None:
+    """映射根缺失不回退到媒体目录；未映射时也不创建缺失的媒体目录。"""
+
+    media = tmp_path / "media" / "Movie.mkv"
+    source = tmp_path / "download.srt"
+    await AsyncPath(source).write_bytes(b"subtitle")
+    root = tmp_path / "missing"
+    destination = None
+    if mapped:
+        await AsyncPath(media.parent).mkdir()
+        destination = SubtitleDestination(root / "nested", PathMapping(media.parent, root))
+    filesystem = SubtitleFiles(tmp_path / "plugin", {"srt"})
+
+    available, _ = await filesystem.target_directory_status(media, destination)
+    assert not available
+    with pytest.raises(OSError, match="保存根目录"):
+        await filesystem.write_media_subtitle(source, media, destination)
+    assert not await AsyncPath(root).exists()
+    assert not await AsyncPath(media.with_suffix(".chi.zh-cn.srt")).exists()
+    assert (await AsyncPath(media.parent).exists()) is mapped
+
+
+async def test_existing_subtitle_checks_only_save_directory(tmp_path: Path) -> None:
+    """媒体旁的标准字幕不阻止独立目录保存，保存目录内的标准字幕才算命中。"""
+
+    media = tmp_path / "media" / "Movie.mkv"
+    original_subtitle = media.with_suffix(".chi.zh-cn.srt")
+    await _write(original_subtitle, b"original")
+    root = tmp_path / "subtitles"
+    await AsyncPath(root).mkdir()
+    destination = SubtitleDestination(root, PathMapping(media.parent, root))
+    filesystem = SubtitleFiles(tmp_path / "plugin", {"srt", "ass"})
+
+    assert await filesystem.has_standard_subtitle(media, destination) is None
+    saved = root / "Movie.default.chi.zh-cn.ass"
+    await _write(saved, b"saved")
+    assert await filesystem.has_standard_subtitle(media, destination) == saved
+    assert await AsyncPath(original_subtitle).read_bytes() == b"original"
+
+
+async def test_disappearing_mapping_root_is_not_recreated_after_preflight(tmp_path: Path) -> None:
+    """预检后根目录消失时写入失败，不能自动重建根或向媒体旁写入。"""
+
+    media = tmp_path / "media" / "Movie.mkv"
+    root = tmp_path / "subtitles"
+    await AsyncPath(root).mkdir()
+    destination = SubtitleDestination(root / "nested", PathMapping(media.parent, root))
+    source = tmp_path / "download.srt"
+    await AsyncPath(source).write_bytes(b"subtitle")
+    filesystem = SubtitleFiles(tmp_path / "plugin", {"srt"})
+    assert (await filesystem.target_directory_status(media, destination))[0]
+
+    await AsyncPath(root).rmdir()
+    with pytest.raises(OSError, match="保存根目录"):
+        await filesystem.write_media_subtitle(source, media, destination)
+    assert not await AsyncPath(root).exists()
+    assert not await AsyncPath(media.parent).exists()
+
+
+async def test_unmapped_subtitle_can_be_saved_beside_missing_video(tmp_path: Path) -> None:
+    """未命中映射时只要求媒体目录可写，不要求视频存在。"""
+
+    source = tmp_path / "download.srt"
+    await AsyncPath(source).write_bytes(b"subtitle")
+    media = tmp_path / "Movie.mkv"
+    filesystem = SubtitleFiles(tmp_path / "plugin", {"srt"})
+    written = await filesystem.write_media_subtitle(source, media)
+    assert written == tmp_path / "Movie.chi.zh-cn.srt"
+    assert await AsyncPath(written).read_bytes() == b"subtitle"
+    assert not await AsyncPath(media).exists()

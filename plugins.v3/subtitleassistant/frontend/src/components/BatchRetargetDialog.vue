@@ -326,6 +326,7 @@ async function submit(): Promise<void> {
       pendingRows.value.map((row, index) => ({
         record_id: row.record.id,
         target_history_id: targetHistoryIds[index]!,
+        expected_final_subtitle_path: row.preview!.preview!.final_subtitle_path,
       })),
     )
     const byId = new Map(result.items.map(item => [item.record_id, item]))

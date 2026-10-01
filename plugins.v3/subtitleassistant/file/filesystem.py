@@ -11,6 +11,7 @@ from pathlib import Path
 from anyio import Path as AsyncPath
 
 from ..schemas.record import RecordStatus
+from ..schemas.target import SubtitleDestination
 
 
 class SubtitleFiles:
@@ -45,10 +46,10 @@ class SubtitleFiles:
             for extension in self.allowed_formats
         }
 
-    async def has_standard_subtitle(self, target: Path) -> Path | None:
-        """查找严格同主文件名的标准简中外挂字幕。"""
+    async def has_standard_subtitle(self, target: Path, destination: SubtitleDestination | None = None) -> Path | None:
+        """只在指定保存目录查找与媒体同主文件名的标准简中字幕。"""
 
-        parent = AsyncPath(target.parent)
+        parent = AsyncPath(destination.directory if destination else target.parent)
         if not await parent.exists():
             return None
         expected = {item.casefold() for item in self._media_subtitle_names(target)}
@@ -91,13 +92,14 @@ class SubtitleFiles:
             raise
         return total
 
-    def media_subtitle_path(self, source: Path, target: Path) -> Path:
+    def media_subtitle_path(self, source: Path, target: Path, destination: SubtitleDestination | None = None) -> Path:
         """返回字幕按宿主标准命名规则落盘后的预计路径。"""
 
         extension = source.suffix.lower().lstrip(".")
         if extension not in self.allowed_formats:
             raise ValueError(f"字幕格式不在宿主允许集合中：{extension}")
-        return target.with_name(f"{target.stem}.chi.zh-cn.{extension}")
+        directory = destination.directory if destination else target.parent
+        return directory / f"{target.stem}.chi.zh-cn.{extension}"
 
     async def is_file(self, path: Path) -> bool:
         """判断路径当前是否为普通文件。"""
@@ -109,17 +111,27 @@ class SubtitleFiles:
 
         return await self._copy_exclusive(source, target)
 
-    async def target_directory_status(self, target: Path) -> tuple[bool, str | None]:
-        """检查目标文件父目录是否存在、为目录且当前可写。"""
+    async def target_directory_status(
+        self, target: Path, destination: SubtitleDestination | None = None
+    ) -> tuple[bool, str | None]:
+        """只读检查保存根与已有相对目录，不创建目录或检查视频。"""
 
-        parent = AsyncPath(target.parent)
-        if not await parent.exists():
-            return False, "目标目录不存在"
-        if not await parent.is_dir():
-            return False, "目标父路径不是目录"
-        writable = await asyncio.to_thread(os.access, target.parent, os.W_OK)
+        destination = destination or SubtitleDestination(directory=target.parent)
+        root = destination.required_root
+        if not await AsyncPath(root).is_dir():
+            return False, "字幕保存根目录不存在或不是目录"
+        current = root
+        writable_parent = root
+        for part in destination.directory.relative_to(root).parts:
+            current /= part
+            path = AsyncPath(current)
+            if await path.exists():
+                if not await path.is_dir():
+                    return False, "字幕保存路径中存在非目录文件"
+                writable_parent = current
+        writable = await asyncio.to_thread(os.access, writable_parent, os.W_OK)
         if not writable:
-            return False, "目标目录不可写"
+            return False, "字幕保存目录不可写"
         return True, None
 
     async def delete_subtitle_file(self, path: Path) -> None:
@@ -191,12 +203,22 @@ class SubtitleFiles:
             raise FileExistsError(f"字幕原路径已被占用，无法回滚：{original}")
         await source.rename(target)
 
-    async def write_media_subtitle(self, source: Path, target: Path) -> Path:
-        """按宿主语言后缀规则以排他方式落盘字幕。"""
+    async def write_media_subtitle(
+        self, source: Path, target: Path, destination: SubtitleDestination | None = None
+    ) -> Path:
+        """按媒体主文件名排他保存字幕，仅创建既有根下的相对目录。"""
 
-        destination = self.media_subtitle_path(source, target)
-        await self.copy_file_exclusive(source, destination)
-        return destination
+        destination = destination or SubtitleDestination(directory=target.parent)
+        available, error = await self.target_directory_status(target, destination)
+        if not available:
+            raise OSError(error)
+        current = destination.required_root
+        for part in destination.directory.relative_to(current).parts:
+            current /= part
+            await AsyncPath(current).mkdir(exist_ok=True)
+        path = self.media_subtitle_path(source, target, destination)
+        await self.copy_file_exclusive(source, path)
+        return path
 
     async def save_plugin_file(self, source: Path, record_id: str, status: RecordStatus) -> str:
         """把暂存或未匹配文件保存到插件数据目录。"""

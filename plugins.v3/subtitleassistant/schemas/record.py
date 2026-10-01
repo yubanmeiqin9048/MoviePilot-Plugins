@@ -351,6 +351,7 @@ class RetargetMapping:
 
     record_id: str
     target_history_id: int | None = None
+    expected_final_subtitle_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)

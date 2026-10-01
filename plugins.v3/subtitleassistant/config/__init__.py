@@ -78,7 +78,7 @@ def load_config(raw: Mapping[str, object] | None, allowed_formats: Sequence[str]
             mapping = PathMapping(source_prefix=source, target_prefix=target)
             source_key = os.path.normcase(str(mapping.source_prefix))
             if source_key in source_keys:
-                raise ValueError(f"历史目录前缀重复：{mapping.source_prefix}")
+                raise ValueError(f"媒体目录前缀重复：{mapping.source_prefix}")
             source_keys.add(source_key)
             mappings.append(mapping)
     for current in mappings:

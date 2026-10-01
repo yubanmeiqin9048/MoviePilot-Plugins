@@ -5,6 +5,8 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from app.plugins.subtitleassistant import SubtitleAssistant
+from app.plugins.subtitleassistant.config import load_config
 from app.plugins.subtitleassistant.plugin import PluginRuntime, RuntimeInitializationError, build_runtime
 from app.plugins.subtitleassistant.schemas.config import PluginConfig
 from app.plugins.subtitleassistant.schemas.source import SourceHealth, SubtitleSource
@@ -305,3 +307,48 @@ async def test_clear_credentials_reports_switch_save_failure_after_marking_disab
     assert runtime.store.cleared == [SubtitleSource.ASSRT]
     assert runtime.source_service.rebuilds[-1][1][SubtitleSource.ASSRT] == {}
     assert runtime.store.saved_statuses[-1].health is SourceHealth.DISABLED
+
+
+@pytest.mark.parametrize("change", ["mapping", "other", "same", "stopped", "invalid"])
+def test_plugin_config_save_only_hot_updates_mapping_changes(monkeypatch: pytest.MonkeyPatch, change: str) -> None:
+    """宿主保存仅映射配置时保留运行态，其他变更或已停止的实例仍重建。"""
+
+    from app.plugins import subtitleassistant as entry
+    from app.plugins.subtitleassistant.plugin.runtime import settings
+
+    runtime = object.__new__(PluginRuntime)
+    runtime._stopped = change == "stopped"
+    runtime.config = load_config({"enabled": True}, settings.RMT_SUBEXT)
+    original_config = runtime.config
+    plugin = object.__new__(SubtitleAssistant)
+    plugin._runtime = runtime
+    calls: list[str] = []
+    replacement = object.__new__(PluginRuntime)
+
+    def rebuild(_host: object, _config: object) -> PluginRuntime:
+        """记录入口是否重新装配运行态。"""
+
+        calls.append("rebuild")
+        return replacement
+
+    monkeypatch.setattr(runtime, "stop_sync", lambda: calls.append("stop"))
+    monkeypatch.setattr(entry, "build_runtime", rebuild)
+    values = runtime.config.saved_payload()
+    if change != "same":
+        values["path_mappings"] = [{"source_prefix": "/media", "target_prefix": "/subtitles"}]
+    if change == "other":
+        values["enabled"] = False
+    if change == "invalid":
+        values["path_mappings"] = [{"source_prefix": "relative", "target_prefix": "/subtitles"}]
+
+    plugin.init_plugin(values)
+
+    if change == "mapping":
+        assert plugin._runtime is runtime
+        assert runtime.config is original_config
+        assert runtime.config.path_mappings[0].as_dict() == {"source_prefix": "/media", "target_prefix": "/subtitles"}
+        assert calls == []
+    else:
+        assert plugin._runtime is replacement
+        assert calls == ["stop", "rebuild"]
+        assert original_config.path_mappings == ()

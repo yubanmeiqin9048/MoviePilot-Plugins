@@ -30,7 +30,7 @@ from app.plugins.subtitleassistant.schemas.source import (
     SourceStatus,
     SubtitleSource,
 )
-from app.plugins.subtitleassistant.schemas.target import MediaType, SubtitleTarget
+from app.plugins.subtitleassistant.schemas.target import SubtitleDestination, MediaType, SubtitleTarget
 from app.plugins.subtitleassistant.schemas.task import (
     AttemptResult,
     CandidateAttemptReasonCode,
@@ -140,10 +140,10 @@ class _RecordCommitter:
         if record.status is RecordStatus.STAGED:
             await self.add(record)
 
-    async def commit_media(self, record: Any, source: Path, target: Path) -> CommittedFileFact:
+    async def commit_media(self, record: Any, source: Path, target: Path, destination: SubtitleDestination | None = None) -> CommittedFileFact:
         """模拟媒体字幕与记录的一致性提交。"""
 
-        destination = await self._filesystem.write_media_subtitle(source, target)
+        destination = await self._filesystem.write_media_subtitle(source, target, destination)
         record.path = destination
         record.final_subtitle_path = destination
         await self.publish(record)
@@ -176,17 +176,17 @@ class _Filesystem:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    async def target_directory_status(self, _target: Path) -> tuple[bool, str | None]:
+    async def target_directory_status(self, _target: Path, destination: SubtitleDestination | None = None) -> tuple[bool, str | None]:
         """返回预设目标目录可用性。"""
 
         return self.directory_available, None if self.directory_available else "目标目录不可写"
 
-    async def write_media_subtitle(self, source: Path, target: Path) -> Path:
+    async def write_media_subtitle(self, source: Path, target: Path, destination: SubtitleDestination | None = None) -> Path:
         """模拟媒体目录排他写入。"""
 
         if self.conflict:
             raise FileExistsError(target.with_suffix(source.suffix))
-        destination = target.with_name(f"{target.stem}.chi.zh-cn{source.suffix.lower()}")
+        destination = (destination.directory if destination else target.parent) / f"{target.stem}.chi.zh-cn{source.suffix.lower()}"
         self.writes.append(destination)
         return destination
 
@@ -203,7 +203,7 @@ class _Filesystem:
     async def delete_subtitle_file(self, _path: Path) -> None:
         """忽略测试中的媒体文件补偿清理。"""
 
-    async def has_standard_subtitle(self, _target: Path) -> None:
+    async def has_standard_subtitle(self, _target: Path, destination: SubtitleDestination | None = None) -> None:
         """模拟没有既有标准字幕。"""
 
     async def cleanup_task_directory(self, _task_id: str) -> None:
@@ -562,7 +562,7 @@ async def test_manual_candidate_workflow_accepts_preserved_results(tmp_path: Pat
         task = await _run_manual(coordinator, context, handle)
         await coordinator.shutdown("测试清理")
 
-        if name == "download":
+        if name in {"download", "directory", "conflict"}:
             assert task.status is TaskStatus.FAILED
             assert task.reason_code == reason_code.value
         else:
@@ -593,8 +593,8 @@ async def test_automatic_host_recognition_rejects_wrong_direct_file(
     assert not filesystem.writes
 
 
-async def test_manual_and_automatic_workflows_keep_their_result_retention_behavior(tmp_path: Path) -> None:
-    """人工失败保留下载结果，自动流程继续尝试媒体目录写入。"""
+async def test_manual_and_automatic_workflows_reject_unavailable_destination(tmp_path: Path) -> None:
+    """人工与自动任务都在下载前拒绝不可用的保存目录，不另找位置保存。"""
 
     manual, context, handle, manual_filesystem, _store, _source = _workflow_case(
         tmp_path / "manual",
@@ -613,11 +613,12 @@ async def test_manual_and_automatic_workflows_keep_their_result_retention_behavi
     automatic_task = await _run_automatic(automatic, context)
     await automatic.shutdown("测试清理")
 
-    assert manual_task.status is TaskStatus.SUCCESS
-    assert manual_task.reason_code == "subtitle_retained"
-    assert manual_filesystem.plugin_saves and not manual_filesystem.writes
-    assert automatic_task.status is TaskStatus.SUCCESS
-    assert automatic_filesystem.writes and not automatic_filesystem.plugin_saves
+    assert manual_task.status is TaskStatus.FAILED
+    assert manual_task.reason_code == "target_directory_unavailable"
+    assert not manual_filesystem.plugin_saves and not manual_filesystem.writes
+    assert automatic_task.status is TaskStatus.FAILED
+    assert automatic_task.reason_code == "target_directory_unavailable"
+    assert not automatic_filesystem.writes and not automatic_filesystem.plugin_saves
 
 
 async def test_manual_candidate_workflow_persists_records_without_task_result_copy(tmp_path: Path) -> None:

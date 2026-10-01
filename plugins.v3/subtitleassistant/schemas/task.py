@@ -13,7 +13,7 @@ from pydantic import Field
 from .base import StrictModel, new_id, utc_now
 from .event import SubtitleWrittenOperation
 from .source import CandidateHandle
-from .target import MediaType, PathMappingSnapshot, SubtitleTarget
+from .target import MediaType, PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 
 if TYPE_CHECKING:
     from .attribution import CandidateMatchContext
@@ -88,6 +88,7 @@ class SubtitleTask(StrictModel):
     imdb_id: str | None = None
     target_file_name: str
     target_path: Path
+    subtitle_directory: Path | None = None
     target_history_id: int | None = None
     history_target_path: Path | None = None
     matched_path_mapping: PathMappingSnapshot | None = None
@@ -127,3 +128,4 @@ class TaskWorkItem:
     attempt_operation: SubtitleWrittenOperation | None = None
     attempt_retention: Literal["preserve", "discard"] | None = None
     task_id: str | None = None
+    destination: SubtitleDestination | None = None

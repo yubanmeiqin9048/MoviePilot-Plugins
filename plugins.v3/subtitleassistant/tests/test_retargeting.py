@@ -20,13 +20,14 @@ from app.plugins.subtitleassistant.schemas.record import (
     MatchRecord,
     RecordStatus,
     RetargetMapping,
+    RetargetResult,
 )
 from app.plugins.subtitleassistant.schemas.source import SubtitleSource
 from app.plugins.subtitleassistant.schemas.target import (
     MediaIdentityKind,
     MediaType,
     PathMapping,
-    PathMappingResolution,
+    SubtitleDestination,
     PathMappingSnapshot,
     SubtitleTarget,
 )
@@ -73,7 +74,7 @@ class _TargetQuery:
         self,
         history_id: int,
         context: SubtitleTarget,
-        resolver: Callable[[SubtitleTarget], PathMappingResolution] | None = None,
+        resolver: Callable[[SubtitleTarget], SubtitleDestination] | None = None,
     ) -> None:
         """保存整理历史标识与目标上下文。"""
 
@@ -93,12 +94,12 @@ class _TargetQuery:
 
         return [SimpleNamespace(history_id=self.history_id, context=self.context)]
 
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
+    def resolve_subtitle_destination(self, target: SubtitleTarget) -> SubtitleDestination:
         """返回未配置映射时的原始目标路径。"""
 
         if self.resolver is not None:
             return self.resolver(target)
-        return PathMappingResolution(original_path=target.target_path, resolved_path=target.target_path)
+        return SubtitleDestination(directory=target.target_path.parent)
 
 
 class _MultiRecordStore:
@@ -139,10 +140,10 @@ class _MultiTargetQuery:
 
         return list(self.targets.values())
 
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
+    def resolve_subtitle_destination(self, target: SubtitleTarget) -> SubtitleDestination:
         """返回未配置映射时的原始目标路径。"""
 
-        return PathMappingResolution(original_path=target.target_path, resolved_path=target.target_path)
+        return SubtitleDestination(directory=target.target_path.parent)
 
 
 class _NoAccessDependency:
@@ -196,6 +197,14 @@ def _maintenance(
 
 
 RetargetService = _maintenance
+
+
+async def _confirm_retarget(service: RecordMaintenance, record_id: str, target_history_id: int) -> RetargetResult:
+    """先取得预览，再提交用户确认的字幕路径。"""
+
+    preview = await service.preview(record_id, target_history_id)
+    assert preview.preview is not None
+    return await service.retarget(record_id, target_history_id, preview.preview.final_subtitle_path)
 
 
 class _Inventory:
@@ -284,12 +293,12 @@ class _BlockingSubtitleFiles(SubtitleFiles):
         self.write_started = asyncio.Event()
         self.allow_write = asyncio.Event()
 
-    async def write_media_subtitle(self, source: Path, target: Path) -> Path:
+    async def write_media_subtitle(self, source: Path, target: Path, destination: SubtitleDestination | None = None) -> Path:
         """通知测试改配已持有保留凭据，等待允许后继续复制。"""
 
         self.write_started.set()
         await self.allow_write.wait()
-        return await super().write_media_subtitle(source, target)
+        return await super().write_media_subtitle(source, target, destination)
 
 
 def _record(path: Path, target_video: Path) -> MatchRecord:
@@ -344,7 +353,7 @@ async def test_matched_record_can_retarget_to_new_media_and_append_history(tmp_p
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     expected = new_video.with_name("New.Movie.chi.zh-cn.srt")
     assert result.success is True
@@ -409,7 +418,7 @@ async def test_retarget_publisher_failure_does_not_change_successful_result(tmp_
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     expected = new_video.with_name("New.Movie.chi.zh-cn.srt")
     assert result.success is True
@@ -458,7 +467,7 @@ async def test_retarget_precondition_failure_does_not_publish_event(
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     assert result.success is False
     assert result.error_code == expected_error
@@ -491,7 +500,7 @@ async def test_retarget_missing_source_does_not_publish_event(tmp_path: Path) ->
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     assert result.success is False
     assert result.error_code == "file_operation_failed"
@@ -553,7 +562,7 @@ async def test_staged_record_retarget_removes_old_inventory_entry(tmp_path: Path
         targets=_TargetQuery(7, new_context),
     )
 
-    result = await service.retarget(record.id, 7)
+    result = await _confirm_retarget(service, record.id, 7)
     old_context = SubtitleTarget(
         title="旧剧集",
         media_type=MediaType.TV,
@@ -625,7 +634,7 @@ async def test_staged_movie_without_inventory_key_can_retarget(tmp_path: Path) -
         targets=_TargetQuery(8, context),
     )
 
-    result = await service.retarget(record.id, 8)
+    result = await _confirm_retarget(service, record.id, 8)
 
     assert result.success is True
     assert store.record.status is RecordStatus.MATCHED
@@ -697,7 +706,7 @@ async def test_staged_retarget_blocks_concurrent_inventory_consumption(tmp_path:
         targets=_TargetQuery(7, new_context),
     )
 
-    retarget_task = asyncio.create_task(service.retarget(record.id, 7))
+    retarget_task = asyncio.create_task(_confirm_retarget(service, record.id, 7))
     await filesystem.write_started.wait()
     consume_task = asyncio.create_task(inventory.consume(old_context, "automatic-task"))
     await asyncio.sleep(0)
@@ -743,7 +752,7 @@ async def test_retarget_persistence_failure_restores_old_store_and_files(tmp_pat
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     expected = new_video.with_name("New.Movie.chi.zh-cn.srt")
     assert result.success is False
@@ -783,7 +792,7 @@ async def test_retarget_incomplete_compensation_does_not_publish_event(tmp_path:
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     assert result.success is False
     assert result.error_code == "file_operation_failed"
@@ -820,16 +829,16 @@ async def test_retarget_success_log_is_chinese_fact_sentence(
         publisher=publisher,
     )
 
-    result = await service.retarget(record.id, 42)
+    result = await _confirm_retarget(service, record.id, 42)
 
     assert result.success is True
     assert [event.record_id for event in publisher.events] == [record.id]
 
 
-async def test_retarget_preview_is_advisory_and_submit_recomputes_current_mapping(
+async def test_retarget_rejects_changed_destination_until_preview_is_confirmed(
     tmp_path: Path,
 ) -> None:
-    """改配预览不作为写入凭据，确认时重新读取当前路径映射。"""
+    """改配提交核对预览目的地，映射变化时保持原文件，刷新确认后才移动。"""
 
     old_video = tmp_path / "old" / "Old.Movie.mkv"
     old_subtitle = old_video.with_name("Old.Movie.default.chi.zh-cn.srt")
@@ -855,13 +864,12 @@ async def test_retarget_preview_is_advisory_and_submit_recomputes_current_mappin
     )
     config = PluginConfig(path_mappings=(PathMapping(str(history_root), str(preview_root)),))
 
-    def resolve_target(target: SubtitleTarget) -> PathMappingResolution:
+    def resolve_target(target: SubtitleTarget) -> SubtitleDestination:
         """按当前测试配置模拟目标能力的实际路径解析。"""
 
         mapping = config.path_mappings[0]
-        return PathMappingResolution(
-            original_path=target.target_path,
-            resolved_path=mapping.target_prefix / target.target_path.relative_to(mapping.source_prefix),
+        return SubtitleDestination(
+            directory=mapping.target_prefix / target.target_path.parent.relative_to(mapping.source_prefix),
             mapping=mapping,
         )
 
@@ -877,17 +885,22 @@ async def test_retarget_preview_is_advisory_and_submit_recomputes_current_mappin
     assert preview_result.success is True
     assert preview_result.preview is not None
     assert preview_result.preview.history_target_path == history_target
-    assert preview_result.preview.target_path == preview_root / history_target.name
+    assert preview_result.preview.target_path == history_target
     assert preview_result.preview.directory_available is True
 
     config.path_mappings = (PathMapping(str(history_root), str(submit_root)),)
-    result = await service.retarget(record.id, 42)
+    stale = await service.retarget(record.id, 42, preview_result.preview.final_subtitle_path)
+    assert stale.error_code == "preview_destination_changed"
+    assert store.record == record
+    assert await AsyncPath(old_subtitle).read_bytes() == b"subtitle"
+    assert list(submit_root.iterdir()) == []
+    result = await _confirm_retarget(service, record.id, 42)
 
     expected = submit_root / "New.Movie.chi.zh-cn.srt"
     assert result.success is True
     assert store.record.target_history_id == 42
     assert store.record.history_target_path == history_target
-    assert store.record.target_path == submit_root / history_target.name
+    assert store.record.target_path == history_target
     assert store.record.target_file_exists is False
     assert store.record.final_subtitle_path == expected
     assert store.record.retarget_history[0].new_matched_path_mapping == PathMappingSnapshot(
@@ -928,7 +941,7 @@ async def test_retarget_unavailable_directory_keeps_record_and_file_unchanged(
     original = store.record.model_copy(deep=True)
 
     preview = await service.preview(record.id, 9)
-    result = await service.retarget(record.id, 9)
+    result = await _confirm_retarget(service, record.id, 9)
 
     assert preview.preview is not None
     assert preview.preview.directory_available is False
@@ -1235,12 +1248,12 @@ async def test_batch_retarget_continues_after_item_or_subtitle_written_event_fai
     class _FailingFiles(SubtitleFiles):
         """用外部文件端口失败模拟单项运行期改配错误。"""
 
-        async def write_media_subtitle(self, source: Path, target: Path) -> Path:
+        async def write_media_subtitle(self, source: Path, target: Path, destination: SubtitleDestination | None = None) -> Path:
             """仅拒绝预设源字幕，其余字幕按真实规则写入。"""
 
             if source in failed_paths:
                 raise OSError("模拟单条批量改配异常")
-            return await super().write_media_subtitle(source, target)
+            return await super().write_media_subtitle(source, target, destination)
 
     service = RetargetService(
         store=store,
@@ -1252,9 +1265,9 @@ async def test_batch_retarget_continues_after_item_or_subtitle_written_event_fai
 
     result = await service.retarget_batch(
         [
-            RetargetMapping(record_id="record-one", target_history_id=1),
-            RetargetMapping(record_id="record-two", target_history_id=2),
-            RetargetMapping(record_id="record-three", target_history_id=3),
+            RetargetMapping(record_id="record-one", target_history_id=1, expected_final_subtitle_path=target_paths[0].with_suffix(".chi.zh-cn.srt")),
+            RetargetMapping(record_id="record-two", target_history_id=2, expected_final_subtitle_path=target_paths[1].with_suffix(".chi.zh-cn.srt")),
+            RetargetMapping(record_id="record-three", target_history_id=3, expected_final_subtitle_path=target_paths[2].with_suffix(".chi.zh-cn.srt")),
         ]
     )
 
@@ -1287,3 +1300,84 @@ async def test_batch_retarget_continues_after_item_or_subtitle_written_event_fai
     assert [event.record_id for event in publisher.events] == expected_event_ids
     assert all(event.operation is SubtitleWrittenOperation.RETARGET for event in publisher.events)
     assert all(event.task_id is None for event in publisher.events)
+
+
+@pytest.mark.parametrize("confirmation", ["missing", "stale"])
+async def test_batch_retarget_requires_current_confirmed_destination(tmp_path: Path, confirmation: str) -> None:
+    """批量提交缺少或携带过期预览时不移动文件，重新确认后可创建映射子目录。"""
+
+    old_video = tmp_path / "old" / "Old.mkv"
+    source = old_video.with_suffix(".chi.zh-cn.srt")
+    await _write(source, b"subtitle")
+    record = _record(source, old_video)
+    store = _RecordStore(record)
+    media_root = tmp_path / "media"
+    media = media_root / "Show" / "New.mkv"
+    first_root = tmp_path / "subtitles-a"
+    second_root = tmp_path / "subtitles-b"
+    await AsyncPath(first_root).mkdir()
+    await AsyncPath(second_root).mkdir()
+    config = PluginConfig(path_mappings=(PathMapping(media_root, first_root),))
+    context = SubtitleTarget(title="New", target_path=media, target_file_name=media.name, target_storage="local")
+
+    def resolve(target: SubtitleTarget) -> SubtitleDestination:
+        """读取当前测试规则，保留媒体相对目录。"""
+
+        mapping = config.path_mappings[0]
+        return SubtitleDestination(mapping.target_prefix / target.target_path.parent.relative_to(mapping.source_prefix), mapping)
+
+    service = RetargetService(
+        store=store, filesystem=SubtitleFiles(tmp_path / "plugin", {"srt"}),
+        targets=_TargetQuery(42, context, resolve),
+    )
+    preview = await service.preview_batch([RetargetMapping(record.id, 42)])
+    assert preview.executable
+    assert preview.items[0].preview is not None
+    expected = preview.items[0].preview.final_subtitle_path
+    assert not await AsyncPath(expected.parent).exists()
+    config.path_mappings = (PathMapping(media_root, second_root),)
+
+    refused = await service.retarget_batch([
+        RetargetMapping(record.id, 42, expected if confirmation == "stale" else None)
+    ])
+    assert not refused.started
+    assert refused.preflight.items[0].error_code == (
+        "preview_destination_changed" if confirmation == "stale" else "preview_required"
+    )
+    assert store.record == record
+    assert await AsyncPath(source).read_bytes() == b"subtitle"
+    assert list(first_root.iterdir()) == []
+    assert list(second_root.iterdir()) == []
+
+    refreshed = await service.preview_batch([RetargetMapping(record.id, 42)])
+    assert refreshed.items[0].preview is not None
+    confirmed = refreshed.items[0].preview.final_subtitle_path
+    result = await service.retarget_batch([RetargetMapping(record.id, 42, confirmed)])
+    assert result.success_count == 1
+    assert confirmed == second_root / "Show" / "New.chi.zh-cn.srt"
+    assert await AsyncPath(confirmed).read_bytes() == b"subtitle"
+    assert store.record.target_path == media
+    assert not await AsyncPath(media_root).exists()
+    assert not await AsyncPath(source).exists()
+
+
+async def test_retarget_preserves_existing_standard_subtitle_of_another_format(tmp_path: Path) -> None:
+    """保存目录已有另一标准格式时，单条和批量改配均保留源文件和现有字幕。"""
+
+    old = tmp_path / "old" / "Old.chi.zh-cn.srt"
+    await _write(old, b"source")
+    media = tmp_path / "new" / "New.mkv"
+    existing = media.with_suffix(".default.chi.zh-cn.ass")
+    await _write(existing, b"existing")
+    record = _record(old, old.with_suffix(".mkv"))
+    store = _RecordStore(record)
+    context = SubtitleTarget(title="New", target_path=media, target_file_name=media.name, target_storage="local")
+    service = RetargetService(store=store, filesystem=SubtitleFiles(tmp_path / "plugin", {"srt", "ass"}), targets=_TargetQuery(42, context))
+    preview = await service.preview_batch([RetargetMapping(record.id, 42)])
+    assert not preview.executable
+    assert preview.items[0].error_code == "existing_standard_subtitle"
+    result = await _confirm_retarget(service, record.id, 42)
+    assert result.error_code == "existing_standard_subtitle"
+    assert store.record == record
+    assert await AsyncPath(old).read_bytes() == b"source"
+    assert await AsyncPath(existing).read_bytes() == b"existing"

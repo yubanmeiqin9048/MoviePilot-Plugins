@@ -32,7 +32,7 @@ from ..schemas.source import (
     SourceStatus,
     SubtitleSource,
 )
-from ..schemas.target import MediaType, PathMappingResolution, PathMappingSnapshot, SubtitleTarget
+from ..schemas.target import MediaType, PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 from ..schemas.task import (
     AttemptResult,
     CandidateAttemptReasonCode,
@@ -87,7 +87,7 @@ class _TaskStorePort(Protocol):
 class _TaskFilePort(Protocol):
     """字幕任务生命周期所需的文件操作。"""
 
-    async def has_standard_subtitle(self, target: Path) -> Path | None:
+    async def has_standard_subtitle(self, target: Path, destination: SubtitleDestination | None = None) -> Path | None:
         """查找目标关联的标准简中外挂字幕。"""
 
     async def make_task_directory(self, task_id: str) -> Path:
@@ -99,7 +99,9 @@ class _TaskFilePort(Protocol):
     async def clear_data_directory(self) -> None:
         """清理插件数据目录。"""
 
-    async def target_directory_status(self, target: Path) -> tuple[bool, str | None]:
+    async def target_directory_status(
+        self, target: Path, destination: SubtitleDestination | None = None
+    ) -> tuple[bool, str | None]:
         """检查字幕目标目录是否可写。"""
 
 
@@ -121,8 +123,8 @@ class _TaskArchivePort(Protocol):
 class _TaskTargetPort(Protocol):
     """任务执行所需的字幕目标路径解析能力。"""
 
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
-        """解析本地媒体目标的实际字幕路径。"""
+    def resolve_subtitle_destination(self, target: SubtitleTarget) -> SubtitleDestination:
+        """解析媒体对应的字幕保存目录。"""
 
 
 TRIGGER_NAMES = {
@@ -206,7 +208,7 @@ class TaskOperations:
         return item.target_history_id is not None
 
     @staticmethod
-    def _mapping_snapshot(resolution: PathMappingResolution) -> PathMappingSnapshot | None:
+    def _mapping_snapshot(resolution: SubtitleDestination) -> PathMappingSnapshot | None:
         """把本次解析命中的不可变规则转换为持久化快照。"""
 
         if resolution.mapping is None:
@@ -381,17 +383,24 @@ class TaskOperations:
                 task, TaskStatus.SKIPPED, "unsupported_media_format", "目标格式不在宿主媒体格式集合中"
             )
             return False
-        if not self._is_history_target(item):
-            task.target_file_exists = await AsyncPath(task.target_path).is_file()
-        await self._save(task)
-        if not task.target_file_exists and not self._is_history_target(item):
-            await self._finish_task(task, TaskStatus.FAILED, "target_missing", "整理目标文件不存在")
-            return False
-        subtitle = await self._filesystem.has_standard_subtitle(Path(task.target_path))
+        subtitle = await self._filesystem.has_standard_subtitle(task.target_path, item.destination)
         if subtitle:
-            await self._finish_task(task, TaskStatus.SKIPPED, "existing_standard_subtitle", "目标已有标准简中外挂字幕")
+            await self._finish_task(
+                task, TaskStatus.SKIPPED, "existing_standard_subtitle", "保存目录已有标准简中外挂字幕"
+            )
             return False
-        if task.media_type is MediaType.TV and task.episode is not None and task.season is None:
+        available, error = await self._filesystem.target_directory_status(task.target_path, item.destination)
+        if not available:
+            await self._finish_task(
+                task, TaskStatus.FAILED, "target_directory_unavailable", error or "字幕保存目录不可用"
+            )
+            return False
+        if (
+            item.manual_handle is None
+            and task.media_type is MediaType.TV
+            and task.episode is not None
+            and task.season is None
+        ):
             await self._finish_task(
                 task,
                 TaskStatus.FAILED,
@@ -402,49 +411,27 @@ class TaskOperations:
         return True
 
     async def _prepare_target(self, task: SubtitleTask, item: TaskWorkItem) -> None:
-        """实时事件与历史目标都在文件操作前解析并冻结本次实际路径。"""
+        """执行开始时固定字幕保存位置，媒体上下文始终保持原始路径。"""
 
         if item.context.target_storage != "local" or item.context.target_type != "file":
             return
-        history_path = task.history_target_path or item.context.target_path
-        resolver = getattr(self._target_catalog, "resolve_actual_subtitle_path", None)
-        if not callable(resolver):
-            raise TypeError("字幕目标能力未提供实际路径解析")
-        resolution = resolver(item.context.model_copy(update={"target_path": history_path}))
-        if self._is_history_target(item) or resolution.mapping_applied:
-            task.history_target_path = resolution.original_path
-        task.target_path = resolution.resolved_path
-        task.matched_path_mapping = self._mapping_snapshot(resolution)
-        task.target_file_exists = await AsyncPath(task.target_path).is_file()
-        resolved_fields = (
-            "title",
-            "original_title",
-            "english_title",
-            "year",
-            "media_type",
-            "season",
-            "episode",
-            "tmdb_id",
-            "imdb_id",
-            "target_storage",
-            "target_type",
-            "target_extension",
-            "target_container",
-        )
-        context_updates = {field: getattr(resolution, field) for field in resolved_fields if hasattr(resolution, field)}
-        context_updates.update(
-            {
-                "target_path": task.target_path,
-                "target_file_name": getattr(resolution, "target_file_name", Path(task.target_path).name)
-                or Path(task.target_path).name,
-            }
-        )
-        item.context = item.context.model_copy(update=context_updates)
+        if self._target_catalog is None:
+            raise TypeError("字幕目标能力未提供保存目录解析")
+        destination = self._target_catalog.resolve_subtitle_destination(item.context)
+        item.destination = destination
+        task.subtitle_directory = destination.directory
+        if self._is_history_target(item) or destination.mapping is not None:
+            task.history_target_path = item.context.target_path
+        task.matched_path_mapping = self._mapping_snapshot(destination)
+        try:
+            task.target_file_exists = await AsyncPath(task.target_path).is_file()
+        except OSError:
+            task.target_file_exists = None
         await self._save(task)
-        if resolution.mapping is not None:
+        if destination.mapping is not None:
             logger.info(
-                f"{self._task_label(task)}执行时应用路径映射："
-                f"原始路径为“{resolution.original_path}”，实际路径为“{resolution.resolved_path}”"
+                f"{self._task_label(task)}已固定字幕保存目录："
+                f"媒体路径为“{task.target_path}”，保存目录为“{destination.directory}”"
             )
 
     async def _search_sources(self, task: SubtitleTask, item: TaskWorkItem) -> list[CandidateHandle]:
@@ -665,11 +652,12 @@ class TaskOperations:
             history_target_path=task.history_target_path,
             matched_path_mapping=task.matched_path_mapping,
             target_file_exists=task.target_file_exists,
+            destination=item.destination,
         )
         records = self._normalize_records(result.records or result.record)
         if records:
             log = logger.warning if result.warning else logger.info
-            log(f"{self._task_label(task)}命中 {len(records)} 条字幕库存记录，字幕已写入媒体目录")
+            log(f"{self._task_label(task)}命中 {len(records)} 条字幕库存记录，字幕已写入保存目录")
         elif result.warning:
             logger.warning(f"{self._task_label(task)}查询字幕库存时出现警告：{result.warning}")
         else:
@@ -726,7 +714,7 @@ class TaskOperations:
             CandidateAttemptRequest(
                 task_id=task.id,
                 handle=handle,
-                target=item.context.model_copy(update={"target_path": task.target_path}),
+                target=item.context,
                 operation=operation,
                 retention=retention,
                 package_attribution_strategy=self._strategy,
@@ -735,6 +723,7 @@ class TaskOperations:
                 history_target_path=task.history_target_path,
                 matched_path_mapping=task.matched_path_mapping,
                 target_file_exists=task.target_file_exists,
+                destination=item.destination,
             )
         )
         self._log_candidate_attempt(task, handle.candidate, result)
@@ -775,6 +764,8 @@ class TaskOperations:
         await self._save(task)
         try:
             await self._prepare_target(task, item)
+            if not await self._preflight(task, item):
+                return
             if item.manual_handle is not None:
                 item.attempt_operation = SubtitleWrittenOperation.MANUAL_CANDIDATE
                 item.attempt_retention = FailureResultRetention.PRESERVE.value
@@ -788,7 +779,7 @@ class TaskOperations:
                 retained_records = self._normalize_records(candidate_result.records)
                 if media_records:
                     await self._finish_task(task, TaskStatus.SUCCESS, "subtitle_written", "人工选择的字幕已落盘")
-                elif retained_records:
+                elif retained_records and candidate_result.result is not AttemptResult.WRITE_FAILED:
                     await self._finish_task(task, TaskStatus.SUCCESS, "subtitle_retained", "人工选择的字幕已安全保留")
                 else:
                     reason_code = (
@@ -802,8 +793,6 @@ class TaskOperations:
                         reason_code,
                         f"人工选择的字幕处理失败：{candidate_result.error_summary or '没有得到可落盘字幕'}",
                     )
-                return
-            if not await self._preflight(task, item):
                 return
             inventory = await self._consume_inventory(task, item)
             inventory_records = self._normalize_records(inventory.records or inventory.record)

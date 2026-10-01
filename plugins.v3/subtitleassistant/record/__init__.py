@@ -23,7 +23,7 @@ from ..schemas.record import (
     RetargetMapping,
     RetargetResult,
 )
-from ..schemas.target import PathMappingSnapshot, SubtitleTarget
+from ..schemas.target import PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 from ..target import TargetCatalog
 from .lock import ReentrantAsyncLock
 
@@ -61,7 +61,12 @@ class RecordStorePort(Protocol):
 class RecordFilePort(Protocol):
     """记录能力所需的字幕文件操作。"""
 
-    async def write_media_subtitle(self, source: Path, target: Path) -> Path:
+    async def has_standard_subtitle(self, target: Path, destination: SubtitleDestination | None = None) -> Path | None:
+        """只在指定保存位置查找已有标准字幕。"""
+
+    async def write_media_subtitle(
+        self, source: Path, target: Path, destination: SubtitleDestination | None = None
+    ) -> Path:
         """排他写入媒体字幕。"""
 
     async def save_plugin_file(self, source: Path, record_id: str, status: RecordStatus) -> str:
@@ -85,13 +90,15 @@ class RecordFilePort(Protocol):
     async def rollback_file_deletion(self, original: Path, backup: Path | None) -> None:
         """回滚已暂存文件删除。"""
 
-    def media_subtitle_path(self, source: Path, target: Path) -> Path:
+    def media_subtitle_path(self, source: Path, target: Path, destination: SubtitleDestination | None = None) -> Path:
         """计算媒体字幕目标路径。"""
 
     async def is_file(self, path: Path) -> bool:
         """检查目标是否为普通文件。"""
 
-    async def target_directory_status(self, target: Path) -> tuple[bool, str | None]:
+    async def target_directory_status(
+        self, target: Path, destination: SubtitleDestination | None = None
+    ) -> tuple[bool, str | None]:
         """检查目标目录是否可用。"""
 
     async def copy_file_exclusive(self, source: Path, target: Path) -> int:
@@ -140,25 +147,26 @@ class RecordCommitter:
         record: MatchRecord,
         source: Path,
         target: Path,
+        destination: SubtitleDestination | None = None,
     ) -> CommittedFileFact:
         """提交媒体字幕与匹配记录，并返回逐文件已提交事实。"""
 
-        destination: Path | None = None
+        written_path: Path | None = None
         try:
-            destination = await self._filesystem.write_media_subtitle(source, target)
-            record.path = destination
-            record.final_subtitle_path = destination
+            written_path = await self._filesystem.write_media_subtitle(source, target, destination)
+            record.path = written_path
+            record.final_subtitle_path = written_path
             await self._inventory.publish(record)
         except BaseException:
-            if destination is not None:
+            if written_path is not None:
                 try:
-                    await self._filesystem.delete_subtitle_file(destination)
+                    await self._filesystem.delete_subtitle_file(written_path)
                 except BaseException as rollback_exc:  # noqa: BLE001 - 回滚失败必须保留审计
                     logger.error(
                         f"媒体目录字幕写入后记录提交失败，补偿删除失败；异常类型为 {type(rollback_exc).__name__}"
                     )
             raise
-        return CommittedFileFact(record=record, target_path=Path(target), subtitle_path=destination)
+        return CommittedFileFact(record=record, target_path=Path(target), subtitle_path=written_path)
 
     async def commit_plugin(self, record: MatchRecord, source: Path) -> MatchRecord:
         """提交插件数据字幕与匹配记录，并在失败时清理残留。"""
@@ -187,6 +195,7 @@ class RecordCommitter:
         history_target_path: Path | str | None = None,
         matched_path_mapping: PathMappingSnapshot | None = None,
         target_file_exists: bool | None = None,
+        destination: SubtitleDestination | None = None,
     ) -> InventoryConsumeResult:
         """消费精确命中的暂存字幕并更新匹配记录。"""
 
@@ -197,6 +206,7 @@ class RecordCommitter:
             history_target_path=history_target_path,
             matched_path_mapping=matched_path_mapping,
             target_file_exists=target_file_exists,
+            destination=destination,
         )
         return result
 
@@ -299,10 +309,12 @@ class RecordMaintenance:
 
         return await self._service.preview_batch(mappings)
 
-    async def retarget(self, record_id: str, target_history_id: int) -> RetargetResult:
+    async def retarget(
+        self, record_id: str, target_history_id: int, expected_final_subtitle_path: Path
+    ) -> RetargetResult:
         """原地改配一条匹配记录。"""
 
-        return await self._service.retarget(record_id, target_history_id)
+        return await self._service.retarget(record_id, target_history_id, expected_final_subtitle_path)
 
     async def retarget_batch(self, mappings: list[RetargetMapping]) -> BatchRetargetResult:
         """按独立映射执行一批记录改配。"""

@@ -104,7 +104,7 @@ export const mediaTypeLabels: Record<MediaType, string> = {
 }
 
 export const locationLabels: Record<FileLocation, string> = {
-  media_directory: '媒体目录',
+  media_directory: '字幕保存目录',
   plugin_data: '插件数据目录',
 }
 

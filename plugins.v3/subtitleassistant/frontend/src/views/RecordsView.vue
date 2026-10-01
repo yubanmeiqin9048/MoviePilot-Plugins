@@ -569,14 +569,14 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
               <DetailRow label="TMDB ID">{{ detail.tmdb_id ?? '未记录' }}</DetailRow>
               <DetailRow label="IMDb ID">{{ detail.imdb_id || '未记录' }}</DetailRow>
               <DetailRow label="整理历史 ID"><CopyValue :value="detail.target_history_id == null ? null : String(detail.target_history_id)" label="整理历史 ID" /></DetailRow>
-              <DetailRow label="历史目标路径"><CopyValue :value="detail.history_target_path" label="历史目标路径" /></DetailRow>
-              <DetailRow label="实际字幕目标"><CopyValue :value="detail.target_path" label="实际字幕目标路径" /></DetailRow>
-              <DetailRow label="命中路径映射">
+              <DetailRow label="媒体路径"><CopyValue :value="detail.history_target_path || detail.target_path" label="媒体路径" /></DetailRow>
+              <DetailRow label="字幕文件路径"><CopyValue :value="detail.current_file_path" label="字幕文件路径" /></DetailRow>
+              <DetailRow label="映射快照">
                 {{ detail.matched_path_mapping
                   ? `${detail.matched_path_mapping.source_prefix} → ${detail.matched_path_mapping.target_prefix}`
                   : '未命中' }}
               </DetailRow>
-              <DetailRow label="目标视频存在">{{ detail.target_file_exists == null ? '未记录' : (detail.target_file_exists ? '是' : '否') }}</DetailRow>
+              <DetailRow label="视频存在（执行时记录）">{{ detail.target_file_exists == null ? '未记录' : (detail.target_file_exists ? '是' : '否') }}</DetailRow>
             </dl></VExpansionPanelText>
           </VExpansionPanel>
           <VExpansionPanel>

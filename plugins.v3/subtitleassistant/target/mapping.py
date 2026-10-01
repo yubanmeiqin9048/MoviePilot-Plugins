@@ -1,6 +1,6 @@
-"""整理历史目标的纯路径映射规则。
+"""字幕保存目录的纯前缀映射规则。
 
-路径映射只负责把历史目标路径转换为当前本地路径。模块不访问文件系统，
+路径映射只负责把媒体目录转换为字幕保存目录。模块不访问文件系统，
 也不负责创建目录或判断挂载状态；这些检查必须留在真正执行文件操作的
 worker/改配服务中。
 """
@@ -45,7 +45,7 @@ def validate_path_mappings(
 ) -> tuple[PathMapping, ...]:
     """校验并规范化路径映射配置。
 
-    校验只覆盖绝对路径、通配符、同路径和重复历史前缀，不探测目录、权限
+    校验只覆盖绝对路径、通配符、同路径和重复媒体前缀，不探测目录、权限
     或挂载状态。返回值保持输入顺序，解析时再按匹配长度选择规则。
     """
 
@@ -62,8 +62,8 @@ def validate_path_mappings(
                 raise PathMappingValidationError(f"第{index + 1}条路径映射缺少{exc.args[0]}") from exc
             try:
                 mapping = PathMapping(
-                    source_prefix=Path(_normalize_prefix(source, "历史目录前缀")),
-                    target_prefix=Path(_normalize_prefix(target, "当前目录前缀")),
+                    source_prefix=Path(_normalize_prefix(source, "媒体目录前缀")),
+                    target_prefix=Path(_normalize_prefix(target, "字幕保存目录前缀")),
                 )
             except ValueError as exc:
                 raise PathMappingValidationError(str(exc)) from exc
@@ -71,7 +71,7 @@ def validate_path_mappings(
             raise PathMappingValidationError(f"第{index + 1}条路径映射格式无效")
         source_key = os.path.normcase(str(mapping.source_prefix))
         if source_key in source_keys:
-            raise PathMappingValidationError(f"历史目录前缀重复：{mapping.source_prefix}")
+            raise PathMappingValidationError(f"媒体目录前缀重复：{mapping.source_prefix}")
         source_keys.add(source_key)
         mappings.append(mapping)
     # 路径替换只允许单次执行。若某条规则的目标目录又正好作为另一条规则
@@ -100,7 +100,7 @@ def resolve_path(
     后不会再次参与匹配，因此不会形成链式映射。
     """
 
-    original = _normalize_prefix(path, "历史目标路径")
+    original = _normalize_prefix(path, "媒体目录")
     normalized_mappings = validate_path_mappings(mappings)
     best: PathMapping | None = None
     best_relative: Path | None = None

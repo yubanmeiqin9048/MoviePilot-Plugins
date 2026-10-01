@@ -38,7 +38,7 @@ const groups: Array<{ key: GroupKey; icon: string; label: string; purpose: strin
   { key: 'sources', icon: 'mdi-database-cog-outline', label: '字幕来源', purpose: '去哪些站点搜字幕，以及按什么顺序搜' },
   { key: 'candidate', icon: 'mdi-filter-cog-outline', label: '候选筛选', purpose: '搜到多个候选时怎么挑、试几次' },
   { key: 'attribution', icon: 'mdi-package-variant-closed-check', label: '字幕归属', purpose: '压缩包里的字幕该算作哪一集' },
-  { key: 'paths', icon: 'mdi-map-marker-path', label: '路径映射', purpose: '整理历史里的旧目录换算成当前目录' },
+  { key: 'paths', icon: 'mdi-map-marker-path', label: '字幕保存目录映射', purpose: '只改变字幕保存位置，不改变媒体路径；保存根目录须已存在，其下目录自动创建' },
 ]
 const sourceMeta: Array<{ source: SubtitleSource; short: string; icon: string; description: string }> = [
   { source: 'moviepilot', short: 'MoviePilot', icon: 'mdi-server-network', description: '使用 MoviePilot 当前有效的字幕站点，凭据由宿主管理' },
@@ -129,7 +129,7 @@ const groupSummary = computed<Record<GroupKey, string>>(() => ({
   sources: `${enabledSourceCount.value}/3 已启用 · 搜索顺序 ${sourcePriority.value.map(item => shortLabel(item)).join(' → ')}`,
   candidate: `最多试 ${form.max_candidate_attempts} 个候选 · ${form.allow_machine_translation ? '允许' : '不允许'}机翻 · 格式 ${formatPriority.value.join(' → ')}`,
   attribution: `${form.package_attribution_strategy === 'trust_package' ? '信任候选包身份' : '交给 MoviePilot 逐个识别'}`,
-  paths: pathMappings.value.length ? `${pathMappings.value.length} 条映射生效` : '未配置，直接使用整理历史中的原始目标路径',
+  paths: pathMappings.value.length ? `${pathMappings.value.length} 条映射生效` : '未配置，字幕保存到媒体同目录',
 }))
 
 const enabledSourceCount = computed(() => sourceMeta.filter(meta => form[enabledKey(meta.source)]).length)
@@ -268,19 +268,19 @@ function pathMappingFieldError(index: number, field: keyof PathMapping): string 
   const row = pathMappings.value[index]
   if (!row) return ''
   const value = row[field].trim()
-  const fieldLabel = field === 'source_prefix' ? '历史目录前缀' : '当前目录前缀'
+  const fieldLabel = field === 'source_prefix' ? '媒体目录前缀' : '字幕保存目录前缀'
   if (!value) return `第 ${index + 1} 行${fieldLabel}不能为空。`
   if (!isAbsolutePath(value)) return `第 ${index + 1} 行${fieldLabel}必须是绝对路径。`
   if (/[*?]/.test(value)) return `第 ${index + 1} 行${fieldLabel}不能包含通配符或正则表达式。`
 
   const source = comparablePath(row.source_prefix)
   const target = comparablePath(row.target_prefix)
-  if (field === 'target_prefix' && source === target) return `第 ${index + 1} 行的历史目录与当前目录不能相同。`
+  if (field === 'target_prefix' && source === target) return `第 ${index + 1} 行的媒体目录与字幕保存目录不能相同。`
   if (field === 'source_prefix') {
     const duplicate = pathMappings.value.some((item, itemIndex) => (
       itemIndex !== index && comparablePath(item.source_prefix) === source
     ))
-    if (duplicate) return `第 ${index + 1} 行的历史目录前缀重复。`
+    if (duplicate) return `第 ${index + 1} 行的媒体目录前缀重复。`
   }
   const chained = pathMappings.value.some((item, itemIndex) => (
     itemIndex !== index && comparablePath(item.source_prefix) === target
@@ -678,19 +678,19 @@ function showNotice(text: string, color: 'success' | 'error' | 'warning'): void 
           <template v-else>
             <div v-if="pathMappings.length" class="map-list">
               <div v-for="(mapping, index) in pathMappings" :key="index" class="map-row">
-                <VTextField v-model="mapping.source_prefix" label="历史目录前缀" placeholder="/旧挂载/媒体" prepend-inner-icon="mdi-history"
+                <VTextField v-model="mapping.source_prefix" label="媒体目录前缀" placeholder="/media" prepend-inner-icon="mdi-history"
                   :error-messages="pathMappingFieldError(index, 'source_prefix') ? [pathMappingFieldError(index, 'source_prefix')] : []" />
                 <VIcon icon="mdi-arrow-right" class="map-arrow" aria-hidden="true" />
-                <VTextField v-model="mapping.target_prefix" label="当前目录前缀" placeholder="/当前挂载/媒体" prepend-inner-icon="mdi-folder-outline"
+                <VTextField v-model="mapping.target_prefix" label="字幕保存目录前缀" placeholder="/subtitles" prepend-inner-icon="mdi-folder-outline"
                   :error-messages="pathMappingFieldError(index, 'target_prefix') ? [pathMappingFieldError(index, 'target_prefix')] : []" />
                 <VBtn icon="mdi-delete-outline" variant="text" color="error"
-                  :aria-label="`删除第 ${index + 1} 条路径映射`" @click="removePathMapping(index)" />
+                  :aria-label="`删除第 ${index + 1} 条字幕保存目录映射`" @click="removePathMapping(index)" />
               </div>
             </div>
             <div v-else class="map-empty">
-              <VIcon icon="mdi-map-marker-off-outline" size="20" /><span>未配置映射时直接使用整理历史中的原始目标路径。</span>
+              <VIcon icon="mdi-map-marker-off-outline" size="20" /><span>未配置或未命中映射时，字幕保存到原媒体同目录；保存目录不可用时不会回退到其他位置。</span>
             </div>
-            <VBtn variant="tonal" prepend-icon="mdi-plus" class="map-add" @click="addPathMapping">添加路径映射</VBtn>
+            <VBtn variant="tonal" prepend-icon="mdi-plus" class="map-add" @click="addPathMapping">添加字幕保存目录映射</VBtn>
           </template>
         </div>
       </section>

@@ -70,6 +70,7 @@ def test_all_http_model_field_shapes_are_explicitly_locked() -> None:
             "target_storage",
             "matched_path_mapping",
             "target_file_exists",
+            "subtitle_directory",
         },
         task.TaskPage: {"items", "total", "page", "page_size"},
         record.RecordListItem: _RECORD_LIST_FIELDS,
@@ -120,6 +121,7 @@ def test_all_http_model_field_shapes_are_explicitly_locked() -> None:
         },
         record.BatchRecordDeleteResponse: {"success_count", "failure_count", "not_executed_count", "items"},
         record.RetargetRequest: {"target_history_id"},
+        record.RetargetSubmitRequest: {"target_history_id", "expected_final_subtitle_path"},
         record.RetargetPreviewResponse: {
             "target_history_id",
             "history_target_path",
@@ -130,7 +132,7 @@ def test_all_http_model_field_shapes_are_explicitly_locked() -> None:
         },
         record.BatchRetargetPreviewMapping: {"record_id", "target_history_id"},
         record.BatchRetargetPreviewRequest: {"items"},
-        record.BatchRetargetSubmitMapping: {"record_id", "target_history_id"},
+        record.BatchRetargetSubmitMapping: {"record_id", "target_history_id", "expected_final_subtitle_path"},
         record.BatchRetargetSubmitRequest: {"items"},
         record.BatchRetargetPreviewItem: {
             "record_id",
@@ -220,7 +222,7 @@ def test_all_http_model_field_shapes_are_explicitly_locked() -> None:
         source.CredentialUpdate: {"api_key", "username", "password", "token"},
     }
 
-    assert len(expected) == 33
+    assert len(expected) == 34
     for model, fields in expected.items():
         assert set(model.model_fields) == fields, model.__name__
 
@@ -251,6 +253,7 @@ def test_http_leaf_modules_declare_only_their_owned_public_models() -> None:
         "RecordPage",
         "RetargetPreviewResponse",
         "RetargetRequest",
+        "RetargetSubmitRequest",
     ]
     assert search.__all__ == [
         "ManualCandidateItem",
@@ -546,3 +549,14 @@ def test_combined_openapi_keeps_shared_nested_component_names() -> None:
     for name in ("PathMappingSnapshot", "SearchPlanItem"):
         assert name in components
         assert not any(key.endswith(f"__{name}") for key in components)
+
+
+@pytest.mark.parametrize("model", [record.RetargetSubmitRequest, record.BatchRetargetSubmitMapping])
+def test_retarget_submission_requires_previewed_destination(model: type[ApiModel]) -> None:
+    """单条和批量 HTTP 提交都拒绝未携带用户确认路径的请求。"""
+
+    payload: dict[str, object] = {"target_history_id": 42}
+    if model is record.BatchRetargetSubmitMapping:
+        payload["record_id"] = "record-one"
+    with pytest.raises(ValidationError, match="expected_final_subtitle_path"):
+        model.model_validate(payload)

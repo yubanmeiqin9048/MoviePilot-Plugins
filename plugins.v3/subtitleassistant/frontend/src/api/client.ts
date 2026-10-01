@@ -245,7 +245,7 @@ export function previewBatchRetargetRecords(
 export function retargetBatchRecords(
   api: PluginApi,
   pluginId: string,
-  items: Array<Required<BatchRetargetMapping>>,
+  items: Array<Required<BatchRetargetMapping> & { expected_final_subtitle_path: string }>,
 ): Promise<BatchRetargetResponse> {
   return api.post<BatchRetargetResponse>(pluginPath(pluginId, 'records/batch-retarget'), { items })
 }

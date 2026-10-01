@@ -9,7 +9,7 @@ from app.plugins.subtitleassistant.target.mapping import (
     validate_path_mappings,
 )
 from app.plugins.subtitleassistant.schemas.config import PluginConfig
-from app.plugins.subtitleassistant.schemas.target import MediaType, PathMapping, ResolvedTarget, SubtitleTarget
+from app.plugins.subtitleassistant.schemas.target import MediaType, PathMapping, SubtitleDestination, SubtitleTarget
 from app.plugins.subtitleassistant.target import TargetCatalog
 
 
@@ -91,8 +91,8 @@ def test_resolve_path_without_match_returns_normalized_original() -> None:
     assert result.mapping is None
 
 
-def test_target_catalog_resolver_freezes_execution_target_facts() -> None:
-    """目标目录能力返回路径映射与执行所需目标事实的不可变快照。"""
+def test_target_catalog_resolver_only_freezes_subtitle_destination() -> None:
+    """保存目录解析只返回不可变目录与映射，不复制或修改媒体事实。"""
 
     mapping = PathMapping(Path("/history"), Path("/current"))
     target = SubtitleTarget(
@@ -113,17 +113,13 @@ def test_target_catalog_resolver_freezes_execution_target_facts() -> None:
         config_provider=lambda: PluginConfig(path_mappings=(mapping,)),
     )
 
-    result = catalog.resolve_actual_subtitle_path(target)
+    result = catalog.resolve_subtitle_destination(target)
 
-    assert isinstance(result, ResolvedTarget)
-    assert result.original_path == target.target_path
-    assert result.resolved_path == Path("/current/Show.S01E02.mkv")
+    assert isinstance(result, SubtitleDestination)
+    assert result.directory == Path("/current")
     assert result.mapping == mapping
-    assert result.title == target.title
-    assert result.media_type is MediaType.TV
-    assert result.season == 1
-    assert result.episode == 2
-    assert result.target_file_name == target.target_file_name
+    assert result.required_root == Path("/current")
+    assert target.target_path == Path("/history/Show.S01E02.mkv")
 
 
 def test_resolve_path_accepts_literal_brackets_in_media_name() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import weakref
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -92,6 +93,23 @@ class PluginRuntime:
         self.source_service: SourceAdministration | None = None
         self.archive: ArchiveExtractor | None = None
         self._stopped = False
+
+    def update_path_mappings(self, config: Mapping[str, object] | None) -> bool:
+        """仅映射变化时原位更新规则，避免宿主保存配置中断当前及排队任务。"""
+
+        if self._stopped:
+            return False
+        try:
+            updated = load_config(config, settings.RMT_SUBEXT)
+        except TypeError, ValueError:
+            return False
+        if updated.path_mappings == self.config.path_mappings:
+            return False
+        if replace(updated, path_mappings=self.config.path_mappings) != self.config:
+            return False
+        self.config.path_mappings = updated.path_mappings
+        logger.info("字幕保存目录映射已更新，执行中的任务继续使用已固定的保存位置")
+        return True
 
     def initialize(self, config: Mapping[str, object] | None = None) -> None:
         """按宿主配置装配当前运行代次的全部能力。"""

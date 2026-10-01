@@ -18,7 +18,7 @@ from app.plugins.subtitleassistant.schemas.record import (
     RecordStatus,
 )
 from app.plugins.subtitleassistant.schemas.source import SubtitleSource
-from app.plugins.subtitleassistant.schemas.target import MediaIdentityKind, MediaType, SubtitleTarget
+from app.plugins.subtitleassistant.schemas.target import MediaIdentityKind, MediaType, PathMapping, PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 
 pytestmark = pytest.mark.anyio
 
@@ -243,3 +243,47 @@ async def test_inventory_consume_returns_each_successful_media_directory_record(
     assert all(record.status is RecordStatus.MATCHED for record in result.records)
     assert await AsyncPath(target.with_name("example.chi.zh-cn.ass")).exists()
     assert await AsyncPath(target.with_name("example.chi.zh-cn.srt")).exists()
+
+
+async def test_inventory_mapping_preserves_media_identity_and_deletion_uses_saved_path(tmp_path: Path) -> None:
+    """库存落盘独立保存字幕；后续映射变化不会改变旧记录删除的文件。"""
+
+    data_root = tmp_path / "plugin"
+    relative = "staged/mapped.srt"
+    source = data_root / relative
+    await AsyncPath(source.parent).mkdir(parents=True)
+    await AsyncPath(source).write_text("字幕")
+    media_root = tmp_path / "media"
+    media = media_root / "Show" / "E02.mkv"
+    save_root = tmp_path / "subtitles"
+    await AsyncPath(save_root).mkdir()
+    mapping = PathMapping(media_root, save_root)
+    destination = SubtitleDestination(save_root / "Show", mapping)
+    record = _record("mapped", relative, datetime(2026, 10, 1, tzinfo=UTC))
+    store = _InventoryStore(record)
+    filesystem = SubtitleFiles(data_root, {"srt"})
+    committer = RecordCommitter(store, filesystem, [record], ["srt"], ["assrt"])
+
+    result = await committer.consume(
+        _context(str(media)), "consume", destination=destination,
+        matched_path_mapping=PathMappingSnapshot(source_prefix=media_root, target_prefix=save_root),
+    )
+    assert result.record is not None
+    written = result.record
+    expected = save_root / "Show" / "E02.chi.zh-cn.srt"
+    assert written.target_path == media
+    assert written.final_subtitle_path == expected
+    assert result.committed_files[0].target_path == media
+    assert result.committed_files[0].subtitle_path == expected
+    assert await AsyncPath(expected).read_text() == "字幕"
+    assert not await AsyncPath(media_root).exists()
+    assert not await AsyncPath(source).exists()
+
+    # 模拟后来在另一个保存目录下载了同媒体字幕，删除旧记录不能误删它。
+    later = tmp_path / "new-subtitles" / "Show" / expected.name
+    await AsyncPath(later.parent).mkdir(parents=True)
+    await AsyncPath(later).write_text("新位置字幕")
+    deleted = await committer.catalog().delete(written.id, _confirmation(written))
+    assert deleted.success
+    assert not await AsyncPath(expected).exists()
+    assert await AsyncPath(later).read_text() == "新位置字幕"

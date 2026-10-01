@@ -37,6 +37,7 @@ from ..schemas.source import CandidateHandle, DownloadedAsset
 from ..schemas.target import (
     MediaType,
     PathMappingSnapshot,
+    SubtitleDestination,
     SubtitleTarget,
 )
 from ..schemas.task import (
@@ -72,6 +73,7 @@ class CandidateAttemptRequest:
     history_target_path: Path | None = None
     matched_path_mapping: PathMappingSnapshot | None = None
     target_file_exists: bool | None = None
+    destination: SubtitleDestination | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +114,9 @@ class CandidateAttemptFileSystemPort(Protocol):
     async def make_task_directory(self, task_id: str) -> Path:
         """创建候选尝试临时目录。"""
 
-    async def target_directory_status(self, target: Path) -> tuple[bool, str | None]:
+    async def target_directory_status(
+        self, target: Path, destination: SubtitleDestination | None = None
+    ) -> tuple[bool, str | None]:
         """检查目标字幕目录是否可用。"""
 
 
@@ -308,7 +312,7 @@ class CandidateAttemptService:
 
             if retention is FailureResultRetention.PRESERVE:
                 directory_available, directory_error = await self.filesystem.target_directory_status(
-                    context.target_path
+                    context.target_path, request.destination
                 )
                 if not directory_available:
                     saved, save_warnings = await self._save_additional_results(
@@ -628,6 +632,7 @@ class CandidateAttemptService:
                 record,
                 result.extracted.physical_path,
                 context.target_path,
+                destination=request.destination,
             )
         except asyncio.CancelledError:
             raise

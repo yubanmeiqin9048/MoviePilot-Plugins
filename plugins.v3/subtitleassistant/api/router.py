@@ -37,6 +37,7 @@ from ..schemas.http.record import (
     RecordPage,
     RetargetPreviewResponse,
     RetargetRequest,
+    RetargetSubmitRequest,
 )
 from ..schemas.http.search import (
     ManualDownloadRequest,
@@ -506,12 +507,14 @@ class ApiController:
     async def retarget_record(
         self,
         record_id: str,
-        payload: RetargetRequest,
+        payload: RetargetSubmitRequest,
         _: Any = Depends(get_current_active_manage_user_async),  # noqa: B008 - FastAPI 依赖注入
     ) -> RecordDetail:
         """把现有匹配记录改配到新的整理目标。"""
 
-        result = await self._maintenance.retarget(record_id, int(payload.target_history_id))
+        result = await self._maintenance.retarget(
+            record_id, int(payload.target_history_id), Path(payload.expected_final_subtitle_path)
+        )
         if result.success and result.record is not None:
             return await self._record_detail(result.record)
         status = 404 if result.error_code in {"record_not_found", "target_not_found"} else 409
@@ -597,6 +600,7 @@ class ApiController:
                 RetargetMapping(
                     record_id=item.record_id,
                     target_history_id=item.target_history_id,
+                    expected_final_subtitle_path=Path(item.expected_final_subtitle_path),
                 )
                 for item in payload.items
             ]

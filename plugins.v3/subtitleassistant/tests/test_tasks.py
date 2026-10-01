@@ -53,7 +53,7 @@ from app.plugins.subtitleassistant.schemas.source import (
     SourceStatus,
     SubtitleSource,
 )
-from app.plugins.subtitleassistant.schemas.target import MediaType, PathMapping, PathMappingResolution, SubtitleTarget
+from app.plugins.subtitleassistant.schemas.target import MediaType, PathMapping, SubtitleDestination, SubtitleTarget
 from app.plugins.subtitleassistant.schemas.task import (
     AttemptResult,
     SubtitleTask,
@@ -142,10 +142,15 @@ class _TaskFileSystem:
         self.root = root
         self.cleanup_calls: list[str] = []
 
-    async def has_standard_subtitle(self, _target: Path) -> None:
+    async def has_standard_subtitle(self, _target: Path, destination: SubtitleDestination | None = None) -> None:
         """默认没有已有标准字幕。"""
 
         return
+
+    async def target_directory_status(self, target: Path, destination: SubtitleDestination | None = None) -> tuple[bool, str | None]:
+        """通过真实目录检查验证任务保存位置。"""
+
+        return await SubtitleFiles(self.root, {"srt"}).target_directory_status(target, destination)
 
     async def make_task_directory(self, task_id: str) -> Path:
         """创建任务临时目录。"""
@@ -159,10 +164,10 @@ class _TaskFileSystem:
 
         self.cleanup_calls.append(task_id)
 
-    async def write_media_subtitle(self, source: Path, target: Path) -> Path:
+    async def write_media_subtitle(self, source: Path, target: Path, destination: SubtitleDestination | None = None) -> Path:
         """返回标准目标字幕路径。"""
 
-        return target.with_name(f"{target.stem}.chi.zh-cn{source.suffix.lower()}")
+        return (destination.directory if destination else target.parent) / f"{target.stem}.chi.zh-cn{source.suffix.lower()}"
 
     async def save_plugin_file(self, _source: Path, record_id: str, status: RecordStatus) -> str:
         """返回测试用插件相对路径。"""
@@ -471,21 +476,20 @@ class _TargetCatalog:
         self._mappings = mappings
         self.calls: list[Path] = []
 
-    def resolve_actual_subtitle_path(self, target: SubtitleTarget) -> PathMappingResolution:
+    def resolve_subtitle_destination(self, target: SubtitleTarget) -> SubtitleDestination:
         """通过目标能力公开路径解析接口返回结果。"""
 
         self.calls.append(target.target_path)
         for mapping in self._mappings:
             try:
-                relative = target.target_path.relative_to(mapping.source_prefix)
+                relative = target.target_path.parent.relative_to(mapping.source_prefix)
             except ValueError:
                 continue
-            return PathMappingResolution(
-                original_path=target.target_path,
-                resolved_path=mapping.target_prefix / relative,
+            return SubtitleDestination(
+                directory=mapping.target_prefix / relative,
                 mapping=mapping,
             )
-        return PathMappingResolution(original_path=target.target_path, resolved_path=target.target_path)
+        return SubtitleDestination(directory=target.target_path.parent)
 
 
 class _LogCapture:
@@ -731,12 +735,12 @@ async def test_transfer_complete_uses_transfer_target_and_builds_safe_context() 
 
 @pytest.mark.parametrize("history_id", [None, 73])
 @pytest.mark.parametrize("video_exists", [False, True])
-async def test_live_transfer_checks_mapped_video_and_existing_subtitle(
+async def test_live_transfer_checks_only_saved_subtitle_without_requiring_video(
     tmp_path: Path,
     history_id: int | None,
     video_exists: bool,
 ) -> None:
-    """实时事件无论有无历史编号，都在映射目录检查视频及已有字幕。"""
+    """实时事件只检查字幕保存目录，视频不存在也按已有字幕跳过。"""
 
     original_root = tmp_path / "original"
     current_root = tmp_path / "current"
@@ -769,11 +773,12 @@ async def test_live_transfer_checks_mapped_video_and_existing_subtitle(
 
     await coordinator._process(task, item)
 
-    assert task.status is (TaskStatus.SKIPPED if video_exists else TaskStatus.FAILED)
-    assert task.reason_code == ("existing_standard_subtitle" if video_exists else "target_missing")
-    assert task.target_path == actual_path
+    assert task.status is TaskStatus.SKIPPED
+    assert task.reason_code == "existing_standard_subtitle"
+    assert task.target_path == original_path
+    assert task.subtitle_directory == current_root
     assert task.history_target_path == original_path
-    assert task.target_file_exists is video_exists
+    assert task.target_file_exists is False
     assert task.matched_path_mapping is not None
     assert pool.query_calls == []
     assert inventory.consume_calls == []
@@ -810,9 +815,10 @@ async def test_automatic_target_resolves_once_before_inventory(
 
     assert task.status is TaskStatus.SUCCESS
     assert catalog.calls == [history_path]
-    assert inventory.consume_calls == [(actual_target, task.id)]
+    assert inventory.consume_calls == [(history_path, task.id)]
     assert task.history_target_path == history_path
-    assert task.target_path == actual_target
+    assert task.target_path == history_path
+    assert task.subtitle_directory == current_root
     assert task.matched_path_mapping is not None
 
 
@@ -844,7 +850,8 @@ async def test_historical_target_allows_missing_video_when_mapped_parent_is_avai
 
     assert await coordinator._preflight(task, item) is True
     assert task.target_file_exists is False
-    assert task.target_path == current_root / history_target.name
+    assert task.target_path == history_target
+    assert task.subtitle_directory == current_root
 
 
 async def test_historical_manual_target_without_catalog_is_assembly_failure(
@@ -1530,11 +1537,13 @@ async def test_tv_episode_without_season_fails_before_inventory_and_search(
     assert task.reason_message is not None and "未搜索字幕源" in task.reason_message
 
 
+@pytest.mark.parametrize("directory_writable", [False, True])
 async def test_existing_subtitle_precedes_missing_season_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    directory_writable: bool,
 ) -> None:
-    """缺季号电视剧已有标准简中字幕时仍优先按已有字幕跳过。"""
+    """已有标准字幕时优先跳过，不要求再次写入权限或完整季号。"""
 
     coordinator = _coordinator(tmp_path)
     item = _work_item(tmp_path, "missing-season-with-subtitle")
@@ -1542,11 +1551,17 @@ async def test_existing_subtitle_precedes_missing_season_failure(
     item.context = item.context.model_copy(update={"season": None, "episode": 2})
     subtitle_path = Path(item.context.target_path).with_suffix(".default.chi.zh-cn.srt")
 
-    async def existing_subtitle(_target: Path) -> Path:
+    async def existing_subtitle(_target: Path, destination: SubtitleDestination | None = None) -> Path:
         """返回测试用已有标准简中字幕。"""
 
         return subtitle_path
 
+    async def directory_status(_target: Path, destination: SubtitleDestination | None = None) -> tuple[bool, str | None]:
+        """模拟可读但不可写的保存目录。"""
+
+        return directory_writable, None if directory_writable else "字幕保存目录不可写"
+
+    monkeypatch.setattr(coordinator._filesystem, "target_directory_status", directory_status)
     monkeypatch.setattr(coordinator._filesystem, "has_standard_subtitle", existing_subtitle)
     task = SubtitleTask(
         media_title=item.context.title,
@@ -1561,7 +1576,7 @@ async def test_existing_subtitle_precedes_missing_season_failure(
 
     assert task.status is TaskStatus.SKIPPED
     assert task.reason_code == "existing_standard_subtitle"
-    assert task.reason_message == "目标已有标准简中外挂字幕"
+    assert task.reason_message == "保存目录已有标准简中外挂字幕"
 
 
 async def test_candidate_download_attempts_are_strictly_serial(
@@ -2554,24 +2569,31 @@ async def test_shutdown_cancels_current_and_marks_current_and_queued_tasks_inter
 
 @pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.parametrize("history_id", [None, 91])
+@pytest.mark.parametrize("change_mapping", [False, True])
 async def test_download_maps_target_path_at_execution(
     tmp_path: Path,
     manual: bool,
     history_id: int | None,
+    change_mapping: bool,
 ) -> None:
-    """自动事件及人工下载都映射落盘、保存原路径并发布实际路径。"""
+    """自动及人工下载保留原媒体路径，记录和事件分别携带媒体与字幕路径。"""
 
     history_root = tmp_path / "history"
     current_root = tmp_path / "current"
     await AsyncPath(current_root).mkdir(parents=True)
-    history_target = history_root / "Show.S01E01.mkv"
-    resolved_target = current_root / history_target.name
-    if not manual:
-        await AsyncPath(resolved_target).write_bytes(b"video")
+    history_target = history_root / "Show" / "Season 01" / "Show.S01E01.mkv"
+    await AsyncPath(history_target.parent).mkdir(parents=True)
+    original_subtitle = history_target.with_suffix(".chi.zh-cn.srt")
+    await AsyncPath(original_subtitle).write_bytes(b"original subtitle")
+    changed_root = tmp_path / "changed"
+    await AsyncPath(changed_root).mkdir()
+    saved_directory = current_root / "Show" / "Season 01"
 
     async def download(_handle: CandidateHandle, directory: Path) -> DownloadedAsset:
         """生成一个直接字幕文件，不经过归档策略。"""
 
+        if change_mapping:
+            config.path_mappings = (PathMapping(history_root, changed_root),)
         path = AsyncPath(directory / "chosen.srt")
         await path.write_text("简体中文字幕", encoding="utf-8")
         return DownloadedAsset(path=Path(path), file_name="chosen.srt")
@@ -2653,19 +2675,21 @@ async def test_download_maps_target_path_at_execution(
     assert task.status is TaskStatus.SUCCESS
     assert task.target_history_id == history_id
     assert task.history_target_path == history_target
-    assert task.target_path == resolved_target
-    assert task.target_file_exists is (not manual)
+    assert task.target_path == history_target
+    assert task.subtitle_directory == saved_directory
+    assert task.target_file_exists is False
     assert task.matched_path_mapping is not None
     record = next(iter(store.records.values()))
     assert record.final_subtitle_path is not None
     assert await AsyncPath(record.final_subtitle_path).is_file()
     assert record.target_history_id == history_id
     assert record.history_target_path == history_target
-    assert record.target_path == resolved_target
-    assert record.target_file_exists is (not manual)
+    assert record.target_path == history_target
+    assert record.target_file_exists is False
     assert record.matched_path_mapping == task.matched_path_mapping
-    assert record.final_subtitle_path.parent == current_root
-    assert not await AsyncPath(history_root).exists()
+    assert record.final_subtitle_path.parent == saved_directory
+    assert not await AsyncPath(history_target).exists()
+    assert await AsyncPath(original_subtitle).read_bytes() == b"original subtitle"
     assert record.file_attribution_method is FileAttributionMethod.DIRECT_FILE
     assert len(publisher.events) == 1
     assert publisher.events[0].operation is (
@@ -2673,10 +2697,19 @@ async def test_download_maps_target_path_at_execution(
     )
     assert publisher.events[0].record_id == record.id
     assert publisher.events[0].task_id == task.id
-    assert publisher.events[0].target_path == resolved_target
+    assert publisher.events[0].target_path == history_target
     assert publisher.events[0].subtitle_path == record.final_subtitle_path
     assert coordinator._active_paths == {}
-    assert [target.target_path for target in pool.query_calls] == ([] if manual else [resolved_target])
+    assert [target.target_path for target in pool.query_calls] == ([] if manual else [history_target])
+    if change_mapping:
+        assert list(changed_root.iterdir()) == []
+        later = await coordinator.enqueue(TaskWorkItem(context=context, manual_handle=handle if manual else None))
+        assert later is not None
+        await coordinator._queue.join()
+        assert store.tasks[later.id].status is TaskStatus.SUCCESS
+        assert store.tasks[later.id].subtitle_directory == changed_root / "Show" / "Season 01"
+        assert await AsyncPath(changed_root / "Show" / "Season 01" / record.final_subtitle_path.name).is_file()
+        assert await AsyncPath(record.final_subtitle_path).is_file()
     await coordinator.shutdown()
 
 

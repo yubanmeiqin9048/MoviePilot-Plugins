@@ -30,7 +30,7 @@ from ..schemas.record import (
     RetargetPreview,
     RetargetResult,
 )
-from ..schemas.target import MediaType, PathMappingResolution, PathMappingSnapshot, SearchTarget
+from ..schemas.target import MediaType, PathMappingSnapshot, SearchTarget, SubtitleDestination
 from .lock import ReentrantAsyncLock
 
 if TYPE_CHECKING:
@@ -103,13 +103,13 @@ class RetargetService:
             raise ValueError("原字幕文件不能是符号链接")
         return path
 
-    def _resolve_target(self, target: SearchTarget) -> PathMappingResolution:
-        """使用调用时的当前配置解析整理历史目标路径。"""
+    def _resolve_target(self, target: SearchTarget) -> SubtitleDestination:
+        """使用调用时的配置确定字幕保存目录，媒体目标保持不变。"""
 
-        resolver = getattr(self._targets, "resolve_actual_subtitle_path", None)
+        resolver = getattr(self._targets, "resolve_subtitle_destination", None)
         if callable(resolver):
             return resolver(target.context)
-        raise RuntimeError("字幕目标能力未提供实际路径解析")
+        raise RuntimeError("字幕目标能力未提供保存目录解析")
 
     async def _build_preview(
         self,
@@ -121,13 +121,13 @@ class RetargetService:
 
         source = await self._record_source_path(record)
         resolution = self._resolve_target(target)
-        resolved_target = Path(resolution.resolved_path)
-        destination = self._filesystem.media_subtitle_path(source, resolved_target)
-        available, error = await self._filesystem.target_directory_status(resolved_target)
+        resolved_target = target.context.target_path
+        destination = self._filesystem.media_subtitle_path(source, resolved_target, resolution)
+        available, error = await self._filesystem.target_directory_status(resolved_target, resolution)
         return RetargetPreview(
             target_history_id=target_history_id,
-            history_target_path=resolution.original_path,
-            target_path=resolution.resolved_path,
+            history_target_path=target.context.target_path,
+            target_path=target.context.target_path,
             final_subtitle_path=destination,
             directory_available=available,
             directory_error=error,
@@ -265,11 +265,17 @@ class RetargetService:
             )
         if await self._filesystem.is_file(Path(preview.final_subtitle_path)):
             return replace(item, error_code="destination_conflict", message="预计最终字幕路径已存在")
+        if await self._filesystem.has_standard_subtitle(
+            target.context.target_path, SubtitleDestination(preview.final_subtitle_path.parent)
+        ):
+            return replace(item, error_code="existing_standard_subtitle", message="保存目录已有标准简中外挂字幕")
         return item
 
     async def _preview_batch_unlocked(
         self,
         mappings: list[RetargetMapping],
+        *,
+        require_confirmation: bool = False,
     ) -> BatchRetargetPreview:
         """在调用方所处并发边界内完成整批预检。"""
 
@@ -294,7 +300,19 @@ class RetargetService:
                     )
                 )
                 continue
-            items.append(await self._preview_mapping(mapping, all_targets, target_cache))
+            item = await self._preview_mapping(mapping, all_targets, target_cache)
+            if require_confirmation and item.executable and item.preview is not None:
+                if mapping.expected_final_subtitle_path is None:
+                    item = replace(item, error_code="preview_required", message="请先预览并确认字幕保存位置")
+                elif self._normalized_path(mapping.expected_final_subtitle_path) != self._normalized_path(
+                    item.preview.final_subtitle_path
+                ):
+                    item = replace(
+                        item,
+                        error_code="preview_destination_changed",
+                        message="字幕保存位置已变化，请刷新改配预览后重新确认",
+                    )
+            items.append(item)
 
         destination_counts = Counter(
             self._normalized_path(item.preview.final_subtitle_path)
@@ -331,7 +349,7 @@ class RetargetService:
         return await self._preview_batch_unlocked(mappings)
 
     @staticmethod
-    def _mapping_snapshot(resolution: PathMappingResolution) -> PathMappingSnapshot | None:
+    def _mapping_snapshot(resolution: SubtitleDestination) -> PathMappingSnapshot | None:
         """把命中规则转换为持久化审计快照。"""
 
         if resolution.mapping is None:
@@ -346,7 +364,7 @@ class RetargetService:
         record: MatchRecord,
         target: SearchTarget,
         target_history_id: int,
-        resolution: PathMappingResolution,
+        resolution: SubtitleDestination,
         old_subtitle: Path,
         destination: Path,
     ) -> MatchRecord:
@@ -372,10 +390,13 @@ class RetargetService:
         updated.tmdb_id = context.tmdb_id
         updated.imdb_id = context.imdb_id
         updated.target_history_id = target_history_id
-        updated.history_target_path = resolution.original_path
-        updated.target_path = resolution.resolved_path
+        updated.history_target_path = context.target_path
+        updated.target_path = context.target_path
         updated.matched_path_mapping = self._mapping_snapshot(resolution)
-        updated.target_file_exists = await self._filesystem.is_file(Path(resolution.resolved_path))
+        try:
+            updated.target_file_exists = await self._filesystem.is_file(context.target_path)
+        except OSError:
+            updated.target_file_exists = None
         updated.final_subtitle_path = destination
         updated.retarget_history.append(
             RetargetHistoryEntry(
@@ -383,9 +404,9 @@ class RetargetService:
                 old_target_history_id=record.target_history_id,
                 new_target_history_id=target_history_id,
                 old_history_target_path=record.history_target_path,
-                new_history_target_path=resolution.original_path,
+                new_history_target_path=target.context.target_path,
                 old_target_path=record.target_path,
-                new_target_path=resolution.resolved_path,
+                new_target_path=target.context.target_path,
                 new_matched_path_mapping=self._mapping_snapshot(resolution),
                 old_subtitle_path=old_subtitle,
                 new_subtitle_path=destination,
@@ -414,7 +435,9 @@ class RetargetService:
         for record in records:
             await self._publish_subtitle_written(record)
 
-    async def _retarget_unlocked(self, record_id: str, target_history_id: int) -> RetargetResult:
+    async def _retarget_unlocked(
+        self, record_id: str, target_history_id: int, expected_final_subtitle_path: Path
+    ) -> RetargetResult:
         """在调用方持有服务级互斥锁时执行一条改配。"""
 
         record = await self._store.get_record(record_id)
@@ -432,12 +455,17 @@ class RetargetService:
                 message=f"原字幕路径不可用：{exc}",
             )
         resolution = self._resolve_target(target)
-        resolved_target = Path(resolution.resolved_path)
-        destination = self._filesystem.media_subtitle_path(source, resolved_target)
+        resolved_target = target.context.target_path
+        destination = self._filesystem.media_subtitle_path(source, resolved_target, resolution)
+        if self._normalized_path(destination) != self._normalized_path(expected_final_subtitle_path):
+            return RetargetResult(
+                error_code="preview_destination_changed",
+                message="字幕保存位置已变化，请刷新改配预览后重新确认",
+            )
         current_subtitle = Path(record.final_subtitle_path or record.path)
         if self._normalized_path(str(current_subtitle)) == self._normalized_path(str(destination)):
             return RetargetResult(error_code="same_target", message="预计最终字幕路径与当前路径相同")
-        available, directory_error = await self._filesystem.target_directory_status(resolved_target)
+        available, directory_error = await self._filesystem.target_directory_status(resolved_target, resolution)
         if not available:
             return RetargetResult(
                 error_code="target_directory_unavailable",
@@ -453,11 +481,13 @@ class RetargetService:
                 return RetargetResult(error_code="file_operation_failed", message="原字幕文件不存在")
             if await self._filesystem.is_file(destination):
                 return RetargetResult(error_code="destination_conflict", message="预计最终字幕路径已存在")
+            if await self._filesystem.has_standard_subtitle(resolved_target, resolution):
+                return RetargetResult(error_code="existing_standard_subtitle", message="保存目录已有标准简中外挂字幕")
 
             written: Path | None = None
             record_save_attempted = False
             try:
-                written = await self._filesystem.write_media_subtitle(source, resolved_target)
+                written = await self._filesystem.write_media_subtitle(source, resolved_target, resolution)
                 await self._filesystem.delete_subtitle_file(source)
                 updated = await self._updated_record(
                     record,
@@ -504,7 +534,7 @@ class RetargetService:
                     logger.error(
                         f"匹配记录 {record.id} 改配失败，文件与记录状态已回滚："
                         f"原目标为“{record.target_path or '未记录'}”，"
-                        f"新目标为“{resolution.resolved_path}”，异常类型为 {type(exc).__name__}；"
+                        f"新目标为“{target.context.target_path}”，异常类型为 {type(exc).__name__}；"
                         f"插件调用栈：{stack}"
                     )
                 if isinstance(exc, asyncio.CancelledError):
@@ -517,15 +547,17 @@ class RetargetService:
         logger.info(
             f"匹配记录 {record.id} 已改配成功："
             f"原目标为“{record.target_path or '未记录'}”，"
-            f"新目标为“{resolution.resolved_path}”"
+            f"新目标为“{target.context.target_path}”"
         )
         return RetargetResult(records=[updated])
 
-    async def retarget(self, record_id: str, target_history_id: int) -> RetargetResult:
+    async def retarget(
+        self, record_id: str, target_history_id: int, expected_final_subtitle_path: Path
+    ) -> RetargetResult:
         """重新解析当前映射并把匹配记录改配到整理历史目标。"""
 
         async with self._lock, self._mutation_lock:
-            result = await self._retarget_unlocked(record_id, target_history_id)
+            result = await self._retarget_unlocked(record_id, target_history_id, expected_final_subtitle_path)
             await self._publish_subtitle_written_records(result.records)
             return result
 
@@ -534,15 +566,17 @@ class RetargetService:
 
         self._validate_batch_mapping_count(mappings)
         async with self._lock, self._mutation_lock:
-            preflight = await self._preview_batch_unlocked(mappings)
+            preflight = await self._preview_batch_unlocked(mappings, require_confirmation=True)
             if not preflight.executable:
                 return BatchRetargetResult(preflight=preflight, items=[], started=False)
             items: list[BatchRetargetResultItem] = []
             for item in preflight.items:
-                if item.target_history_id is None:
+                if item.target_history_id is None or item.preview is None:
                     continue
                 try:
-                    result = await self._retarget_unlocked(item.record_id, item.target_history_id)
+                    result = await self._retarget_unlocked(
+                        item.record_id, item.target_history_id, item.preview.final_subtitle_path
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - 单项失败不能中断批量改配

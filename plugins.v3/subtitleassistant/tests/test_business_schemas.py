@@ -55,7 +55,7 @@ from app.plugins.subtitleassistant.schemas.target import (
     MediaType,
     PathMapping,
     PathMappingResolution,
-    ResolvedTarget,
+    SubtitleDestination,
     SearchTarget,
     SubtitleTarget,
 )
@@ -112,7 +112,7 @@ EXPECTED_EXPORTS = {
         "SearchTarget",
         "PathMapping",
         "PathMappingResolution",
-        "ResolvedTarget",
+        "SubtitleDestination",
         "MediaType",
         "MediaIdentityKind",
     },
@@ -169,6 +169,7 @@ EXPECTED_PERSISTED_FIELDS = {
         "imdb_id",
         "target_file_name",
         "target_path",
+        "subtitle_directory",
         "target_history_id",
         "history_target_path",
         "matched_path_mapping",
@@ -562,15 +563,9 @@ def test_path_mapping_and_batch_result_defaults_are_explicit() -> None:
         mapping=mapping,
     )
     assert resolution.mapping_applied
-    resolved_target = ResolvedTarget(
-        original_path=Path("/history/a.mkv"),
-        resolved_path=Path("/media/a.mkv"),
-        mapping=mapping,
-        title="A",
-        target_file_name="a.mkv",
-    )
-    assert resolved_target.mapping_applied
-    assert resolved_target.target_file_name == "a.mkv"
+    destination = SubtitleDestination(directory=Path("/media"), mapping=mapping)
+    assert destination.mapping == mapping
+    assert destination.required_root == Path("/media")
     run = SourceSearchResult(source=SubtitleSource.MOVIEPILOT, status=SourceSearchStatus.SUCCESS)
     assert run.candidates == []
     assert run.default_queries == []

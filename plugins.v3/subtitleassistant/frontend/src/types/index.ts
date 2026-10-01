@@ -94,6 +94,7 @@ export interface TaskListItem {
 }
 
 export interface TaskDetail extends TaskListItem {
+  subtitle_directory?: string | null
   tmdb_id: number | null
   imdb_id: string | null
   target_storage: string | null
