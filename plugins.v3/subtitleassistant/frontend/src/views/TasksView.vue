@@ -10,6 +10,7 @@ import DetailRow from '@/components/DetailRow.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import StateChip from '@/components/StateChip.vue'
 import { useDebouncedValue } from '@/composables/useDebouncedValue'
+import { useStickyContentClipping, useStickyTableClipping } from '@/composables/useStickyTableClipping'
 import type { PluginApi, TaskDetail, TaskListItem, TaskStatus } from '@/types'
 import {
   elapsedDuration,
@@ -64,6 +65,13 @@ const deleting = ref(false)
 const deleteTarget = ref<TaskListItem | null>(null)
 const pageVisible = ref(typeof document === 'undefined' || !document.hidden)
 const tableFrame = ref<HTMLElement | null>(null)
+const viewControls = ref<HTMLElement | null>(null)
+const masterDetail = ref<HTMLElement | null>(null)
+useStickyTableClipping(() => tableFrame.value?.querySelector('table'))
+useStickyContentClipping(
+  () => isDesktop.value ? null : viewControls.value,
+  () => masterDetail.value ? [masterDetail.value] : [],
+)
 let listRequest = 0
 let detailRequest = 0
 let detailRefreshInFlight = false
@@ -295,7 +303,7 @@ function taskTime(item: TaskListItem): string {
 
 <template>
   <section class="view-shell" aria-labelledby="tasks-view-title">
-    <div class="view-controls">
+    <div ref="viewControls" class="view-controls">
       <header class="view-header">
         <div>
           <h2 id="tasks-view-title">任务</h2>
@@ -364,7 +372,7 @@ function taskTime(item: TaskListItem): string {
       </template>
     </EmptyState>
 
-    <div v-else class="master-detail">
+    <div v-else ref="masterDetail" class="master-detail">
       <div class="master-pane">
         <div v-if="isDesktop" ref="tableFrame" class="table-frame">
           <VTable hover fixed-header height="100%" class="data-table">
@@ -628,6 +636,7 @@ function taskTime(item: TaskListItem): string {
 }
 
 @media (max-width: 959px) {
+  .view-controls { background: var(--glass-sheen, rgb(var(--v-theme-surface))); box-shadow: none; }
   .filter-bar { grid-template-columns: 1fr; }
 }
 
@@ -635,11 +644,7 @@ function taskTime(item: TaskListItem): string {
   .view-controls { margin-block-end: 0.75rem; padding-block-end: 0.5rem; }
   .view-header { margin-block-end: 0.5rem; }
   .view-header p { display: none; }
-  .filter-bar { grid-template-columns: minmax(0, 1fr) minmax(7.5rem, 9rem); gap: 0.5rem; }
-}
-
-@media (max-width: 26rem) {
-  .filter-bar { grid-template-columns: minmax(0, 1fr); }
+  .filter-bar { grid-template-columns: minmax(0, 1fr); gap: 0.5rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {

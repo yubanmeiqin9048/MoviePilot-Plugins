@@ -5,6 +5,7 @@ import { useDisplay } from 'vuetify'
 import EmptyState from '@/components/EmptyState.vue'
 import SearchDetailsDialog from '@/components/SearchDetailsDialog.vue'
 import StateChip from '@/components/StateChip.vue'
+import { useStickyTableClipping } from '@/composables/useStickyTableClipping'
 import type { SearchSourceGroup, SubtitleCandidate, TargetItem } from '@/types'
 import {
   manualSourceState,
@@ -69,12 +70,15 @@ function loadMore(): void {
 
 // 结果工具栏在桌面端冻结；表头粘贴位置需要它的实际高度，随指标行折行动态测量。
 const toolbarElement = ref<HTMLElement | null>(null)
+const tableElement = ref<HTMLTableElement | null>(null)
 const toolbarHeight = ref(0)
 let toolbarObserver: ResizeObserver | null = null
+const scheduleBodyClipping = useStickyTableClipping(() => tableElement.value)
 
 function measureToolbar(): void {
   const element = toolbarElement.value
   if (element) toolbarHeight.value = element.offsetHeight
+  scheduleBodyClipping()
 }
 
 onMounted(() => {
@@ -228,7 +232,7 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
       message="当前筛选隐藏了全部候选，请清除或切换筛选条件。"
     />
     <div v-else class="candidate-table-wrap" aria-live="polite">
-      <table class="candidate-table">
+      <table ref="tableElement" class="candidate-table">
         <caption class="sr-only">人工字幕搜索候选比较表；移动设备上按字段标签顺序阅读。</caption>
         <thead>
           <tr>
@@ -401,21 +405,20 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
   font-size: 0.75rem;
 }
 
-.candidate-table thead th {
+.candidate-table thead {
   position: sticky;
   z-index: 2;
   inset-block-start: 0;
+  background: var(--glass-sheen, rgb(var(--v-theme-surface)));
+}
+
+.candidate-table thead th {
   padding: 0.6rem 1rem;
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
   color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
   font-size: 0.6875rem;
   font-weight: 650;
   text-align: left;
-  background-color: rgb(var(--v-theme-surface));
-  background-image: linear-gradient(
-    rgba(var(--v-theme-on-surface), 0.04),
-    rgba(var(--v-theme-on-surface), 0.04)
-  );
 }
 
 .candidate-table thead th:nth-child(1) { width: 38%; }
@@ -575,14 +578,10 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
     inset-block-start: 0;
     border-start-start-radius: 0.45rem;
     border-start-end-radius: 0.45rem;
-    background-color: rgb(var(--v-theme-surface));
-    background-image: linear-gradient(
-      rgba(var(--v-theme-on-surface), 0.04),
-      rgba(var(--v-theme-on-surface), 0.04)
-    );
+    background: var(--glass-sheen, rgb(var(--v-theme-surface)));
   }
 
-  .candidate-table thead th {
+  .candidate-table thead {
     inset-block-start: var(--candidate-toolbar-height, 0px);
   }
 }
@@ -635,7 +634,6 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
     padding: 0.9rem;
     border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
     border-radius: 0.45rem;
-    background: rgba(var(--v-theme-surface), 0.58);
   }
 
   .candidate-table tbody > tr:not(.candidate-group-row) td {
@@ -686,10 +684,6 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
   .candidate-table .candidate-range,
   .candidate-table .candidate-language {
     min-width: 0;
-  }
-
-  .candidate-table tbody > tr:not(.candidate-group-row):hover {
-    background: rgba(var(--v-theme-surface), 0.58);
   }
 
   .candidate-table .candidate-action {

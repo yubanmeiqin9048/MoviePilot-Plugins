@@ -61,7 +61,7 @@ function updateWorkbenchHeight(): void {
     ? Number.parseFloat(window.getComputedStyle(hostPage).paddingBottom) || 0
     : 16
   const viewportTop = Math.max(0, element.getBoundingClientRect().top)
-  const availableHeight = Math.max(0, Math.floor(window.innerHeight - viewportTop - hostBottomPadding))
+  const availableHeight = Math.max(0, window.innerHeight - viewportTop - hostBottomPadding)
   if (workbenchHeight.value !== availableHeight) workbenchHeight.value = availableHeight
   bindViewScrollTracking(activeView.value)
 }
@@ -291,6 +291,14 @@ onBeforeUnmount(() => {
   overflow: clip;
 }
 
+.subtitleassistant-workbench :deep(.data-table.v-table--fixed-header > .v-table__wrapper > table > thead) {
+  background: var(--glass-sheen, rgb(var(--v-theme-surface)));
+}
+
+.subtitleassistant-workbench :deep(.data-table.v-table--fixed-header > .v-table__wrapper > table > thead > tr > th) {
+  background: transparent;
+}
+
 .subtitleassistant-workbench :deep(.v-btn:focus-visible),
 .subtitleassistant-workbench :deep(.v-tab:focus-visible),
 .subtitleassistant-workbench :deep(input:focus-visible) {
@@ -299,6 +307,10 @@ onBeforeUnmount(() => {
 }
 
 @media (min-width: 960px) {
+  :global(.layout-page-content:has(.subtitleassistant-workbench)) {
+    padding-block-end: var(--glass-v3-navigation-inset, 1rem);
+  }
+
   :global(.layout-page-content:has(.subtitleassistant-workbench) + .layout-footer) {
     display: none;
   }
@@ -309,7 +321,7 @@ onBeforeUnmount(() => {
     grid-template-rows: auto minmax(0, 1fr);
     overflow: hidden;
     padding-inline: 0;
-    padding-block: 0.75rem 1rem;
+    padding-block: 0.75rem 0;
   }
 
   .workbench-heading { min-height: 3rem; }

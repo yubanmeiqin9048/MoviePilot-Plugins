@@ -5,6 +5,7 @@ import { useDisplay } from 'vuetify'
 import { getErrorMessage, previewBatchRetargetRecords, retargetBatchRecords } from '@/api/client'
 import TargetSelector from '@/components/TargetSelector.vue'
 import { useDialogFocusReturn } from '@/composables/useDialogFocusReturn'
+import { useStickyContentClipping, useStickyTableClipping } from '@/composables/useStickyTableClipping'
 import {
   MAX_RECORD_BATCH_SIZE,
   type BatchRetargetPreviewItem,
@@ -71,6 +72,13 @@ const sortKey = ref<SortKey | null>(null)
 const sortDirection = ref<'asc' | 'desc'>('asc')
 const openPickerId = ref('')
 const mobilePickerId = ref('')
+const tableElement = ref<HTMLTableElement | null>(null)
+const toolbarElement = ref<HTMLElement | null>(null)
+const scheduleTableClipping = useStickyTableClipping(() => tableElement.value)
+const scheduleToolbarClipping = useStickyContentClipping(
+  () => tableElement.value?.tHead?.getClientRects().length ? null : toolbarElement.value,
+  () => tableElement.value ? [tableElement.value] : [],
+)
 /**
  * 「待处理优先」只在打开批次和提交之后各取一次快照。
  * 若每次改目标都重排，刚修好的行会立刻跳出待处理档，用户会丢失当前位置。
@@ -369,6 +377,7 @@ function handleDialogUpdate(open: boolean): void {
     :aria-labelledby="titleId"
     @update:model-value="handleDialogUpdate"
     @after-leave="restoreFocus"
+    @after-enter="scheduleTableClipping(); scheduleToolbarClipping()"
   >
     <VCard class="batch-card">
       <VCardTitle class="dialog-title">
@@ -386,7 +395,7 @@ function handleDialogUpdate(open: boolean): void {
         <VAlert v-if="generalError" type="error" variant="tonal" density="compact" class="dialog-alert">{{ generalError }}</VAlert>
 
         <template v-if="rows.length">
-          <div class="toolbar">
+          <div ref="toolbarElement" class="toolbar">
             <p v-if="destinationRoot" class="toolbar__prefix">
               共同目录 <code :title="destinationRoot">{{ destinationRoot }}</code>
               <span>表中只显示相对该目录的差异</span>
@@ -425,7 +434,7 @@ function handleDialogUpdate(open: boolean): void {
           </div>
 
           <div class="table-wrap">
-            <table class="batch-table">
+            <table ref="tableElement" class="batch-table">
               <thead>
                 <tr>
                   <th v-for="column in SORT_COLUMNS" :key="column.key" scope="col" :aria-sort="ariaSort(column.key)">
@@ -631,7 +640,8 @@ function handleDialogUpdate(open: boolean): void {
 
 .table-wrap { min-block-size: 0; flex: 1 1 auto; overflow: auto; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(var(--v-theme-on-surface), 0.25) transparent; }
 .batch-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
-.batch-table thead th { position: sticky; top: 0; z-index: 1; padding: 0; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); text-align: start; background: rgb(var(--v-theme-surface)); font-size: 0.75rem; font-weight: 650; }
+.batch-table thead { position: sticky; top: 0; z-index: 1; background: var(--glass-sheen, rgb(var(--v-theme-surface))); }
+.batch-table thead th { padding: 0; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); text-align: start; font-size: 0.75rem; font-weight: 650; }
 .batch-table tbody td { padding: 0.4rem 0.6rem; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); vertical-align: middle; }
 .batch-table tbody tr:last-child td { border-bottom: 0; }
 .sort-button { display: flex; width: 100%; align-items: center; gap: 0.25rem; padding: 0.45rem 0.6rem; border: 0; color: inherit; text-align: start; background: transparent; cursor: pointer; font: inherit; }
@@ -693,7 +703,7 @@ function handleDialogUpdate(open: boolean): void {
   .dialog-content { overflow-y: auto !important; padding: 0.875rem 1rem; }
   .action-summary { display: none; }
 
-  .toolbar { position: sticky; top: -0.875rem; z-index: 2; padding-block: 0.5rem; background: rgb(var(--v-theme-surface)); }
+  .toolbar { position: sticky; top: -0.875rem; z-index: 2; padding-block: 0.5rem; background: var(--glass-sheen, rgb(var(--v-theme-surface))); }
   .toolbar__prefix { flex: 1 1 100%; }
   .toolbar__sort { display: flex; flex: 1 1 100%; align-items: center; gap: 0.4rem; }
   .toolbar__sort > :deep(.v-input) { flex: 1 1 auto; }
