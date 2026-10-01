@@ -624,7 +624,7 @@ class SubtitleSourceBase(ABC):
                     candidate=SubtitleCandidate.model_validate_json(json.dumps(item["candidate"], ensure_ascii=False)),
                     download_handle=SubtitleSourceBase._decode_download_handle(source, item["download_handle"]),
                 )
-            except (KeyError, TypeError, ValueError):
+            except KeyError, TypeError, ValueError:
                 return None
             if handle.candidate.source is not source or not SubtitleSourceBase._valid_handle(handle):
                 return None

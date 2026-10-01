@@ -42,7 +42,7 @@ def _parse_integer(value: object) -> int | None:
         return None
     try:
         return int(str(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -58,7 +58,7 @@ def _parse_history_time(value: object) -> datetime:
 
     try:
         parsed = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return datetime.now(UTC)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)

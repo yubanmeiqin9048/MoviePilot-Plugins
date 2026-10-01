@@ -102,7 +102,7 @@ class ApiController:
             return str(record.path)
         try:
             return str(await self._filesystem.plugin_file_path(str(record.path)))
-        except (OSError, ValueError):
+        except OSError, ValueError:
             # 历史损坏记录仍应能列出并由后端安全拒绝文件操作；此时保留原值
             # 供用户定位数据问题，不尝试自行拼接未经校验的路径。
             return str(record.path)

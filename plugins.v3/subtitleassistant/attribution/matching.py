@@ -87,7 +87,7 @@ class MoviePilotMatcher:
                 continue
             try:
                 number = int(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if number >= 0:
                 result.add(number)
@@ -113,7 +113,7 @@ class MoviePilotMatcher:
         for label, name in self._candidate_names(candidate):
             try:
                 result.append((label, name, MetaInfo(title=name, subtitle=description)))
-            except (AttributeError, TypeError, ValueError):
+            except AttributeError, TypeError, ValueError:
                 continue
         return result
 
@@ -246,7 +246,7 @@ class MoviePilotMatcher:
                             season_episodes=season_episodes,
                         ):
                             break
-                    except (AttributeError, TypeError, ValueError):
+                    except AttributeError, TypeError, ValueError:
                         continue
                 else:
                     return None
@@ -277,7 +277,7 @@ class MoviePilotMatcher:
                     torrent=torrent,
                 ):
                     continue
-            except (AttributeError, TypeError, ValueError):
+            except AttributeError, TypeError, ValueError:
                 continue
             candidate.exact_id_match = False
             return candidate
@@ -378,7 +378,7 @@ class MoviePilotMatcher:
 
         try:
             return MetaInfoPath(Path(logical_source_path))
-        except (AttributeError, TypeError, ValueError):
+        except AttributeError, TypeError, ValueError:
             return None
 
     @staticmethod
@@ -543,14 +543,14 @@ class MoviePilotMatcher:
         raw_tmdb_id = getattr(mediainfo, "tmdb_id", None)
         try:
             tmdb_id = int(raw_tmdb_id) if raw_tmdb_id is not None else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             tmdb_id = None
         raw_imdb_id = getattr(mediainfo, "imdb_id", None)
         imdb_id = str(raw_imdb_id).strip() if raw_imdb_id else None
         raw_year = getattr(mediainfo, "year", None)
         try:
             year = int(raw_year) if raw_year not in (None, "") else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             year = None
         summary: dict[str, Any] = {
             "recognized": True,

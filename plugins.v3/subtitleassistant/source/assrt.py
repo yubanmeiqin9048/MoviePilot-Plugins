@@ -222,7 +222,7 @@ class AssrtSource(SubtitleSourceBase):
                 continue
             try:
                 subtitle_id = int(item.get("id"))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 rejected["download_locator"] = rejected.get("download_locator", 0) + 1
                 continue
             if subtitle_id <= 0:
@@ -238,7 +238,7 @@ class AssrtSource(SubtitleSourceBase):
             )
             try:
                 revision = int(item.get("revision") or 0)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 revision = 0
             candidate = SubtitleCandidate(
                 candidate_key=f"assrt:{subtitle_id}:{revision}",

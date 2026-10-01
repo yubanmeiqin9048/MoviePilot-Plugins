@@ -411,7 +411,7 @@ class RecordDeletionService:
         for record in records_by_id.values():
             try:
                 path = await self._normalized_record_file_path(record)
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 continue
             path_owners.setdefault(path, set()).add(record.id)
 

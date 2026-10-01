@@ -119,7 +119,7 @@ class MoviePilotSource(SubtitleSourceBase):
 
         try:
             return int(value) if value not in (None, "") else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
     @staticmethod

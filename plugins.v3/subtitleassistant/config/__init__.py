@@ -57,7 +57,7 @@ def load_config(raw: Mapping[str, object] | None, allowed_formats: Sequence[str]
     try:
         raw_attempts = values.get("max_candidate_attempts", 3)
         attempts = int(raw_attempts) if isinstance(raw_attempts, (str, int, float)) else 3
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         attempts = 3
     mapping_values = values.get("path_mappings")
     mappings: list[PathMapping] = []

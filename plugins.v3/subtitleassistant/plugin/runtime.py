@@ -256,7 +256,7 @@ class PluginRuntime:
         history_id = data.get("transfer_history_id")
         try:
             history_id = int(history_id) if history_id not in (None, "") else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             history_id = None
         await self.coordinator.enqueue(
             TaskWorkItem(

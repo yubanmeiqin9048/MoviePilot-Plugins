@@ -10,13 +10,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
-!plugins.v2/*/frontend/dist/
-!plugins.v2/*/frontend/dist/assets/
-!plugins.v2/*/frontend/dist/assets/**
-!plugins.v3/*/frontend/dist/
-!plugins.v3/*/frontend/dist/assets/
-!plugins.v3/*/frontend/dist/assets/**
 downloads/
 eggs/
 .eggs/
@@ -76,15 +69,6 @@ instance/
 
 # Sphinx documentation
 docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-# The v2 and v3 release staging directories contain publishable plugin files.
-!plugins.v2/subtitleassistant/target/
-!plugins.v2/subtitleassistant/target/**
-!plugins.v3/subtitleassistant/target/
-!plugins.v3/subtitleassistant/target/**
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -217,6 +201,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# ty
+.ty_cache/
+
 # PyPI configuration file
 .pypirc
 
@@ -230,3 +217,16 @@ __marimo__/
 
 # vscode 
 .vscode/
+
+# yarn*npm
+node_modules/
+
+# vite
+.vite/
+
+# SubtitleAssistant V3 development files (after the target/ source exceptions).
+/plugins.v3/subtitleassistant/.impeccable/
+/plugins.v3/subtitleassistant/.worktree
+/plugins.v3/subtitleassistant/AGENTS.md
+/plugins.v3/subtitleassistant/CONTEXT.md
+/plugins.v3/subtitleassistant/docs

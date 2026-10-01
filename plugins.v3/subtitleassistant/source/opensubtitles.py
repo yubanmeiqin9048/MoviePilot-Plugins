@@ -149,7 +149,7 @@ class OpenSubtitlesSource(SubtitleSourceBase):
         retry_after = headers.get("Retry-After") if headers is not None else None
         try:
             seconds = max(1, int(retry_after if retry_after is not None else 60))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             seconds = 60
         self._cooldown_until = datetime.now(UTC) + timedelta(seconds=seconds)
         self._last_details["limited_until"] = self._cooldown_until.isoformat()
@@ -280,7 +280,7 @@ class OpenSubtitlesSource(SubtitleSourceBase):
             imdb_id = feature.get("imdb_id")
         try:
             parsed_tmdb = int(tmdb_id) if tmdb_id not in (None, "") else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             parsed_tmdb = None
         imdb_digits = str(imdb_id or "")
         parsed_imdb = f"tt{int(imdb_digits):07d}" if imdb_digits.isdigit() else None
@@ -339,7 +339,7 @@ class OpenSubtitlesSource(SubtitleSourceBase):
                     continue
                 try:
                     file_id = int(file_info.get("file_id"))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     rejected["download_locator"] = rejected.get("download_locator", 0) + 1
                     continue
                 if file_id <= 0:
@@ -432,7 +432,7 @@ class OpenSubtitlesSource(SubtitleSourceBase):
         handles, raw_count, rejected, malformed_count = self._normalize_pool(raw_page.model_dump(), query)
         try:
             total_pages = max(1, int(raw_page.total_pages or 1))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             total_pages = 1
         return SourcePage(
             candidates=handles,

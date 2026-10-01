@@ -79,7 +79,7 @@ def _page_size_parser(value: object) -> object:
     if isinstance(value, (int, str)):
         try:
             return PageSize(int(value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return value
     return value
 
