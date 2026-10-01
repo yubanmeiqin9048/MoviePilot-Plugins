@@ -1,14 +1,18 @@
 """测试引导的源码来源契约。"""
 
+import json
 import os
 import socket
 import sys
 from pathlib import Path
+from types import ModuleType
+
+import pytest
+from anyio import Path as AsyncPath
+from anyio import create_task_group, run_process
 
 import app.testing.bootstrap
 import app.testing.network
-import pytest
-from anyio import run_process
 from app.plugins import subtitleassistant
 from app.plugins.subtitleassistant.schemas import target as target_schema
 
@@ -35,109 +39,74 @@ async def test_host_test_harness_remains_loaded_from_moviepilot() -> None:
     assert socket.getaddrinfo.__name__ == "_guarded_getaddrinfo"
 
 
-async def _run_bootstrap_probe(source: str) -> tuple[int, str, str]:
-    """在独立解释器中探测会影响全局导入状态的失败路径。"""
-
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(HOST_ROOT)
-    environment["MOVIEPILOT_ROOT"] = str(HOST_ROOT)
-    result = await run_process(
-        [sys.executable, "-c", source],
-        cwd=Path(__file__).resolve().parents[1],
-        env=environment,
-        check=False,
-    )
-    return result.returncode, result.stdout.decode(), result.stderr.decode()
-
-
-async def test_bootstrap_rejects_plugin_preloaded_from_another_location() -> None:
+def test_bootstrap_rejects_plugin_preloaded_from_another_location(monkeypatch: pytest.MonkeyPatch) -> None:
     """确保已从其他位置加载同名插件时明确失败。"""
 
-    bootstrap = Path(__file__).with_name("_bootstrap.py").resolve()
+    bootstrap = sys.modules["_subtitleassistant_test_bootstrap"]
+    foreign = ModuleType(bootstrap.PLUGIN_MODULE)
+    foreign.__file__ = "/tmp/other/subtitleassistant/__init__.py"
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, bootstrap.PLUGIN_MODULE, foreign)
+        with pytest.raises(RuntimeError, match="已从其他位置加载"):
+            bootstrap._load_plugin_from_worktree()
+
+    assert sys.modules[bootstrap.PLUGIN_MODULE] is subtitleassistant
+
+
+async def _run_entry_probes(cwd: Path, report: Path) -> list[str]:
+    """一次启动收集全量节点并执行来源及网络探针，每个入口使用独立配置目录。"""
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(HOST_ROOT)
+    environment["CONFIG_DIR"] = str(report.with_suffix(".config"))
+    arguments = [
+        "-q",
+        f"--rootdir={TEST_ROOT}",
+        str(TEST_ROOT),
+        "-k",
+        "plugin_package_is_loaded or host_test_harness_remains_loaded",
+    ]
+    # 在 -k 筛选前保存全量节点，避免另起 pytest 进程只做收集。
     source = f"""
-import importlib.util
-import sys
-from types import ModuleType
+import json
+from pathlib import Path
 
-spec = importlib.util.spec_from_file_location("probe_bootstrap", {str(bootstrap)!r})
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-foreign = ModuleType(module.PLUGIN_MODULE)
-foreign.__file__ = "/tmp/other/subtitleassistant/__init__.py"
-sys.modules[module.PLUGIN_MODULE] = foreign
-try:
-    module.prepare_plugin_backend()
-except RuntimeError as error:
-    print(error)
-else:
-    raise SystemExit("bootstrap unexpectedly accepted foreign plugin")
+import pytest
+
+class CollectionReport:
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection_modifyitems(self, items):
+        Path({str(report)!r}).write_text(
+            json.dumps(sorted(item.nodeid for item in items)), encoding="utf-8"
+        )
+
+raise SystemExit(pytest.main({arguments!r}, plugins=[CollectionReport()]))
 """
-
-    returncode, stdout, stderr = await _run_bootstrap_probe(source)
-
-    assert returncode == 0, stderr
-    assert "已从其他位置加载" in stdout
-
-
-async def _collect_tests(cwd: Path, *arguments: str) -> list[str]:
-    """从指定入口收集测试并返回稳定的节点列表。"""
-
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(HOST_ROOT)
     result = await run_process(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            f"--rootdir={TEST_ROOT}",
-            *arguments,
-        ],
+        [sys.executable, "-c", source],
         cwd=cwd,
         env=environment,
         check=False,
     )
-    stderr = result.stderr.decode()
-    assert result.returncode == 0, stderr
-    return sorted(line for line in result.stdout.decode().splitlines() if "::" in line)
+    output = result.stdout.decode() + result.stderr.decode()
+    assert result.returncode == 0, output
+    assert "2 passed" in output, output
+    return json.loads(await AsyncPath(report).read_text(encoding="utf-8"))
 
 
-async def _run_entry_probes(cwd: Path, test_path: str) -> str:
-    """从指定入口执行源码来源与宿主网络守卫探针。"""
-
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(HOST_ROOT)
-    result = await run_process(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            f"--rootdir={TEST_ROOT}",
-            test_path,
-            "-k",
-            "plugin_package_is_loaded or host_test_harness_remains_loaded",
-        ],
-        cwd=cwd,
-        env=environment,
-        check=False,
-    )
-    stderr = result.stderr.decode()
-    assert result.returncode == 0, stderr
-    return result.stdout.decode()
-
-
-async def test_pytest_entry_points_collect_the_same_worktree_tests() -> None:
+async def test_pytest_entry_points_collect_the_same_worktree_tests(tmp_path: Path) -> None:
     """确保插件与宿主启动位置均可执行当前工作树测试。"""
 
-    plugin_nodes = await _collect_tests(PLUGIN_ROOT, str(TEST_ROOT))
-    host_nodes = await _collect_tests(HOST_ROOT, str(TEST_ROOT))
-    plugin_probe = await _run_entry_probes(PLUGIN_ROOT, str(TEST_ROOT / "test_bootstrap.py"))
-    host_probe = await _run_entry_probes(HOST_ROOT, str(TEST_ROOT / "test_bootstrap.py"))
+    nodes: dict[str, list[str]] = {}
 
-    assert plugin_nodes
-    assert plugin_nodes == host_nodes
-    assert "2 passed" in plugin_probe
-    assert "2 passed" in host_probe
+    async def probe(name: str, cwd: Path) -> None:
+        """保存一个独立入口收集的节点。"""
+
+        nodes[name] = await _run_entry_probes(cwd, tmp_path / f"{name}.json")
+
+    async with create_task_group() as group:
+        group.start_soon(probe, "plugin", PLUGIN_ROOT)
+        group.start_soon(probe, "host", HOST_ROOT)
+
+    assert nodes["plugin"]
+    assert nodes["plugin"] == nodes["host"]

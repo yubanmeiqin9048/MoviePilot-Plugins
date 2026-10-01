@@ -1048,7 +1048,7 @@ def test_stop_service_does_not_clear_host_backed_manual_search_sessions() -> Non
 
     # 宿主基类构造需要完整 Chain 运行上下文，单测不装配组合根，
     # 用 __new__ 绕过基类 __init__，仅初始化本用例触及的运行态。
-    plugin = SubtitleAssistant.__new__(SubtitleAssistant)
+    plugin = object.__new__(SubtitleAssistant)
     plugin._runtime = None
     manual_search = SimpleNamespace(clear_sessions=AsyncMock())
     plugin.manual_search = manual_search
