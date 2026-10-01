@@ -300,11 +300,28 @@ onBeforeUnmount(() => {
 }
 
 .subtitleassistant-workbench :deep(.v-btn:focus-visible),
-.subtitleassistant-workbench :deep(.v-tab:focus-visible),
-.subtitleassistant-workbench :deep(input:focus-visible) {
+.subtitleassistant-workbench :deep(.v-tab:focus-visible) {
   outline: 2px solid rgb(var(--v-theme-primary));
   outline-offset: 2px;
 }
+
+.subtitleassistant-workbench :deep(.v-field input:focus-visible) {
+  outline: none;
+}
+
+/* 宿主可放大字段圆角，描边左段也必须同步加宽，避免与标签缺口的底边相交。 */
+.subtitleassistant-workbench :deep(.v-field--variant-outlined .v-field__outline__start) { flex-basis: max(12px, calc(var(--app-field-radius, 4px) + 8px)); }
+.subtitleassistant-workbench :deep(.v-field--variant-outlined .v-field__outline__notch) { max-width: calc(100% - max(12px, calc(var(--app-field-radius, 4px) + 8px))); }
+
+/* 玻璃主题会重新给填充按钮加边框，以下操作与筛选仅由底色区分状态。 */
+.subtitleassistant-workbench :deep(.target-summary__actions .v-btn),
+.subtitleassistant-workbench :deep(.recognition-filter .v-btn),
+.subtitleassistant-workbench :deep(.candidate-download-button),
+.subtitleassistant-workbench :deep(.target-empty .v-btn),
+.subtitleassistant-workbench :deep(.load-more .v-btn),
+.subtitleassistant-workbench :deep(.candidate-pagination > .v-btn),
+.subtitleassistant-workbench :deep(.selection-actions--header .v-btn),
+.subtitleassistant-workbench :deep(.source-refresh-button) { border: 0 !important; }
 
 @media (min-width: 960px) {
   :global(.layout-page-content:has(.subtitleassistant-workbench)) {

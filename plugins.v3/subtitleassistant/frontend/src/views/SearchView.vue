@@ -284,7 +284,6 @@ function clearCandidateFilters(): void {
 
     <section
       class="execution-overview"
-      :class="{ 'execution-overview--empty': !selectedHistory }"
       aria-label="搜索执行总览"
     >
       <div v-if="!selectedHistory" class="target-empty">
@@ -315,13 +314,13 @@ function clearCandidateFilters(): void {
           :disabled="historyId(selectedHistory) == null"
           @change="requestTargetChange"
           @search="search"
-        />
-
-        <SearchKeywordPanel
-          :keywords="keywords"
-          :plans="keywordPlans"
-          @change="setKeyword"
-        />
+        >
+          <SearchKeywordPanel
+            :keywords="keywords"
+            :plans="keywordPlans"
+            @change="setKeyword"
+          />
+        </SearchTargetSummary>
       </template>
     </section>
 
@@ -413,8 +412,7 @@ function clearCandidateFilters(): void {
 .view-header p { margin: 0.25rem 0 0; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; line-height: 1.5; }
 .stale-alert, .search-feedback, .session-expired-feedback { margin-bottom: 0.75rem; }
 .session-expired-feedback__content { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
-.execution-overview { display: flex; flex-direction: column; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.5rem; }
-.execution-overview--empty { border-style: dashed; }
+.execution-overview { display: flex; flex-direction: column; border: 0; border-radius: 0; }
 .target-empty { display: flex; align-items: center; gap: 1rem; padding: 1.5rem 1.25rem; }
 .target-empty__badge { display: inline-flex; width: 2.75rem; height: 2.75rem; flex: 0 0 auto; align-items: center; justify-content: center; border-radius: 0.5rem; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); background: rgba(var(--v-theme-on-surface), 0.06); }
 .target-empty__copy { min-width: 0; flex: 1 1 auto; }

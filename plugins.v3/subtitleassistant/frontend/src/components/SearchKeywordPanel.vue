@@ -1,6 +1,4 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-
 import type { SearchPlanItem, SubtitleSource } from '@/types'
 import { formatSearchPlan, sourceLabels, subtitleSourceOrder } from '@/types/presentation'
 
@@ -10,7 +8,6 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{ change: [source: SubtitleSource, value: string] }>()
-const expandedPanels = ref<number[]>([])
 
 function updateKeyword(source: SubtitleSource, value: string | null): void {
   emit('change', source, value || '')
@@ -23,57 +20,53 @@ function usePlan(source: SubtitleSource, plan: SearchPlanItem): void {
 </script>
 
 <template>
-  <VExpansionPanels v-model="expandedPanels" multiple variant="accordion" class="keyword-panel">
-    <VExpansionPanel>
-      <VExpansionPanelTitle>
-        <div class="keyword-panel__title">
-          <span><VIcon icon="mdi-tune-variant" size="18" aria-hidden="true" />来源关键词</span>
-          <small>可选，留空使用默认查询</small>
-        </div>
-      </VExpansionPanelTitle>
-      <VExpansionPanelText>
-        <p class="keyword-panel__note">按来源修改当前条件，不会自动发起搜索；准备好后请显式执行搜索。</p>
-        <div class="keyword-grid">
-          <div v-for="source in subtitleSourceOrder" :key="source" class="keyword-block">
-            <VTextField
-              :model-value="props.keywords[source]"
-              :label="sourceLabels[source]"
-              placeholder="可选，自定义搜索词"
-              clearable
-              hide-details="auto"
-              density="compact"
-              :aria-label="`${sourceLabels[source]}自定义关键词`"
-              @update:model-value="updateKeyword(source, $event)"
-            />
-            <div class="default-plan" :aria-label="`${sourceLabels[source]}默认查询计划`">
-              <span class="default-plan__label">默认查询计划</span>
-              <template v-if="props.plans[source]?.length">
-                <template v-for="(plan, index) in props.plans[source]" :key="`${source}-${plan.kind}-${index}`">
-                  <VBtn
-                    v-if="plan.editable && plan.query"
-                    variant="text"
-                    size="x-small"
-                    class="default-plan__button"
-                    :aria-label="`使用${sourceLabels[source]}查询计划：${formatSearchPlan(plan)}`"
-                    @click="usePlan(source, plan)"
-                  >
-                    {{ formatSearchPlan(plan) }}
-                  </VBtn>
-                  <VChip v-else size="x-small" variant="tonal" label>{{ formatSearchPlan(plan) }}</VChip>
-                </template>
+  <VExpansionPanel class="keyword-panel">
+    <VExpansionPanelTitle>
+      <div class="keyword-panel__title">
+        <span><VIcon icon="mdi-tune-variant" size="18" aria-hidden="true" />来源关键词</span>
+        <small>可选，留空使用默认查询</small>
+      </div>
+    </VExpansionPanelTitle>
+    <VExpansionPanelText>
+      <p class="keyword-panel__note">按来源修改当前条件，不会自动发起搜索；准备好后请显式执行搜索。</p>
+      <div class="keyword-grid">
+        <div v-for="source in subtitleSourceOrder" :key="source" class="keyword-block">
+          <VTextField
+            :model-value="props.keywords[source]"
+            :label="sourceLabels[source]"
+            placeholder="可选，自定义搜索词"
+            clearable
+            hide-details="auto"
+            density="compact"
+            :aria-label="`${sourceLabels[source]}自定义关键词`"
+            @update:model-value="updateKeyword(source, $event)"
+          />
+          <div class="default-plan" :aria-label="`${sourceLabels[source]}默认查询计划`">
+            <span class="default-plan__label">默认查询计划</span>
+            <template v-if="props.plans[source]?.length">
+              <template v-for="(plan, index) in props.plans[source]" :key="`${source}-${plan.kind}-${index}`">
+                <VBtn
+                  v-if="plan.editable && plan.query"
+                  variant="text"
+                  size="x-small"
+                  class="default-plan__button"
+                  :aria-label="`使用${sourceLabels[source]}查询计划：${formatSearchPlan(plan)}`"
+                  @click="usePlan(source, plan)"
+                >
+                  {{ formatSearchPlan(plan) }}
+                </VBtn>
+                <VChip v-else size="x-small" variant="tonal" label>{{ formatSearchPlan(plan) }}</VChip>
               </template>
-              <span v-else class="default-plan__empty">留空将使用默认计划；首次搜索后可查看实际计划</span>
-            </div>
+            </template>
+            <span v-else class="default-plan__empty">留空将使用默认计划；首次搜索后可查看实际计划</span>
           </div>
         </div>
-      </VExpansionPanelText>
-    </VExpansionPanel>
-  </VExpansionPanels>
+      </div>
+    </VExpansionPanelText>
+  </VExpansionPanel>
 </template>
 
 <style scoped>
-.keyword-panel { border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0; }
-.keyword-panel :deep(.v-expansion-panel) { background: transparent; }
 .keyword-panel :deep(.v-expansion-panel-title) { min-height: 2.85rem; padding: 0.6rem 1.15rem; }
 .keyword-panel :deep(.v-expansion-panel-text__wrapper) { padding: 0 1.15rem 0.9rem; }
 .keyword-panel__title { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 1rem; padding-right: 0.5rem; }

@@ -674,7 +674,7 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
 .filter-bar { display: grid; grid-template-columns: minmax(15rem, 1fr) minmax(10rem, 14rem); gap: 0.75rem; }
 .inline-alert { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .master-detail, .master-pane { min-width: 0; }
-.table-frame { overflow: hidden; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; }
+.table-frame { overflow: hidden; border: 0; border-radius: 0; }
 .table-frame :deep(.v-table__wrapper) { overscroll-behavior: contain; scrollbar-gutter: stable; }
 .selectable-row { cursor: pointer; transition: background-color 180ms ease; }
 .selectable-row:hover, .selectable-row--active { background: rgba(var(--v-theme-primary), 0.08); }

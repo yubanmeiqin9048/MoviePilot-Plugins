@@ -39,7 +39,7 @@ const emit = defineEmits<{
   search: []
 }>()
 
-// 事实明细默认折叠，与来源关键词面板保持一致：目标身份已在标题中，路径等按需展开。
+// 目标信息与来源关键词共用折叠组，默认折叠，可分别展开。
 const openPanels = ref<number[]>([])
 
 const summaryTarget = computed<TargetRecord>(() => props.resolvedTarget || props.target)
@@ -92,7 +92,8 @@ const searchDescription = computed(() => {
       <div class="target-summary__actions">
         <VBtn
           type="button"
-          variant="text"
+          variant="tonal"
+          color="primary"
           prepend-icon="mdi-swap-horizontal"
           aria-label="更换整理历史目标"
           :disabled="disabled"
@@ -139,6 +140,7 @@ const searchDescription = computed(() => {
           </dl>
         </VExpansionPanelText>
       </VExpansionPanel>
+      <slot />
     </VExpansionPanels>
   </section>
 </template>
@@ -181,7 +183,8 @@ const searchDescription = computed(() => {
 .target-summary__actions { display: flex; flex: 0 0 auto; align-items: center; gap: 0.35rem; }
 
 /* 明细折叠行与来源关键词面板同款：整行可点，标题在左、提示在右。 */
-.target-summary__details { border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0; }
+.target-summary__details { overflow: hidden; }
+.target-summary__details :deep(.v-expansion-panel + .v-expansion-panel) { border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .target-summary__details :deep(.v-expansion-panel) { background: transparent; }
 .target-summary__details :deep(.v-expansion-panel-title) { min-height: 2.85rem; padding: 0.6rem 1.15rem; }
 .target-summary__details :deep(.v-expansion-panel-text__wrapper) { padding: 0 1.15rem 1rem; }

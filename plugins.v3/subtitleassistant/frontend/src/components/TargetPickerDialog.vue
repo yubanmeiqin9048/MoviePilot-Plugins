@@ -91,7 +91,7 @@ function confirm(): void {
           {{ draft ? `已选：${historyLabel(draft)}` : '尚未选择整理历史' }}
         </span>
         <VSpacer />
-        <VBtn type="button" variant="text" @click="emit('update:modelValue', false)">取消</VBtn>
+        <VBtn type="button" color="primary" variant="tonal" @click="emit('update:modelValue', false)">取消</VBtn>
         <VBtn
           type="button"
           color="primary"
@@ -118,6 +118,8 @@ function confirm(): void {
 .picker-content { display: flex; min-block-size: 0; flex: 1 1 auto; flex-direction: column; overflow: hidden !important; padding: 1rem 1.25rem; }
 .picker-alert { flex: 0 0 auto; margin-bottom: 0.75rem; }
 .picker-actions { flex: 0 0 auto; padding: 0.75rem 1.25rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
+/* 弹窗挂载在工作台之外，底部操作按钮在本地覆盖宿主附加的边框。 */
+.picker-actions :deep(.v-btn) { border: 0 !important; }
 .picker-choice { min-width: 0; overflow: hidden; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.75rem; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 37.5rem) {
   .picker-card { max-block-size: 100dvh; }

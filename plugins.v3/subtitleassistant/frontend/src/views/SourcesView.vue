@@ -99,6 +99,7 @@ function detailValue(key: string, value: unknown): string {
         <p>状态来自最近任务观测或本次手动检测，不进行后台健康轮询。</p>
       </div>
       <VBtn
+        class="source-refresh-button"
         variant="tonal"
         prepend-icon="mdi-refresh"
         :loading="refreshing"
@@ -124,7 +125,7 @@ function detailValue(key: string, value: unknown): string {
       <VBtn class="mt-2" size="small" variant="text" prepend-icon="mdi-refresh" @click="loadStatus()">重试</VBtn>
     </VAlert>
     <EmptyState v-else-if="!orderedItems.length" icon="mdi-database-off-outline" title="没有字幕源状态" message="插件尚未返回字幕源状态，请刷新后重试。">
-      <template #actions><VBtn variant="tonal" prepend-icon="mdi-refresh" @click="refreshAll">刷新状态</VBtn></template>
+      <template #actions><VBtn class="source-refresh-button" variant="tonal" prepend-icon="mdi-refresh" @click="refreshAll">刷新状态</VBtn></template>
     </EmptyState>
 
     <VExpansionPanels v-else v-model="openPanels" multiple variant="accordion" class="source-list">
@@ -176,7 +177,7 @@ function detailValue(key: string, value: unknown): string {
 .view-header h2 { margin: 0; color: rgb(var(--v-theme-on-surface)); font-size: 1rem; font-weight: 650; letter-spacing: 0; }
 .view-header p { margin: 0.25rem 0 0; color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.8125rem; }
 .inline-alert { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
-.source-skeleton, .source-list { overflow: hidden; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 0.375rem; }
+.source-skeleton, .source-list { overflow: hidden; border: 0; border-radius: 0; }
 .source-panel + .source-panel { border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .source-summary { display: grid; width: 100%; min-width: 0; grid-template-columns: minmax(14rem, 1.2fr) minmax(7rem, auto) minmax(10rem, 0.8fr) minmax(12rem, 1fr); align-items: center; gap: 1rem; padding-right: 0.75rem; }
 .source-identity { display: flex; min-width: 0; align-items: center; gap: 0.625rem; }

@@ -45,7 +45,7 @@ function updateSourceFilter(value: unknown): void {
       :model-value="props.recognitionFilter"
       mandatory
       color="primary"
-      variant="outlined"
+      variant="tonal"
       density="compact"
       aria-label="按识别状态筛选候选"
       @update:model-value="updateRecognitionFilter"

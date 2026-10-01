@@ -792,7 +792,8 @@ function showNotice(text: string, color: 'success' | 'error' | 'warning'): void 
 .map-add { justify-self: start; }
 .narrow { max-width: 16rem; }
 
-.cfg :deep(.v-btn:focus-visible), .cfg :deep(input:focus-visible), .cfg button:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 2px; }
+.cfg :deep(.v-btn:focus-visible), .cfg button:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 2px; }
+.cfg :deep(.v-field input:focus-visible) { outline: none; }
 
 @media (max-width: 74.99rem) {
   .cfg-group__summary { max-width: 16rem; }

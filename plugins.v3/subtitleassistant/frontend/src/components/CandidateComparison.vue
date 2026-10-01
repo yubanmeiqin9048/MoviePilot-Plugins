@@ -340,8 +340,6 @@ function candidateActionLabel(candidate: SubtitleCandidate): string {
 .candidate-results {
   min-width: 0;
   margin-top: 0.75rem;
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-radius: 0.5rem;
 }
 
 .results-toolbar {
