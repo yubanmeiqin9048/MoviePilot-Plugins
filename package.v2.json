@@ -94,6 +94,7 @@
     "author": "yubanmeiqin9048",
     "level": 1,
     "system_version": ">=2.15.1",
+    "v3": false,
     "history": {
       "v1.4.1": "字幕搜索加入分页",
       "v1.4": "精简功能，聚焦核心实现",
