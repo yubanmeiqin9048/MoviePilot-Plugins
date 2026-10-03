@@ -224,7 +224,6 @@ node_modules/
 # vite
 .vite/
 
-# SubtitleAssistant V3 development files (after the target/ source exceptions).
-/plugins.v3/subtitleassistant/.impeccable/
-/plugins.v3/subtitleassistant/.worktree
-/plugins.v3/subtitleassistant/AGENTS.md
+# Temporary ban
+AGENTS.md
+.scratch/
