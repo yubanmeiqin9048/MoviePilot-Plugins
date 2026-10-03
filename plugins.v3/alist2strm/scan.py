@@ -375,6 +375,13 @@ class _MappingRun:
     mapping_index: int
     exclude_keywords: tuple[str, ...]
     status: MappingScanStatus
+    playback_changed: bool = False
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """返回用于比较有效播放地址的稳定映射身份。"""
+
+        return (self.instance_id, self.source_dir, str(self.output_dir))
 
     @property
     def label(self) -> str:
@@ -420,6 +427,7 @@ class ScanCoordinator:
         self._clock = clock
         self._lock = threading.Lock()
         self._run: _ScanRun | None = None
+        self._last_playback_urls: dict[tuple[str, str, str], str] = {}
 
     def _dispatch_with_host_scheduler(self, task: Callable[[], None]) -> bool:
         """通过宿主一次性任务注册扫描，不创建插件私有线程池。"""
@@ -545,17 +553,23 @@ class ScanCoordinator:
                     source_dir=mapping.source_dir,
                     output_dir=mapping.output_dir,
                 )
+                identity = (instance.id, mapping.source_dir, mapping.output_dir)
+                effective_playback_url = instance.effective_playback_url
                 mappings.append(
                     _MappingRun(
                         instance_id=instance.id,
                         instance_name=instance.name,
                         scan_url=instance.scan_url,
-                        playback_url=instance.effective_playback_url,
+                        playback_url=effective_playback_url,
                         token=instance.api_token,
                         source_dir=mapping.source_dir,
                         output_dir=Path(mapping.output_dir),
                         mapping_index=mapping_index,
                         exclude_keywords=tuple(mapping.exclude_keywords),
+                        playback_changed=playback_address_changed(
+                            self._last_playback_urls.get(identity),
+                            effective_playback_url,
+                        ),
                         status=status,
                     )
                 )
@@ -596,6 +610,7 @@ class ScanCoordinator:
                     mapping.status.state = "failed"
                     mapping.status.error = "映射内存在失败操作"
                 else:
+                    self._remember_playback_identity(mapping)
                     mapping.status.state = "success"
             except OpenListError as error:
                 self._mark_mapping_failed(mapping, error.message)
@@ -609,6 +624,12 @@ class ScanCoordinator:
             finally:
                 with self._lock:
                     run.current_mapping = None
+
+    def _remember_playback_identity(self, mapping: _MappingRun) -> None:
+        """仅在映射无失败时记录本轮已应用的有效播放地址。"""
+
+        with self._lock:
+            self._last_playback_urls[mapping.identity] = mapping.playback_url
 
     @staticmethod
     def _mark_mapping_failed(mapping: _MappingRun, error: str) -> None:
@@ -638,7 +659,11 @@ class ScanCoordinator:
                     continue
                 target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
                 if target.exists():
-                    mapping.status.counters.skipped += 1
+                    if mapping.playback_changed:
+                        content = build_playback_url(mapping.playback_url, remote_path)
+                        self._update_existing_target(target, content, mapping.status.counters)
+                    else:
+                        mapping.status.counters.skipped += 1
                     continue
                 content = build_playback_url(mapping.playback_url, remote_path)
                 self._write_new_target(target, content, mapping.status.counters)
@@ -661,6 +686,32 @@ class ScanCoordinator:
 
         folded = name.casefold()
         return any(keyword.casefold() in folded for keyword in keywords)
+
+    @staticmethod
+    def _update_existing_target(target: Path, content: str, counters: ScanCounters) -> None:
+        """完整写入临时文件后原子替换已有 STRM，失败时保留原文件。"""
+
+        temporary: Path | None = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=target.parent,
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        except OSError:
+            counters.failed += 1
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        counters.updated += 1
 
     @staticmethod
     def _write_new_target(target: Path, content: str, counters: ScanCounters) -> None:
@@ -690,6 +741,12 @@ class ScanCoordinator:
             counters.failed += 1
             return
         counters.generated += 1
+
+
+def playback_address_changed(previous: str | None, current: str) -> bool:
+    """只把已知有效播放身份的变化判定为 STRM 更新信号。"""
+
+    return previous is not None and previous != current
 
 
 def _join_remote_path(parent: str, name: str) -> str:
@@ -726,4 +783,5 @@ __all__ = [
     "encode_remote_path",
     "is_video_name",
     "local_strm_path",
+    "playback_address_changed",
 ]

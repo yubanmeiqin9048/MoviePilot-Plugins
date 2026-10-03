@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -181,6 +182,61 @@ def test_manual_trigger_uses_saved_snapshot_and_injected_high_level_io(tmp_path)
     assert (old_output / "Movie.strm").is_file()
     assert not new_output.exists()
     assert plugin.get_scan_status()["state"] == "success"
+
+
+def test_save_during_queued_scan_keeps_snapshot_until_next_run(tmp_path: Path) -> None:
+    """通过插件保存新地址后，已排队任务仍使用启动时快照。"""
+
+    plugin = _plugin()
+    output = tmp_path / "strm"
+    old_payload = {
+        "instances": [
+            {
+                "id": "instance-1",
+                "name": "主实例",
+                "scan_url": "https://openlist.example.invalid",
+                "playback_url": "https://play-old.example.invalid",
+                "api_token": "configured",
+                "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+            }
+        ]
+    }
+    new_payload = {
+        "instances": [
+            {
+                "id": "instance-1",
+                "name": "主实例",
+                "scan_url": "https://openlist.example.invalid",
+                "playback_url": "https://play-new.example.invalid",
+                "api_token": "configured",
+                "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+            }
+        ]
+    }
+    plugin._configuration = build_configuration(old_payload)
+    jobs: list[Any] = []
+    plugin._scan_dispatch = lambda task: jobs.append(task) or True
+    plugin._scan_client_factory = lambda _url, _token: _Reader()
+    plugin._scan_media_suffix_provider = lambda: (".mkv",)
+    plugin.update_config = lambda _config, plugin_id=None: True
+    plugin.save_data = lambda _key, _value, plugin_id=None: None
+
+    assert plugin.trigger_scan() == {"accepted": True, "message": "扫描已在后台启动"}
+    jobs.pop()()
+    target = output / "Movie.strm"
+    assert target.read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Movie.mkv"
+
+    assert plugin.trigger_scan() == {"accepted": True, "message": "扫描已在后台启动"}
+    plugin.save_configuration(new_payload)
+    jobs.pop()()
+    assert target.read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Movie.mkv"
+    assert plugin.get_scan_status()["counters"]["skipped"] == 1  # type: ignore[index]
+    assert plugin.get_scan_status()["counters"]["updated"] == 0  # type: ignore[index]
+
+    assert plugin.trigger_scan() == {"accepted": True, "message": "扫描已在后台启动"}
+    jobs.pop()()
+    assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Movie.mkv"
+    assert plugin.get_scan_status()["counters"]["updated"] == 1  # type: ignore[index]
 
 
 class _Reader:

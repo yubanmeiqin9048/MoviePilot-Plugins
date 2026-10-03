@@ -6,6 +6,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from app.plugins.alist2strm import scan as scan_module  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.config import build_configuration  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     HttpResponse,
@@ -184,6 +187,262 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_safe_urls(tmp_p
         assert "token" not in str(call["payload"]).casefold()
 
 
+def test_playback_address_change_updates_existing_video_target(tmp_path: Path) -> None:
+    """已保存播放地址变化时，当前映射的已有视频 STRM 应更新。"""
+
+    first = _config(tmp_path)
+    replacement = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "a",
+                    "name": "实例 A",
+                    "scan_url": "https://scan-a.example.invalid",
+                    "playback_url": "https://play-new.example.invalid",
+                    "api_token": "token-a",
+                    "mappings": [
+                        {
+                            "source_dir": "/media/movies",
+                            "output_dir": str(tmp_path / "a"),
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    current = [first]
+    queue = _Queue()
+    transport = _Transport(
+        {
+            "https://scan-a.example.invalid": {
+                "/media/movies": [{"name": "Film.mkv", "is_dir": False}],
+            }
+        }
+    )
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    target = tmp_path / "a" / "Film.strm"
+    assert target.read_text(encoding="utf-8") == "https://play-a.example.invalid/d/media/movies/Film.mkv"
+
+    current[0] = replacement
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/media/movies/Film.mkv"
+    assert coordinator.status()["counters"] == {
+        "generated": 0,
+        "downloaded": 0,
+        "updated": 1,
+        "skipped": 0,
+        "deleted": 0,
+        "failed": 0,
+    }
+
+
+def test_fallback_playback_address_change_updates_existing_video_target(tmp_path: Path) -> None:
+    """播放地址留空时，扫描地址变化也应更新已有视频 STRM。"""
+
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "fallback",
+                    "name": "回退实例",
+                    "scan_url": "https://scan-old.example.invalid",
+                    "api_token": "token-fallback",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "fallback")}],
+                }
+            ]
+        }
+    )
+    replacement = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "fallback",
+                    "name": "回退实例",
+                    "scan_url": "https://scan-new.example.invalid",
+                    "api_token": "token-fallback",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "fallback")}],
+                }
+            ]
+        }
+    )
+    current = [first]
+    queue = _Queue()
+    transport = _Transport(
+        {
+            "https://scan-old.example.invalid": {"/library": [{"name": "Movie.mkv", "is_dir": False}]},
+            "https://scan-new.example.invalid": {"/library": [{"name": "Movie.mkv", "is_dir": False}]},
+        }
+    )
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    target = tmp_path / "fallback" / "Movie.strm"
+    assert target.read_text(encoding="utf-8") == "https://scan-old.example.invalid/d/library/Movie.mkv"
+
+    current[0] = replacement
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert target.read_text(encoding="utf-8") == "https://scan-new.example.invalid/d/library/Movie.mkv"
+    assert coordinator.status()["counters"]["updated"] == 1  # type: ignore[index]
+
+
+def test_handmade_existing_strm_skips_until_playback_identity_changes(tmp_path: Path) -> None:
+    """手工已有 STRM 在普通扫描保留，明确播放地址变化时随当前映射更新。"""
+
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "handmade",
+                    "name": "手工实例",
+                    "scan_url": "https://scan-handmade.example.invalid",
+                    "playback_url": "https://play-old.example.invalid",
+                    "api_token": "token-handmade",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "handmade")}],
+                }
+            ]
+        }
+    )
+    replacement = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "handmade",
+                    "name": "手工实例",
+                    "scan_url": "https://scan-handmade.example.invalid",
+                    "playback_url": "https://play-new.example.invalid",
+                    "api_token": "token-handmade",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "handmade")}],
+                }
+            ]
+        }
+    )
+    current = [first]
+    output = tmp_path / "handmade"
+    target = output / "Movie.strm"
+    output.mkdir()
+    target.write_text("hand-made destination", encoding="utf-8")
+    queue = _Queue()
+    transport = _Transport(
+        {"https://scan-handmade.example.invalid": {"/library": [{"name": "Movie.mkv", "is_dir": False}]}}
+    )
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert target.read_text(encoding="utf-8") == "hand-made destination"
+    assert coordinator.status()["counters"]["skipped"] == 1  # type: ignore[index]
+
+    current[0] = replacement
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Movie.mkv"
+    assert coordinator.status()["counters"]["updated"] == 1  # type: ignore[index]
+
+
+def test_playback_update_failure_preserves_original_and_rescan_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """更新原子替换失败时保留原件，后续可重扫完成地址更新。"""
+
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "recovery",
+                    "name": "恢复实例",
+                    "scan_url": "https://scan-recovery.example.invalid",
+                    "playback_url": "https://play-old.example.invalid",
+                    "api_token": "token-recovery",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "recovery")}],
+                }
+            ]
+        }
+    )
+    replacement = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "recovery",
+                    "name": "恢复实例",
+                    "scan_url": "https://scan-recovery.example.invalid",
+                    "playback_url": "https://play-new.example.invalid",
+                    "api_token": "token-recovery",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "recovery")}],
+                }
+            ]
+        }
+    )
+    current = [first]
+    queue = _Queue()
+    transport = _Transport(
+        {"https://scan-recovery.example.invalid": {"/library": [{"name": "Movie.mkv", "is_dir": False}]}}
+    )
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    target = tmp_path / "recovery" / "Movie.strm"
+    original = target.read_text(encoding="utf-8")
+
+    current[0] = replacement
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        """模拟本地原子替换失败。"""
+
+        raise OSError("synthetic replacement failure")
+
+    monkeypatch.setattr(scan_module.os, "replace", fail_replace)
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    failed_status = coordinator.status()
+    assert target.read_text(encoding="utf-8") == original
+    assert failed_status["state"] == "failed"
+    assert failed_status["counters"]["updated"] == 0  # type: ignore[index]
+    assert failed_status["counters"]["failed"] == 1  # type: ignore[index]
+    assert failed_status["mappings"][0]["state"] == "failed"  # type: ignore[index]
+
+    monkeypatch.undo()
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    recovered_status = coordinator.status()
+    assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Movie.mkv"
+    assert recovered_status["state"] == "success"
+    assert recovered_status["counters"]["updated"] == 1  # type: ignore[index]
+    assert recovered_status["counters"]["failed"] == 0  # type: ignore[index]
+
+
 def test_overlapping_source_roots_keep_each_mapping_relative(tmp_path: Path) -> None:
     """重叠源目录仍按各自映射根保留相对结构。"""
 
@@ -262,6 +521,115 @@ def test_scan_uses_empty_directories_as_success_and_isolates_bad_mapping(tmp_pat
     assert status["mappings"][2]["state"] == "failed"  # type: ignore[index]
     assert (tmp_path / "a" / "ok.strm").is_file()
     assert not (tmp_path / "empty").exists()
+
+
+def test_unchanged_playback_rescan_keeps_existing_target_skipped(tmp_path: Path) -> None:
+    """有效播放地址未变化时，重复扫描继续跳过已有目标。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "unchanged",
+                    "name": "不变实例",
+                    "scan_url": "https://scan-unchanged.example.invalid",
+                    "playback_url": "https://play-unchanged.example.invalid",
+                    "api_token": "token-unchanged",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "unchanged")}],
+                }
+            ]
+        }
+    )
+    queue = _Queue()
+    transport = _Transport(
+        {"https://scan-unchanged.example.invalid": {"/library": [{"name": "Movie.mkv", "is_dir": False}]}}
+    )
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    target = tmp_path / "unchanged" / "Movie.strm"
+    original = target.read_text(encoding="utf-8")
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert target.read_text(encoding="utf-8") == original
+    assert coordinator.status()["counters"] == {
+        "generated": 0,
+        "downloaded": 0,
+        "updated": 0,
+        "skipped": 1,
+        "deleted": 0,
+        "failed": 0,
+    }
+
+
+def test_saved_playback_change_waits_until_queued_task_finishes(tmp_path: Path) -> None:
+    """任务排队后保存新地址不改变该任务，下次扫描才更新 STRM。"""
+
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "queued",
+                    "name": "排队实例",
+                    "scan_url": "https://scan-queued.example.invalid",
+                    "playback_url": "https://play-old.example.invalid",
+                    "api_token": "token-queued",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "queued")}],
+                }
+            ]
+        }
+    )
+    replacement = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "queued",
+                    "name": "排队实例",
+                    "scan_url": "https://scan-queued.example.invalid",
+                    "playback_url": "https://play-new.example.invalid",
+                    "api_token": "token-queued",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "queued")}],
+                }
+            ]
+        }
+    )
+    current = [first]
+    queue = _Queue()
+    transport = _Transport(
+        {"https://scan-queued.example.invalid": {"/library": [{"name": "Movie.mkv", "is_dir": False}]}}
+    )
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    target = tmp_path / "queued" / "Movie.strm"
+    original = target.read_text(encoding="utf-8")
+
+    assert coordinator.trigger().accepted is True
+    current[0] = replacement
+    queue.run()
+    queued_status = coordinator.status()
+    assert target.read_text(encoding="utf-8") == original
+    assert queued_status["counters"]["skipped"] == 1  # type: ignore[index]
+    assert queued_status["counters"]["updated"] == 0  # type: ignore[index]
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Movie.mkv"
+    assert coordinator.status()["counters"]["updated"] == 1  # type: ignore[index]
 
 
 def test_duplicate_trigger_skips_and_running_task_keeps_start_snapshot(tmp_path: Path) -> None:
