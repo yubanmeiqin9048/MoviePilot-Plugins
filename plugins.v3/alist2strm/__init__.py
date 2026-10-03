@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, Depends, HTTPException
 
 from app.api.dependencies.auth import get_current_active_superuser_async
@@ -108,6 +109,39 @@ class Alist2Strm(_PluginBase):
 
         return bool(getattr(self, "_configuration_valid", False) and getattr(self, "_configuration", None))
 
+    def get_service(self) -> list[dict[str, Any]]:
+        """按已保存的全局计划向宿主声明唯一 Cron 服务，不触发扫描。"""
+
+        if getattr(self, "_stopped", False):
+            return []
+        configuration = getattr(self, "_configuration", None)
+        if not getattr(self, "_configuration_valid", False) or not isinstance(configuration, PluginConfiguration):
+            return []
+        if not configuration.schedule_enabled:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(configuration.schedule_cron)
+        except TypeError, ValueError:
+            return []
+        return [
+            {
+                "id": "shared-scan",
+                "name": "Alist2Strm 共用定时扫描",
+                "trigger": trigger,
+                "func": self.scheduled_scan,
+                "kwargs": {
+                    "coalesce": True,
+                    "max_instances": 1,
+                    "misfire_grace_time": None,
+                },
+            }
+        ]
+
+    def scheduled_scan(self) -> dict[str, object]:
+        """通过现有全量扫描入口触发一次定时运行，不创建第二套扫描流程。"""
+
+        return self.trigger_scan()
+
     @staticmethod
     def get_command() -> list[dict[str, Any]]:
         """插件不提供远程命令。"""
@@ -189,11 +223,28 @@ class Alist2Strm(_PluginBase):
         self._configuration = candidate
         self._secret_tokens = new_tokens
         self._configuration_valid = True
+        self._refresh_scheduler_registration()
         return {
             "success": True,
             "message": "Alist2Strm 配置已保存；当前任务如正在运行仍使用原配置。",
             "data": self.public_configuration(),
         }
+
+    def _refresh_scheduler_registration(self) -> None:
+        """在保存发布新快照后显式请求宿主重建本插件定时服务。"""
+
+        injected = getattr(self, "_schedule_update", None)
+        if callable(injected):
+            injected(self._plugin_id())
+            return
+        from app.sdk.scheduler import update_plugin_job
+
+        try:
+            update_plugin_job(self._plugin_id())
+        except RuntimeError as error:
+            # 测试、启动早期或宿主停机时调度器可能尚未装配；配置仍已成功保存，
+            # 宿主下一次生命周期对账会按新配置注册服务。
+            logger.warning(f"Alist2Strm 定时服务刷新暂不可用：{error}")
 
     def _rollback_persistence(self, old_public: Mapping[str, object], old_tokens: Mapping[str, str]) -> None:
         """尽力恢复保存失败前的公开配置和 Token 分区，不记录敏感值。"""
