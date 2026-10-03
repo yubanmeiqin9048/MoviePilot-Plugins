@@ -58,10 +58,17 @@ def _host_scheduler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator
     """构造真实宿主一次性任务保留逻辑使用的离线调度器。"""
 
     plugin = _plugin(_payload(enabled=True, output_dir=str(tmp_path / "old")))
+
+    def get_plugin_services(*, pid: str) -> list[dict[str, Any]]:
+        """按宿主的关键字参数契约返回当前插件服务声明。"""
+
+        assert pid == plugin._plugin_id()
+        return plugin.get_service()
+
     manager = SimpleNamespace(
         running_plugins={plugin._plugin_id(): plugin},
         get_plugin_attr=lambda _pid, _attr: "Alist2Strm",
-        get_plugin_services=lambda _pid: plugin.get_service(),
+        get_plugin_services=get_plugin_services,
     )
     monkeypatch.setattr(reconcile_module, "get_plugin_manager", lambda: manager)
     monkeypatch.setattr(oncejob_module, "get_plugin_manager", lambda: manager)
@@ -266,6 +273,11 @@ def test_save_refresh_preserves_host_pending_scan_snapshot(
 
     plugin.save_configuration(_payload(enabled=True, cron="*/20 * * * *", output_dir=str(new_output)))
 
+    periodic_job_id = "Alist2Strm_shared-scan"
+    periodic_job = owner._scheduler.get_job(periodic_job_id)
+    assert periodic_job is not None
+    assert periodic_job_id in owner._jobs
+    assert str(periodic_job.trigger) == str(CronTrigger.from_crontab("*/20 * * * *"))
     assert owner._scheduler.get_job(once_job_id) is not None
     retained = owner._jobs[once_job_id]
     assert retained["_plugin_instance"] is plugin
