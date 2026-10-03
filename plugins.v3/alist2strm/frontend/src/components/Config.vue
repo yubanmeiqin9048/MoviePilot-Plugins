@@ -2,6 +2,7 @@
 import { computed, inject, onMounted, ref, watch } from 'vue'
 
 import { getErrorMessage, saveConfiguration } from '@/api'
+import { configurationEditorState } from '@/configState'
 import type { ConfigModel, DirectoryMapping, Notices, OpenListInstance, PluginApi } from '@/types'
 
 const DEFAULT_NOTICES: Notices = {
@@ -47,7 +48,12 @@ watch(() => props.initialConfig, value => {
   draft.value = next
   baseline.value = serialize(toPayload(next))
   saveError.value = ''
+  configurationEditorState.dirty = false
 }, { immediate: true, deep: true })
+
+watch(draft, () => {
+  configurationEditorState.dirty = dirty.value
+}, { deep: true })
 
 onMounted(() => emit('layout', { maxWidth: '78rem' }))
 
@@ -225,6 +231,7 @@ async function save(): Promise<void> {
     const returned = response?.data ? normalizeConfig(response.data) : draft.value
     draft.value = returned
     baseline.value = serialize(toPayload(returned))
+    configurationEditorState.dirty = false
     toast?.success(response.message || '配置已保存。')
   } catch (error) {
     // 不改动 draft/baseline；管理员可以直接修正或重试。

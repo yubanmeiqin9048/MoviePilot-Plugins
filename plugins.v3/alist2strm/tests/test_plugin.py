@@ -8,6 +8,7 @@ import pytest
 
 from app.plugins.alist2strm import Alist2Strm  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.config import build_configuration, public_configuration  # ty: ignore[unresolved-import]
+from app.plugins.alist2strm.scan import RemoteEntry  # ty: ignore[unresolved-import]
 
 
 def _payload(*, instance_id: str = "instance-1", token: str = "configured") -> dict[str, object]:
@@ -133,3 +134,61 @@ def test_reload_reads_saved_public_config_and_secret_partition_without_running_s
     assert plugin.get_state() is True
     assert plugin.public_configuration()["instances"][0]["api_token_configured"] is True
     assert plugin.scan_invocations == 0
+
+
+def test_manual_trigger_uses_saved_snapshot_and_injected_high_level_io(tmp_path) -> None:
+    """插件级手动入口捕获配置快照，后台替身执行时不读取后续保存。"""
+
+    plugin = _plugin()
+    old_output = tmp_path / "old"
+    new_output = tmp_path / "new"
+    plugin._configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "instance-1",
+                    "name": "实例",
+                    "scan_url": "https://openlist.example.invalid",
+                    "api_token": "configured",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(old_output)}],
+                }
+            ]
+        }
+    )
+    jobs: list[Any] = []
+    plugin._scan_dispatch = lambda task: jobs.append(task) or True
+    plugin._scan_client_factory = lambda _url, _token: _Reader()
+    plugin._scan_media_suffix_provider = lambda: (".mkv",)
+
+    assert plugin.trigger_scan() == {"accepted": True, "message": "扫描已在后台启动"}
+    assert plugin.get_scan_status()["running"] is True
+    plugin._configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "instance-1",
+                    "name": "实例替换",
+                    "scan_url": "https://openlist.example.invalid",
+                    "api_token": "replacement",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(new_output)}],
+                }
+            ]
+        }
+    )
+    assert len(jobs) == 1
+    jobs.pop()()
+
+    assert (old_output / "Movie.strm").is_file()
+    assert not new_output.exists()
+    assert plugin.get_scan_status()["state"] == "success"
+
+
+class _Reader:
+    """插件扫描 seam 使用的 OpenList 目录替身。"""
+
+    def list_dir(self, path: str) -> list[RemoteEntry]:
+        """返回一个视频或空目录。"""
+
+        if path == "/library":
+            return [RemoteEntry("Movie.mkv", False)]
+        return []

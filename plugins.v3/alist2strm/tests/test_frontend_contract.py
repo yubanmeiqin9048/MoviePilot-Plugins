@@ -29,6 +29,22 @@ def test_config_uses_injected_api_and_keeps_failed_draft_without_host_save_event
     assert "完整扫描成功后，会清理该目录中不再需要的受管文件，包括手工放入的文件；请使用专用输出目录。" in source
 
 
+def test_page_runs_saved_all_or_one_mapping_and_stops_status_polling_on_close() -> None:
+    """详情页只通过注入 API 运行已保存配置，并在卸载时停止轮询。"""
+
+    source = (PLUGIN_ROOT / "frontend" / "src" / "components" / "Page.vue").read_text(encoding="utf-8")
+    assert "startScan(props.api" in source
+    assert "startMappingScan(props.api" in source
+    assert "configurationEditorState.dirty" in source
+    assert "setInterval" in source and "}, 2000)" in source
+    assert "onUnmounted(()" in source
+    assert "stopPolling()" in source
+    assert "clearInterval" in source
+    for counter in ("generated", "downloaded", "updated", "skipped", "deleted", "failed"):
+        assert counter in source
+    assert "emit('save')" not in source
+
+
 def test_built_federation_assets_are_delivered_and_reference_both_exposes() -> None:
     """构建后的 remoteEntry 与 Config/Page 产物必须同时存在。"""
 

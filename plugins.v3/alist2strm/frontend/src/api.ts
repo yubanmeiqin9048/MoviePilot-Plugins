@@ -1,4 +1,11 @@
-import type { ConfigModel, ConfigResponse, PluginApi } from '@/types'
+import type {
+  ConfigModel,
+  ConfigResponse,
+  PluginApi,
+  ScanStatus,
+  ScanTarget,
+  ScanTriggerResponse,
+} from '@/types'
 
 function pluginPath(pluginId: string, path: string): string {
   return `plugin/${encodeURIComponent(pluginId)}/${path.replace(/^\//, '')}`
@@ -39,4 +46,23 @@ export async function saveConfiguration(
 /** 读取实例级安全配置；响应不包含管理员 Token。 */
 export function readConfiguration(api: PluginApi, pluginId: string): Promise<ConfigResponse> {
   return api.get<ConfigResponse>(pluginPath(pluginId, 'config'))
+}
+
+/** 启动全部映射的手动扫描，服务端只读取已保存配置。 */
+export function startScan(api: PluginApi, pluginId: string): Promise<ScanTriggerResponse> {
+  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan'), {})
+}
+
+/** 启动一个已保存映射的手动扫描。 */
+export function startMappingScan(
+  api: PluginApi,
+  pluginId: string,
+  target: ScanTarget,
+): Promise<ScanTriggerResponse> {
+  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan/mapping'), target)
+}
+
+/** 读取可轮询的扫描状态与六类计数。 */
+export function readScanStatus(api: PluginApi, pluginId: string): Promise<ScanStatus> {
+  return api.get<ScanStatus>(pluginPath(pluginId, 'scan/status'))
 }

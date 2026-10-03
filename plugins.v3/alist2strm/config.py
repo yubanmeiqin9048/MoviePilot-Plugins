@@ -69,6 +69,8 @@ def _normalise_url(value: str, *, field_name: str) -> str:
         raise ValueError(f"{field_name}必须是完整的 HTTP(S) 地址")
     if any(character.isspace() for character in url):
         raise ValueError(f"{field_name}不能包含空白字符")
+    if parsed.username or parsed.password:
+        raise ValueError(f"{field_name}不能包含凭据")
     return url.rstrip("/") or url
 
 

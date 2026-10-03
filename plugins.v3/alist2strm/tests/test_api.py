@@ -30,7 +30,7 @@ def _configuration() -> object:
     )
 
 
-def _dependency(endpoint: Any) -> object:
+def _dependency(endpoint: Any) -> Any:
     """读取端点下划线参数的 FastAPI 依赖。"""
 
     parameter = inspect.signature(endpoint).parameters["_"]
@@ -48,6 +48,9 @@ def test_all_management_routes_use_bearer_and_explicit_superuser_dependency() ->
     assert {(item["path"], tuple(item["methods"])) for item in routes} == {
         ("/config", ("GET",)),
         ("/config", ("PUT",)),
+        ("/scan", ("POST",)),
+        ("/scan/mapping", ("POST",)),
+        ("/scan/status", ("GET",)),
     }
     assert all(item["auth"] == "bear" for item in routes)
     assert all(_dependency(item["endpoint"]) is get_current_active_superuser_async for item in routes)
@@ -92,6 +95,31 @@ def test_invalid_save_returns_validation_error_without_calling_persistence() -> 
         )
 
     assert getattr(error.value, "status_code", None) == 422
+
+
+def test_empty_run_scan_body_selects_all_saved_mappings() -> None:
+    """联邦页面发送空对象时仍应进入全量扫描入口。"""
+
+    plugin = object.__new__(Alist2Strm)
+    plugin.trigger_scan = lambda target=None: {"target": target}
+
+    assert plugin.start_scan({}, _=object()) == {"target": None}
+
+
+@pytest.mark.anyio
+async def test_scan_routes_reject_non_superuser_before_work() -> None:
+    """运行全部、单组和状态端点都在业务前拒绝普通用户。"""
+
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    plugin = object.__new__(Alist2Strm)
+    scan_routes = [item for item in plugin.get_api() if item["path"].startswith("/scan")]
+    for route in scan_routes:
+        with pytest.raises(HTTPException) as error:
+            await _dependency(route["endpoint"])(current_user=SimpleNamespace(is_superuser=False))
+        assert error.value.status_code == 403
 
 
 @pytest.mark.anyio

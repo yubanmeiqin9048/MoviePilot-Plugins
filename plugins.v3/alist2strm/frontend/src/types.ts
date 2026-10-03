@@ -18,7 +18,7 @@ export interface OpenListInstance {
   id: string
   name: string
   scan_url: string
-  api_token: string
+  api_token?: string
   api_token_configured?: boolean
   playback_url: string
   mappings: DirectoryMapping[]
@@ -44,4 +44,48 @@ export interface ConfigResponse {
   success: boolean
   message?: string
   data: ConfigModel
+}
+
+export interface ScanCounters {
+  generated: number
+  downloaded: number
+  updated: number
+  skipped: number
+  deleted: number
+  failed: number
+}
+
+export interface ScanMappingStatus {
+  instance_id: string
+  instance_name: string
+  mapping_index: number
+  source_dir: string
+  output_dir: string
+  state: string
+  status: string
+  counters: ScanCounters
+  error?: string | null
+}
+
+export interface ScanStatus {
+  state: string
+  status: string
+  running: boolean
+  current_mapping?: string | null
+  total_mappings: number
+  counters: ScanCounters
+  mappings: ScanMappingStatus[]
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface ScanTriggerResponse {
+  accepted: boolean
+  message: string
+}
+
+export interface ScanTarget {
+  instance_id: string
+  mapping_index: number
+  source_dir?: string
 }

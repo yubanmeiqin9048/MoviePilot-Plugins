@@ -18,6 +18,7 @@ from .config import (
     public_configuration,
     secret_tokens,
 )
+from .scan import ScanCoordinator, ScanTarget
 
 
 class ConfigurationPersistenceError(RuntimeError):
@@ -49,7 +50,8 @@ class Alist2Strm(_PluginBase):
         self._secret_tokens: dict[str, str] = {}
         self._configuration_valid = True
         self._stopped = False
-        # 当前票据不创建扫描器；计数仅用于确保保存和启动没有隐式扫描。
+        # 当前票据仅通过宿主一次性任务执行手动扫描；保存和启动不会调用它。
+        self._scan_coordinator: ScanCoordinator | None = None
         self.scan_invocations = 0
 
     def _plugin_id(self) -> str:
@@ -204,6 +206,110 @@ class Alist2Strm(_PluginBase):
         except Exception:  # noqa: BLE001 - 原始失败优先返回，回滚异常不覆盖它
             logger.error("Alist2Strm 配置保存失败后的凭据分区回滚失败")
 
+    def _configuration_for_scan(self) -> PluginConfiguration | None:
+        """返回当前已保存且有效的配置，供扫描入口在启动时复制。"""
+
+        configuration = getattr(self, "_configuration", None)
+        if not getattr(self, "_configuration_valid", False) or not isinstance(configuration, PluginConfiguration):
+            return None
+        return configuration
+
+    def _dispatch_scan(self, task: Any) -> bool:
+        """把扫描提交给注入的测试调度器或宿主一次性任务 SDK。"""
+
+        injected = getattr(self, "_scan_dispatch", None)
+        if callable(injected):
+            return bool(injected(task))
+        from app.sdk.scheduler import add_plugin_once_job
+
+        return bool(add_plugin_once_job(self._plugin_id(), "manual-scan", task, "Alist2Strm 手动扫描"))
+
+    def _get_scan_coordinator(self) -> ScanCoordinator:
+        """惰性取得全插件唯一扫描协调器，兼容无构造函数的 seam 测试对象。"""
+
+        coordinator = getattr(self, "_scan_coordinator", None)
+        if not isinstance(coordinator, ScanCoordinator):
+            coordinator = ScanCoordinator(
+                self._configuration_for_scan,
+                plugin_id=self._plugin_id(),
+                dispatch=self._dispatch_scan,
+                client_factory=getattr(self, "_scan_client_factory", None),
+                media_suffix_provider=getattr(self, "_scan_media_suffix_provider", None),
+            )
+            self._scan_coordinator = coordinator
+        return coordinator
+
+    def trigger_scan(self, target: ScanTarget | None = None) -> dict[str, object]:
+        """捕获已保存配置并提交全部或单组手动扫描任务。"""
+
+        result = self._get_scan_coordinator().trigger(target)
+        if result.accepted:
+            self.scan_invocations = int(getattr(self, "scan_invocations", 0)) + 1
+        return result.as_dict()
+
+    def get_scan_status(self) -> dict[str, object]:
+        """返回当前或最近一次扫描的生命周期、映射和六类计数。"""
+
+        return self._get_scan_coordinator().status().as_dict()
+
+    @staticmethod
+    def _scan_target(payload: object, *, required: bool = False) -> ScanTarget | None:
+        """解析运行接口目标，不接收或保存浏览器配置草稿。"""
+
+        value: object = payload
+        if isinstance(value, Mapping) and "target" in value:
+            value = value.get("target")
+        if value is None or (isinstance(value, Mapping) and not value and not required):
+            if required:
+                raise HTTPException(status_code=422, detail="必须指定目录映射")
+            return None
+        if not isinstance(value, Mapping):
+            raise HTTPException(status_code=422, detail="目录映射参数无效")
+        instance_id = value.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            raise HTTPException(status_code=422, detail="实例 ID 无效")
+        mapping_index = value.get("mapping_index")
+        if mapping_index is not None and (
+            isinstance(mapping_index, bool) or not isinstance(mapping_index, int) or mapping_index < 1
+        ):
+            raise HTTPException(status_code=422, detail="映射序号无效")
+        source_dir = value.get("source_dir")
+        if source_dir is not None and not isinstance(source_dir, str):
+            raise HTTPException(status_code=422, detail="源目录无效")
+        if mapping_index is None and not isinstance(source_dir, str):
+            raise HTTPException(status_code=422, detail="必须指定映射序号或源目录")
+        return ScanTarget(
+            instance_id=instance_id.strip(),
+            mapping_index=mapping_index,
+            source_dir=source_dir,
+        )
+
+    def start_scan(
+        self,
+        payload: dict[str, Any] | None = Body(None),  # noqa: B008 - FastAPI 请求体注入
+        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
+    ) -> dict[str, object]:
+        """运行全部映射，兼容带 target 的单组请求并使用启动快照。"""
+
+        return self.trigger_scan(self._scan_target(payload))
+
+    def run_mapping_scan(
+        self,
+        payload: dict[str, Any] | None = Body(None),  # noqa: B008 - FastAPI 请求体注入
+        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
+    ) -> dict[str, object]:
+        """运行一个已保存目录映射，不把配置草稿传入扫描任务。"""
+
+        return self.trigger_scan(self._scan_target(payload, required=True))
+
+    def scan_status(
+        self,
+        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
+    ) -> dict[str, object]:
+        """读取当前扫描状态，供详情弹窗轮询。"""
+
+        return self.get_scan_status()
+
     def read_config(self, _: Any = Depends(get_current_active_superuser_async)) -> dict[str, object]:  # noqa: B008 - FastAPI 权限注入
         """返回已保存的安全配置投影。"""
 
@@ -227,7 +333,7 @@ class Alist2Strm(_PluginBase):
             ) from error
 
     def get_api(self) -> list[dict[str, Any]]:
-        """返回配置读写 Bearer API，并在端点上显式要求超级管理员。"""
+        """返回配置与扫描 Bearer API，并在端点上显式要求超级管理员。"""
 
         return [
             {
@@ -243,6 +349,27 @@ class Alist2Strm(_PluginBase):
                 "methods": ["PUT"],
                 "auth": "bear",
                 "summary": "保存 Alist2Strm 配置",
+            },
+            {
+                "path": "/scan",
+                "endpoint": self.start_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "运行全部或指定映射",
+            },
+            {
+                "path": "/scan/mapping",
+                "endpoint": self.run_mapping_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "运行单组映射",
+            },
+            {
+                "path": "/scan/status",
+                "endpoint": self.scan_status,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "读取扫描状态",
             },
         ]
 
