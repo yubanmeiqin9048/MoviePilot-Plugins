@@ -248,3 +248,26 @@ class _Reader:
         if path == "/library":
             return [RemoteEntry("Movie.mkv", False)]
         return []
+
+
+def test_stop_service_cancels_pending_job_and_stops_coordinator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """卸载时移除宿主一次性任务并使排队扫描不可执行。"""
+
+    plugin = _plugin()
+    jobs: list[Any] = []
+    removed: list[tuple[str, str]] = []
+    plugin._scan_dispatch = lambda task: jobs.append(task) or True
+    plugin._scan_client_factory = lambda _url, _token: _Reader()
+    plugin._scan_media_suffix_provider = lambda: (".mkv",)
+    monkeypatch.setattr(
+        "app.sdk.scheduler.remove_plugin_once_job",
+        lambda plugin_id, job_id: removed.append((plugin_id, job_id)),
+    )
+
+    assert plugin.trigger_scan() == {"accepted": True, "message": "扫描已在后台启动"}
+    plugin.stop_service()
+
+    assert removed == [("Alist2Strm", "manual-scan")]
+    assert plugin.get_scan_status()["state"] == "stopped"
+    jobs.pop()()
+    assert plugin.get_scan_status()["state"] == "stopped"

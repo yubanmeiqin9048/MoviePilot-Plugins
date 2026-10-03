@@ -40,6 +40,10 @@ def test_page_runs_saved_all_or_one_mapping_and_stops_status_polling_on_close() 
     assert "onUnmounted(()" in source
     assert "stopPolling()" in source
     assert "clearInterval" in source
+    assert "stopScan(props.api" in source
+    assert "停止扫描" in source
+    assert "正在停止" in source
+    assert "按运行时间、实例和映射查阅宿主日志" in source
     for counter in ("generated", "downloaded", "updated", "skipped", "deleted", "failed"):
         assert counter in source
     assert "emit('save')" not in source

@@ -24,6 +24,12 @@ LIST_PER_PAGE = 100
 DOWNLOAD_PREFIX = "/d"
 STRM_SUFFIX = ".strm"
 MAX_DOWNLOAD_REDIRECTS = 10
+MAX_RETRIES = 2
+DEFAULT_RETRY_DELAY = 0.1
+
+
+class ScanStopped(RuntimeError):
+    """扫描在当前原子 I/O 操作结束后收到停止请求。"""
 
 
 @dataclass(frozen=True)
@@ -224,13 +230,34 @@ def default_transport() -> HttpTransport:
 class OpenListError(RuntimeError):
     """OpenList 读取失败，错误信息不包含管理员 Token。"""
 
-    def __init__(self, message: str, *, retryable: bool = True, status_code: int | None = None) -> None:
-        """记录脱敏错误及可重试标记。"""
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        status_code: int | None = None,
+        attempts_exhausted: bool = False,
+        auth_failure: bool = False,
+    ) -> None:
+        """记录脱敏错误、重试分类和认证失败标记。"""
 
         super().__init__(message)
         self.message = message
         self.retryable = retryable
         self.status_code = status_code
+        self.attempts_exhausted = attempts_exhausted
+        self.auth_failure = auth_failure or status_code in {401, 403}
+
+    def exhausted(self) -> OpenListError:
+        """返回标记为已耗尽重试次数的同类错误。"""
+
+        return OpenListError(
+            self.message,
+            retryable=self.retryable,
+            status_code=self.status_code,
+            attempts_exhausted=True,
+            auth_failure=self.auth_failure,
+        )
 
 
 @dataclass(frozen=True)
@@ -251,18 +278,34 @@ class OpenListClient:
         *,
         transport: HttpTransport | None = None,
         per_page: int = LIST_PER_PAGE,
+        sleep: Callable[[float], None] | None = None,
+        retry_backoff: Callable[[int], float] | None = None,
+        max_retries: int = MAX_RETRIES,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
-        """绑定扫描地址、Token 和可替换的 HTTP 传输边界。"""
+        """绑定扫描地址、Token 和可替换的 HTTP、重试与停止边界。"""
 
         self._scan_url = scan_url.rstrip("/")
         self._token = token
         self._transport = transport if transport is not None else default_transport()
         self._per_page = max(int(per_page), 1)
+        self._sleep = sleep if sleep is not None else time.sleep
+        self._retry_backoff = retry_backoff if retry_backoff is not None else _retry_delay
+        self._max_retries = max(int(max_retries), 0)
+        self._should_stop = should_stop
 
     def _headers(self) -> dict[str, str]:
         """返回 OpenList 要求的原始 Token 头，不添加 Bearer。"""
 
         return {"Authorization": self._token}
+
+    def close(self) -> None:
+        """释放传输替身或客户端资源，并丢弃内存中的 Token。"""
+
+        close = getattr(self._transport, "close", None)
+        if callable(close):
+            close()
+        self._token = ""
 
     def _post_list(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         """请求一页目录并检查 HTTP 与 OpenList 业务响应。"""
@@ -282,17 +325,43 @@ class OpenListClient:
         if response.status_code >= 500:
             raise OpenListError(f"OpenList 服务端错误（HTTP {response.status_code}）", retryable=True)
         if response.status_code >= 400:
-            raise OpenListError(f"OpenList 请求被拒绝（HTTP {response.status_code}）", retryable=False)
+            raise OpenListError(
+                f"OpenList 请求被拒绝（HTTP {response.status_code}）",
+                retryable=False,
+                status_code=response.status_code,
+            )
         body = response.payload
         if not isinstance(body, Mapping):
-            raise OpenListError("OpenList 响应格式无效", retryable=True)
+            raise OpenListError("OpenList 响应格式无效", retryable=False)
         code = body.get("code")
-        if isinstance(code, bool) or str(code) != "200":
-            raise OpenListError("OpenList 业务请求失败", retryable=True)
+        if isinstance(code, bool) or not isinstance(code, int):
+            raise OpenListError("OpenList 响应状态无效", retryable=False)
+        if code != 200:
+            raise OpenListError(
+                "OpenList 业务请求失败",
+                retryable=code >= 500,
+                status_code=code,
+            )
         data = body.get("data")
         if not isinstance(data, Mapping):
-            raise OpenListError("OpenList 目录响应格式无效", retryable=True)
+            raise OpenListError("OpenList 目录响应格式无效", retryable=False)
         return data
+
+    def _post_list_with_retry(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """按页重试临时 OpenList 错误，最多增加两次请求。"""
+
+        for retry_index in range(self._max_retries + 1):
+            if self._should_stop is not None and self._should_stop():
+                raise ScanStopped()
+            try:
+                return self._post_list(payload)
+            except OpenListError as error:
+                if not error.retryable or error.attempts_exhausted or retry_index >= self._max_retries:
+                    if error.retryable and retry_index >= self._max_retries:
+                        raise error.exhausted() from error
+                    raise
+                self._sleep(max(float(self._retry_backoff(retry_index + 1)), 0.0))
+        raise AssertionError("OpenList 重试循环未返回")
 
     def list_dir(self, remote_path: str) -> list[RemoteEntry]:
         """完整读取一个全站绝对目录，不限制页数并支持空目录。"""
@@ -303,7 +372,7 @@ class OpenListClient:
         page = 1
         collected = 0
         while True:
-            data = self._post_list(
+            data = self._post_list_with_retry(
                 {
                     "path": remote_path,
                     "password": "",
@@ -313,21 +382,21 @@ class OpenListClient:
                 }
             )
             content = data.get("content")
-            if not isinstance(content, list):
-                raise OpenListError("OpenList 目录响应缺少 content", retryable=True)
+            total = data.get("total")
+            if not isinstance(content, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
+                raise OpenListError("OpenList 目录响应格式无效", retryable=False)
             for item in content:
                 if not isinstance(item, Mapping):
-                    continue
+                    raise OpenListError("OpenList 目录项格式无效", retryable=False)
                 name = item.get("name")
                 if not isinstance(name, str) or not name:
-                    continue
+                    raise OpenListError("OpenList 目录项名称无效", retryable=False)
                 entries.append(RemoteEntry(name=name, is_dir=bool(item.get("is_dir"))))
             collected += len(content)
-            total = data.get("total")
+            if collected >= total:
+                break
             if not content:
-                break
-            if isinstance(total, int) and not isinstance(total, bool) and collected >= total:
-                break
+                raise OpenListError("OpenList 分页响应不完整", retryable=False)
             page += 1
         return entries
 
@@ -341,6 +410,8 @@ class OpenListClient:
         headers: Mapping[str, str] = self._headers()
         response: DownloadResponse | None = None
         for _ in range(MAX_DOWNLOAD_REDIRECTS + 1):
+            if self._should_stop is not None and self._should_stop():
+                raise ScanStopped()
             try:
                 response = self._transport.get_stream(url, headers)
             except OpenListError:
@@ -358,8 +429,20 @@ class OpenListClient:
                 url = next_url
                 continue
             if 200 <= response.status_code < 300:
+                response_for_body = response
+
+                def iter_response(response: DownloadResponse = response_for_body) -> Iterator[bytes]:
+                    """读取响应正文并将远端流中断归类为可重试错误。"""
+
+                    try:
+                        yield from response.iter_bytes()
+                    except OpenListError:
+                        raise
+                    except Exception as error:
+                        raise OpenListError("OpenList 下载流读取失败", retryable=True) from error
+
                 try:
-                    yield response.iter_bytes()
+                    yield iter_response()
                 finally:
                     response.close()
                 return
@@ -375,6 +458,12 @@ class OpenListClient:
         if response is not None:
             response.close()
         raise OpenListError("OpenList 下载重定向过多", retryable=False)
+
+
+def _retry_delay(retry_number: int) -> float:
+    """返回短暂且可预测的默认退避时长。"""
+
+    return DEFAULT_RETRY_DELAY * (2 ** max(retry_number - 1, 0))
 
 
 def encode_remote_path(remote_path: str) -> str:
@@ -554,6 +643,7 @@ class MappingScanStatus:
     state: str = "pending"
     counters: ScanCounters = field(default_factory=ScanCounters)
     error: str | None = None
+    cleanup_eligible: bool = False
 
     def as_dict(self) -> dict[str, object]:
         """返回稳定的映射状态对象。"""
@@ -568,6 +658,7 @@ class MappingScanStatus:
             "status": self.state,
             "counters": self.counters.as_dict(),
             "error": self.error,
+            "cleanup_eligible": self.cleanup_eligible,
         }
 
 
@@ -650,6 +741,8 @@ class _ScanRun:
     state: str = "running"
     current_mapping: str | None = None
     finished_at: float | None = None
+    stop_requested: bool = False
+    started: bool = False
 
 
 class ScanCoordinator:
@@ -666,8 +759,11 @@ class ScanCoordinator:
         whitelist_suffix_provider: Callable[[], Sequence[str]] | None = None,
         filesystem: OutputFileSystem | None = None,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] | None = None,
+        retry_backoff: Callable[[int], float] | None = None,
+        max_retries: int = MAX_RETRIES,
     ) -> None:
-        """绑定已保存配置、后台提交器和可替换 OpenList I/O。"""
+        """绑定已保存配置、后台提交器和可替换 OpenList、退避与资源边界。"""
 
         self._configuration_provider = configuration_provider
         self._plugin_id = plugin_id
@@ -681,8 +777,12 @@ class ScanCoordinator:
         )
         self._filesystem = filesystem if filesystem is not None else LocalFileSystem()
         self._clock = clock
+        self._sleep = sleep if sleep is not None else time.sleep
+        self._retry_backoff = retry_backoff if retry_backoff is not None else _retry_delay
+        self._max_retries = max(int(max_retries), 0)
         self._lock = threading.Lock()
         self._run: _ScanRun | None = None
+        self._active_readers: list[Any] = []
         self._last_playback_urls: dict[tuple[str, str, str], str] = {}
 
     def _dispatch_with_host_scheduler(self, task: Callable[[], None]) -> bool:
@@ -692,11 +792,19 @@ class ScanCoordinator:
 
         return bool(add_plugin_once_job(self._plugin_id, "manual-scan", task, "Alist2Strm 手动扫描"))
 
-    @staticmethod
-    def _default_client_factory(scan_url: str, token: str) -> OpenListClient:
-        """构造默认 OpenList 只读客户端。"""
+    def _default_client_factory(self, scan_url: str, token: str) -> OpenListClient:
+        """构造带当前任务重试和停止边界的默认 OpenList 客户端。"""
 
-        return OpenListClient(scan_url, token)
+        with self._lock:
+            run = self._run
+        return OpenListClient(
+            scan_url,
+            token,
+            sleep=self._sleep,
+            retry_backoff=self._retry_backoff,
+            max_retries=self._max_retries,
+            should_stop=(lambda: self._is_stop_requested(run)) if run is not None else None,
+        )
 
     @staticmethod
     def _host_suffixes() -> Sequence[str]:
@@ -714,8 +822,11 @@ class ScanCoordinator:
         """捕获已保存配置并提交一次后台扫描；运行中触发不排队。"""
 
         with self._lock:
-            if self._run is not None and self._run.state == "running":
-                return ScanTriggerResult(False, "扫描正在运行，已跳过本次触发")
+            if self._run is not None and self._run.state in {"running", "stopping"}:
+                message = (
+                    "扫描正在停止，已跳过本次触发" if self._run.state == "stopping" else "扫描正在运行，已跳过本次触发"
+                )
+                return ScanTriggerResult(False, message)
             run_or_error = self._build_run(target)
             if isinstance(run_or_error, ScanTriggerResult):
                 return run_or_error
@@ -743,7 +854,7 @@ class ScanCoordinator:
             state = run.state
             return ScanStatus(
                 state=state,
-                running=state == "running",
+                running=state in {"running", "stopping"},
                 current_mapping=run.current_mapping,
                 counters=counters,
                 mappings=[
@@ -756,6 +867,7 @@ class ScanCoordinator:
                         state=item.status.state,
                         counters=item.status.counters.copy(),
                         error=item.status.error,
+                        cleanup_eligible=item.status.cleanup_eligible,
                     )
                     for item in run.mappings
                 ],
@@ -763,31 +875,117 @@ class ScanCoordinator:
                 finished_at=_timestamp(run.finished_at),
             )
 
+    def stop(self) -> ScanTriggerResult:
+        """请求停止当前任务；当前原子 I/O 结束后不再开始下一项。"""
+
+        with self._lock:
+            run = self._run
+            if run is None or run.state not in {"running", "stopping"}:
+                return ScanTriggerResult(False, "当前没有正在运行的扫描")
+            run.stop_requested = True
+            if run.state == "running":
+                run.state = "stopping"
+            if not run.started:
+                self._mark_pending_stopped_locked(run)
+                run.state = "stopped"
+                run.current_mapping = None
+                run.finished_at = self._clock()
+            return ScanTriggerResult(True, "扫描正在停止")
+
+    def shutdown(self) -> None:
+        """请求停止并在没有活动任务时释放已注入的客户端资源。"""
+
+        self.stop()
+        with self._lock:
+            run = self._run
+            readers = list(self._active_readers) if run is None or not run.started else []
+            if readers:
+                self._active_readers = []
+        self._close_resources(readers)
+
+    close = shutdown
+
     def execute(self) -> None:
         """执行已捕获的配置快照，并保证任务最终进入稳定状态。"""
 
         with self._lock:
             run = self._run
+            if run is not None and run.state == "stopped":
+                return
+            if run is not None:
+                run.started = True
         if run is None:
             return
         try:
             self._execute_mappings(run)
+        except ScanStopped:
+            pass
         except Exception:  # noqa: BLE001 - 后台任务不得把异常传播回调度器
             logger.error("Alist2Strm 扫描任务异常终止")
             with self._lock:
-                for mapping in run.mappings:
-                    if mapping.status.state in {"pending", "running"}:
-                        mapping.status.state = "failed"
-                        mapping.status.error = "扫描任务异常终止"
-                        mapping.status.counters.failed += 1
+                if run.stop_requested:
+                    self._mark_pending_stopped_locked(run)
+                else:
+                    for mapping in run.mappings:
+                        if mapping.status.state in {"pending", "running"}:
+                            mapping.status.state = "failed"
+                            mapping.status.error = "扫描任务异常终止"
+                            mapping.status.cleanup_eligible = False
+                            mapping.status.counters.failed += 1
         finally:
             with self._lock:
-                if any(item.status.state == "failed" for item in run.mappings):
-                    run.state = "failed"
+                if run.stop_requested:
+                    self._mark_pending_stopped_locked(run)
+                    run.state = "stopped"
+                elif any(item.status.state == "failed" for item in run.mappings):
+                    completed = any(
+                        item.status.state == "success"
+                        or any(
+                            getattr(item.status.counters, name) > 0
+                            for name in ("generated", "downloaded", "updated", "skipped", "deleted")
+                        )
+                        for item in run.mappings
+                    )
+                    run.state = "partial_failure" if completed else "failed"
                 else:
                     run.state = "success"
                 run.current_mapping = None
                 run.finished_at = self._clock()
+
+    def _is_stop_requested(self, run: _ScanRun | None) -> bool:
+        """读取任务停止标志，供客户端和扫描循环共享。"""
+
+        with self._lock:
+            return run is None or run.stop_requested
+
+    @staticmethod
+    def _mark_pending_stopped_locked(run: _ScanRun) -> None:
+        """在锁内将尚未开始的映射标为停止，不增加失败数量。"""
+
+        for mapping in run.mappings:
+            if mapping.status.state in {"pending", "running"}:
+                mapping.status.state = "stopped"
+                mapping.status.cleanup_eligible = False
+                if not mapping.status.error:
+                    mapping.status.error = "扫描已停止"
+
+    @staticmethod
+    def _close_resources(resources: Sequence[Any]) -> None:
+        """尽力关闭注入客户端，不把释放异常传播回后台任务。"""
+
+        seen: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            for method_name in ("close", "release", "shutdown"):
+                method = getattr(resource, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:  # noqa: BLE001 - 资源释放不得掩盖扫描结果
+                        logger.warning("Alist2Strm 扫描资源释放失败")
+                    break
 
     def _build_run(self, target: ScanTarget | None) -> _ScanRun | ScanTriggerResult:
         """从当前已保存配置构造深拷贝快照，不读取浏览器草稿。"""
@@ -879,36 +1077,92 @@ class ScanCoordinator:
         """逐映射执行并隔离实例、目录和本地写入失败。"""
 
         readers: dict[str, Any] = {}
-        for mapping in run.mappings:
-            with self._lock:
-                mapping.status.state = "running"
-                run.current_mapping = mapping.label
-            try:
-                reader = readers.get(mapping.instance_id)
-                if reader is None:
-                    if not mapping.token:
-                        raise OpenListError("实例未配置管理员 API Token", retryable=False)
-                    reader = self._client_factory(mapping.scan_url, mapping.token)
-                    readers[mapping.instance_id] = reader
-                self._scan_mapping(reader, mapping, run.video_suffixes)
-                if mapping.status.counters.failed:
-                    mapping.status.state = "failed"
-                    mapping.status.error = "映射内存在失败操作"
-                else:
-                    self._remember_playback_identity(mapping)
-                    mapping.status.state = "success"
-            except OpenListError as error:
-                self._mark_mapping_failed(mapping, error.message)
-                logger.warning(f"Alist2Strm 映射扫描失败：{mapping.instance_name} / {mapping.source_dir}")
-            except (OSError, ValueError) as error:
-                self._mark_mapping_failed(mapping, str(error))
-                logger.warning(f"Alist2Strm 映射产物处理失败：{mapping.instance_name} / {mapping.source_dir}")
-            except Exception:  # noqa: BLE001 - 单组不可用不得阻断独立映射
-                self._mark_mapping_failed(mapping, "映射扫描失败")
-                logger.warning(f"Alist2Strm 映射扫描失败：{mapping.instance_name} / {mapping.source_dir}")
-            finally:
+        failed_instances: set[str] = set()
+        try:
+            for mapping in run.mappings:
+                if self._is_stop_requested(run):
+                    raise ScanStopped()
                 with self._lock:
-                    run.current_mapping = None
+                    mapping.status.state = "running"
+                    run.current_mapping = mapping.label
+                try:
+                    if mapping.instance_id in failed_instances:
+                        self._mark_mapping_failed(mapping, "实例认证或权限失败，已跳过该实例剩余映射")
+                        continue
+                    reader = readers.get(mapping.instance_id)
+                    if reader is None:
+                        if not mapping.token:
+                            raise OpenListError(
+                                "实例未配置管理员 API Token",
+                                retryable=False,
+                                auth_failure=True,
+                            )
+                        reader = self._client_factory(mapping.scan_url, mapping.token)
+                        readers[mapping.instance_id] = reader
+                        with self._lock:
+                            self._active_readers = list(readers.values())
+                    self._scan_mapping(reader, mapping, run.video_suffixes)
+                    self._observe_stop(run)
+                    if mapping.status.counters.failed:
+                        mapping.status.state = "failed"
+                        mapping.status.cleanup_eligible = False
+                        if not mapping.status.error:
+                            mapping.status.error = "映射内存在失败操作"
+                    else:
+                        self._remember_playback_identity(mapping)
+                        mapping.status.state = "success"
+                        mapping.status.cleanup_eligible = True
+                except ScanStopped:
+                    self._mark_mapping_stopped(mapping)
+                    raise
+                except OpenListError as error:
+                    self._mark_mapping_failed(mapping, error.message)
+                    if self._is_auth_failure(error):
+                        failed_instances.add(mapping.instance_id)
+                    self._log_mapping_failure(mapping)
+                except (OSError, ValueError) as error:
+                    self._mark_mapping_failed(mapping, str(error))
+                    self._log_mapping_failure(mapping)
+                except Exception:  # noqa: BLE001 - 单组不可用不得阻断独立映射
+                    self._mark_mapping_failed(mapping, "映射扫描失败")
+                    self._log_mapping_failure(mapping)
+                finally:
+                    with self._lock:
+                        run.current_mapping = None
+        finally:
+            with self._lock:
+                self._active_readers = []
+            self._close_resources(list(readers.values()))
+
+    def _retry_operation(self, operation: Callable[[], Any], run: _ScanRun) -> Any:
+        """在 I/O 边界有限重试已分类的临时 OpenList 错误。"""
+
+        for retry_index in range(self._max_retries + 1):
+            self._observe_stop(run)
+            try:
+                return operation()
+            except ScanStopped:
+                raise
+            except OpenListError as error:
+                if not error.retryable or error.attempts_exhausted or retry_index >= self._max_retries:
+                    if error.retryable and retry_index >= self._max_retries:
+                        raise error.exhausted() from error
+                    raise
+                self._sleep(max(float(self._retry_backoff(retry_index + 1)), 0.0))
+        raise AssertionError("扫描重试循环未返回")
+
+    def _observe_stop(self, run: _ScanRun) -> None:
+        """在下一项 I/O 前观察停止请求。"""
+
+        if self._is_stop_requested(run):
+            raise ScanStopped()
+
+    def _list_directory(self, reader: Any, remote_path: str, run: _ScanRun) -> list[RemoteEntry]:
+        """读取一个目录；失败分类由客户端或注入边界提供。"""
+
+        result = self._retry_operation(lambda: reader.list_dir(remote_path), run)
+        self._observe_stop(run)
+        return result
 
     def _remember_playback_identity(self, mapping: _MappingRun) -> None:
         """仅在映射无失败时记录本轮已应用的有效播放地址。"""
@@ -917,63 +1171,171 @@ class ScanCoordinator:
             self._last_playback_urls[mapping.identity] = mapping.playback_url
 
     @staticmethod
-    def _mark_mapping_failed(mapping: _MappingRun, error: str) -> None:
-        """设置脱敏映射失败结果并保留已完成计数。"""
+    def _safe_error(mapping: _MappingRun, error: str) -> str:
+        """移除映射 Token，保留可定位的错误上下文。"""
 
         safe_error = error or "映射扫描失败"
+        return safe_error.replace(mapping.token, "<redacted>") if mapping.token else safe_error
+
+    @classmethod
+    def _record_mapping_error(cls, mapping: _MappingRun, error: str) -> None:
+        """记录首个失败位置和原因，避免逐文件历史明细。"""
+
+        safe_error = cls._safe_error(mapping, error)
+        if not mapping.status.error:
+            mapping.status.error = safe_error
+
+    @classmethod
+    def _mark_mapping_failed(cls, mapping: _MappingRun, error: str) -> None:
+        """设置脱敏映射失败结果并保留已完成计数。"""
+
+        cls._record_mapping_error(mapping, error)
         mapping.status.state = "failed"
-        mapping.status.error = safe_error.replace(mapping.token, "<redacted>") if mapping.token else safe_error
+        mapping.status.cleanup_eligible = False
         mapping.status.counters.failed += 1
+
+    @staticmethod
+    def _mark_mapping_stopped(mapping: _MappingRun) -> None:
+        """保留已完成数量并使停止映射失去清理资格。"""
+
+        mapping.status.state = "stopped"
+        mapping.status.cleanup_eligible = False
+        if not mapping.status.error:
+            mapping.status.error = "扫描已停止"
+
+    @staticmethod
+    def _is_auth_failure(error: OpenListError) -> bool:
+        """判断实例级认证或权限失败。"""
+
+        return error.auth_failure or error.status_code in {401, 403}
+
+    def _log_mapping_failure(self, mapping: _MappingRun) -> None:
+        """记录含实例、映射和安全原因的中文失败日志。"""
+
+        logger.warning(
+            f"Alist2Strm 映射扫描失败：{mapping.instance_name} / {mapping.source_dir} / "
+            f"{self._safe_error(mapping, mapping.status.error or '映射扫描失败')}"
+        )
 
     def _scan_mapping(self, reader: Any, mapping: _MappingRun, video_suffixes: frozenset[str]) -> None:
         """按任务快照递归筛选并生成视频 STRM 或下载其他白名单文件。"""
 
         pending = [mapping.source_dir]
         while pending:
+            self._observe_stop(self._run_for_mapping(mapping))
             current = pending.pop()
-            entries = reader.list_dir(current)
+            try:
+                entries = self._list_directory(reader, current, self._run_for_mapping(mapping))
+            except ScanStopped:
+                raise
+            except OpenListError as error:
+                if self._is_auth_failure(error):
+                    raise
+                mapping.status.counters.failed += 1
+                self._record_mapping_error(mapping, f"目录 {current}：{error.message}")
+                continue
+            except Exception as error:  # noqa: BLE001 - 单个目录失败不阻断兄弟目录
+                mapping.status.counters.failed += 1
+                self._record_mapping_error(mapping, f"目录 {current}：目录读取失败（{error}）")
+                continue
             for raw_entry in entries:
-                entry = self._entry(raw_entry)
-                if entry is None or self._excluded(entry.name, mapping.exclude_keywords):
-                    continue
-                remote_path = _join_remote_path(current, entry.name)
-                if entry.is_dir:
-                    pending.append(remote_path)
-                    continue
-                suffix = PurePosixPath(entry.name).suffix.casefold()
-                if not suffix or suffix not in mapping.allowed_suffixes:
-                    continue
-                if is_video_name(entry.name, video_suffixes):
-                    target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
-                    if self._filesystem.exists(target):
-                        if mapping.playback_changed:
-                            content = build_playback_url(mapping.playback_url, remote_path)
-                            self._update_existing_target(target, content, mapping.status.counters)
-                        else:
-                            mapping.status.counters.skipped += 1
+                run = self._run_for_mapping(mapping)
+                self._observe_stop(run)
+                try:
+                    entry = self._entry(raw_entry)
+                    if entry is None:
+                        mapping.status.counters.failed += 1
+                        self._record_mapping_error(mapping, f"目录 {current}：目录项格式无效")
                         continue
-                    content = build_playback_url(mapping.playback_url, remote_path)
-                    self._write_new_target(target, content, mapping.status.counters)
-                    continue
-                target = local_file_path(mapping.output_dir, mapping.source_dir, remote_path)
-                if self._filesystem.exists(target):
-                    mapping.status.counters.skipped += 1
-                    continue
-                self._download_target(reader, remote_path, target, mapping.status.counters)
+                    if self._excluded(entry.name, mapping.exclude_keywords):
+                        continue
+                    remote_path = _join_remote_path(current, entry.name)
+                    if entry.is_dir:
+                        pending.append(remote_path)
+                        continue
+                    suffix = PurePosixPath(entry.name).suffix.casefold()
+                    if not suffix or suffix not in mapping.allowed_suffixes:
+                        continue
+                    if is_video_name(entry.name, video_suffixes):
+                        target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
+                        if self._filesystem.exists(target):
+                            if mapping.playback_changed:
+                                content = build_playback_url(mapping.playback_url, remote_path)
+                                failure = self._update_existing_target(target, content, mapping.status.counters)
+                            else:
+                                mapping.status.counters.skipped += 1
+                                failure = None
+                        else:
+                            content = build_playback_url(mapping.playback_url, remote_path)
+                            failure = self._write_new_target(target, content, mapping.status.counters)
+                    else:
+                        target = local_file_path(mapping.output_dir, mapping.source_dir, remote_path)
+                        if self._filesystem.exists(target):
+                            mapping.status.counters.skipped += 1
+                            failure = None
+                        else:
+                            failure = self._download_target(
+                                reader,
+                                remote_path,
+                                target,
+                                mapping.status.counters,
+                                run,
+                            )
+                    if failure:
+                        self._record_mapping_error(mapping, f"文件 {remote_path}：{failure}")
+                except ScanStopped:
+                    raise
+                except OpenListError as error:
+                    if self._is_auth_failure(error):
+                        raise
+                    mapping.status.counters.failed += 1
+                    self._record_mapping_error(mapping, f"文件处理失败：{error.message}")
+                except Exception as error:  # noqa: BLE001 - 单文件失败不得阻断同目录文件
+                    mapping.status.counters.failed += 1
+                    self._record_mapping_error(mapping, f"文件处理失败：{error}")
 
-    def _download_target(self, reader: Any, remote_path: str, target: Path, counters: ScanCounters) -> None:
-        """把附件流写入临时目标，失败时只增加失败计数并清理半成品。"""
+    def _run_for_mapping(self, mapping: _MappingRun) -> _ScanRun:
+        """取得映射所属运行，供目录与文件边界观察停止请求。"""
+
+        with self._lock:
+            run = self._run
+        if run is None:
+            raise ScanStopped()
+        return run
+
+    def _download_target(
+        self,
+        reader: Any,
+        remote_path: str,
+        target: Path,
+        counters: ScanCounters,
+        run: _ScanRun,
+    ) -> str | None:
+        """有限重试附件下载，且本地原子写入失败不重试。"""
+
+        def download_once() -> bool:
+            """执行一次完整的打开、读取和原子写入。"""
+
+            with reader.open_download(remote_path) as chunks:
+                return bool(self._filesystem.write_bytes_atomic(target, chunks))
 
         try:
-            with reader.open_download(remote_path) as chunks:
-                created = self._filesystem.write_bytes_atomic(target, chunks)
-        except Exception:  # noqa: BLE001 - 单个附件失败不得伪造完整目标
+            created = bool(self._retry_operation(download_once, run))
+        except ScanStopped:
+            raise
+        except OpenListError as error:
             counters.failed += 1
-            return
+            if self._is_auth_failure(error):
+                raise
+            return error.message
+        except Exception as error:  # noqa: BLE001 - 本地写入或编程错误不重试
+            counters.failed += 1
+            return f"附件下载或写入失败（{error}）"
         if created:
             counters.downloaded += 1
         else:
             counters.skipped += 1
+        return None
 
     @staticmethod
     def _entry(raw_entry: object) -> RemoteEntry | None:
@@ -994,28 +1356,30 @@ class ScanCoordinator:
         folded = name.casefold()
         return any(keyword.casefold() in folded for keyword in keywords)
 
-    def _update_existing_target(self, target: Path, content: str, counters: ScanCounters) -> None:
+    def _update_existing_target(self, target: Path, content: str, counters: ScanCounters) -> str | None:
         """通过注入文件系统原子替换已有 STRM，失败时保留原文件。"""
 
         try:
             self._filesystem.replace_text_atomic(target, content)
-        except Exception:  # noqa: BLE001 - 更新失败必须保留原件并支持重试
+        except Exception as error:  # noqa: BLE001 - 更新失败必须保留原件并支持重试
             counters.failed += 1
-            return
+            return f"原子更新失败（{error}）"
         counters.updated += 1
+        return None
 
-    def _write_new_target(self, target: Path, content: str, counters: ScanCounters) -> None:
+    def _write_new_target(self, target: Path, content: str, counters: ScanCounters) -> str | None:
         """以注入文件系统原子创建新 STRM，避免留下半成品。"""
 
         try:
             created = self._filesystem.write_text_atomic(target, content)
-        except Exception:  # noqa: BLE001 - 本地写入失败记入映射结果
+        except Exception as error:  # noqa: BLE001 - 本地写入失败记入映射结果
             counters.failed += 1
-            return
+            return f"原子创建失败（{error}）"
         if created:
             counters.generated += 1
         else:
             counters.skipped += 1
+        return None
 
 
 def playback_address_changed(previous: str | None, current: str) -> bool:
@@ -1054,6 +1418,7 @@ __all__ = [
     "ScanCoordinator",
     "ScanCounters",
     "ScanStatus",
+    "ScanStopped",
     "ScanTarget",
     "ScanTriggerResult",
     "build_download_url",

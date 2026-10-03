@@ -14,6 +14,8 @@ from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     DownloadResponse,
     HttpResponse,
     OpenListClient,
+    OpenListError,
+    RemoteEntry,
     ScanCoordinator,
     build_playback_url,
 )
@@ -530,7 +532,7 @@ def test_scan_uses_empty_directories_as_success_and_isolates_bad_mapping(tmp_pat
     queue.run()
 
     status = coordinator.status()
-    assert status["state"] == "failed"
+    assert status["state"] == "partial_failure"
     assert status["counters"]["generated"] == 1  # type: ignore[index]
     assert status["counters"]["failed"] == 1  # type: ignore[index]
     assert status["mappings"][1]["state"] == "success"  # type: ignore[index]
@@ -860,17 +862,24 @@ def test_interrupted_attachment_download_leaves_no_target_and_retries(tmp_path: 
 
     assert coordinator.trigger().accepted is True
     queue.run()
-    assert not (tmp_path / "info.nfo").exists()
-    assert coordinator.status()["counters"]["failed"] == 1
-
-    assert coordinator.trigger().accepted is True
-    queue.run()
     assert (tmp_path / "info.nfo").read_bytes().startswith(b"download:")
+    assert attempts == 2
     assert coordinator.status()["counters"] == {
         "generated": 0,
         "downloaded": 1,
         "updated": 0,
         "skipped": 0,
+        "deleted": 0,
+        "failed": 0,
+    }
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert coordinator.status()["counters"] == {
+        "generated": 0,
+        "downloaded": 0,
+        "updated": 0,
+        "skipped": 1,
         "deleted": 0,
         "failed": 0,
     }
@@ -958,6 +967,477 @@ def test_cross_origin_redirect_drops_authorization_and_url_credentials() -> None
     assert transport.calls[0][1] == {"Authorization": "test-token"}
     assert transport.calls[1][1] == {}
     assert "user:password" not in transport.calls[1][0]
+
+
+def test_list_retry_succeeds_after_two_transient_failures_without_material_sleep() -> None:
+    """目录页的临时网络失败最多额外重试两次，并可注入零退避。"""
+
+    class RetryTransport:
+        """前两次返回服务端错误，第三次返回目录。"""
+
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+            """记录请求次数并返回受控响应。"""
+
+            self.attempts += 1
+            if self.attempts < 3:
+                return HttpResponse(503, {"code": 503, "data": None})
+            return HttpResponse(200, {"code": 200, "data": {"content": [], "total": 0}})
+
+    transport = RetryTransport()
+    client = OpenListClient(
+        "https://retry.example.invalid",
+        "test-token",
+        transport=transport,
+        sleep=lambda _delay: None,
+        retry_backoff=lambda _attempt: 0,
+    )
+
+    assert client.list_dir("/library") == []
+    assert transport.attempts == 3
+
+
+def test_list_retry_exhaustion_and_non_retryable_responses() -> None:
+    """临时失败耗尽为三次；权限、4xx 和无效响应均不重试。"""
+
+    class ResponseTransport:
+        """按给定响应顺序返回目录请求结果。"""
+
+        def __init__(self, responses: list[HttpResponse]) -> None:
+            self.responses = responses
+            self.attempts = 0
+
+        def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+            """返回下一个响应。"""
+
+            self.attempts += 1
+            return self.responses[min(self.attempts - 1, len(self.responses) - 1)]
+
+    for response in (
+        HttpResponse(401, {"code": 401, "data": None}),
+        HttpResponse(403, {"code": 403, "data": None}),
+        HttpResponse(404, {"code": 404, "data": None}),
+        HttpResponse(200, {"code": 200, "data": None}),
+    ):
+        transport = ResponseTransport([response])
+        client = OpenListClient(
+            "https://retry.example.invalid",
+            "test-token",
+            transport=transport,
+            sleep=lambda _delay: None,
+            retry_backoff=lambda _attempt: 0,
+        )
+        with pytest.raises(OpenListError):
+            client.list_dir("/library")
+        assert transport.attempts == 1
+
+    transport = ResponseTransport([HttpResponse(503, {"code": 503, "data": None})])
+    client = OpenListClient(
+        "https://retry.example.invalid",
+        "test-token",
+        transport=transport,
+        sleep=lambda _delay: None,
+        retry_backoff=lambda _attempt: 0,
+    )
+    with pytest.raises(OpenListError) as error:
+        client.list_dir("/library")
+    assert error.value.attempts_exhausted is True
+    assert transport.attempts == 3
+
+
+def test_download_retry_exhaustion_isolated_from_good_attachment(tmp_path: Path) -> None:
+    """附件临时失败耗尽只使该文件失败，其他附件继续处理。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "downloads",
+                    "name": "下载实例",
+                    "scan_url": "https://downloads.example.invalid",
+                    "api_token": "download-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".nfo"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    class Reader:
+        """一个附件耗尽重试、另一个附件成功的目录替身。"""
+
+        def list_dir(self, path: str) -> list[object]:
+            """返回两个白名单附件。"""
+
+            return [RemoteEntry("bad.nfo", False), RemoteEntry("good.nfo", False)]
+
+        def open_download(self, path: str) -> Any:
+            """只让 bad 附件返回可重试失败。"""
+
+            from contextlib import contextmanager
+
+            @contextmanager
+            def opened() -> Any:
+                """提供下载流或抛出临时错误。"""
+
+                if path.endswith("bad.nfo"):
+                    raise OpenListError("临时下载失败", retryable=True)
+                yield (b"good",)
+
+            return opened()
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv",),
+        sleep=lambda _delay: None,
+        retry_backoff=lambda _attempt: 0,
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert not (tmp_path / "bad.nfo").exists()
+    assert (tmp_path / "good.nfo").read_bytes() == b"good"
+    assert coordinator.status()["counters"] == {
+        "generated": 0,
+        "downloaded": 1,
+        "updated": 0,
+        "skipped": 0,
+        "deleted": 0,
+        "failed": 1,
+    }
+    assert coordinator.status()["state"] == "partial_failure"
+    assert coordinator.status()["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
+def test_local_attachment_write_failure_is_not_retried(tmp_path: Path) -> None:
+    """本地原子写入失败不因下载重试策略重复写入。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "local-write",
+                    "name": "本地写入实例",
+                    "scan_url": "https://local-write.example.invalid",
+                    "api_token": "local-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".nfo"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    writes = 0
+
+    class Reader:
+        """返回一个可下载附件。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回附件。"""
+
+            return [RemoteEntry("info.nfo", False)]
+
+        def open_download(self, path: str) -> Any:
+            """返回完整正文。"""
+
+            from contextlib import contextmanager
+
+            @contextmanager
+            def opened() -> Any:
+                """提供一个字节块。"""
+
+                yield (b"info",)
+
+            return opened()
+
+    class FileSystem:
+        """记录并拒绝本地写入。"""
+
+        def exists(self, target: Path) -> bool:
+            """目标不存在。"""
+
+            return False
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """该场景不生成 STRM。"""
+
+            raise AssertionError("不应写入 STRM")
+
+        def replace_text_atomic(self, target: Path, content: str) -> None:
+            """该场景不更新 STRM。"""
+
+            raise AssertionError("不应更新 STRM")
+
+        def write_bytes_atomic(self, target: Path, chunks: Any) -> bool:
+            """只失败一次即可证明没有重试。"""
+
+            nonlocal writes
+            writes += 1
+            raise OSError("disk full")
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        filesystem=FileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+        sleep=lambda _delay: None,
+        retry_backoff=lambda _attempt: 0,
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert writes == 1
+    assert coordinator.status()["counters"]["failed"] == 1  # type: ignore[index]
+
+
+def test_auth_failure_skips_remaining_mapping_of_instance_but_continues_other_instance(tmp_path: Path) -> None:
+    """实例认证失败隔离该实例剩余映射，并继续其他实例。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "denied",
+                    "name": "无权实例",
+                    "scan_url": "https://denied.example.invalid",
+                    "api_token": "denied-token",
+                    "mappings": [
+                        {"source_dir": "/one", "output_dir": str(tmp_path / "one")},
+                        {"source_dir": "/two", "output_dir": str(tmp_path / "two")},
+                    ],
+                },
+                {
+                    "id": "allowed",
+                    "name": "可用实例",
+                    "scan_url": "https://allowed.example.invalid",
+                    "api_token": "allowed-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "allowed")}],
+                },
+            ]
+        }
+    )
+    calls: list[tuple[str, str]] = []
+
+    class Reader:
+        """按实例提供认证失败或正常目录。"""
+
+        def __init__(self, denied: bool) -> None:
+            self.denied = denied
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回认证错误或一个视频。"""
+
+            calls.append(("denied" if self.denied else "allowed", path))
+            if self.denied:
+                raise OpenListError("权限不足", retryable=False, status_code=403)
+            return [RemoteEntry("ok.mkv", False)]
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, _token: Reader("denied" in url),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert calls == [("denied", "/one"), ("allowed", "/library")]
+    status = coordinator.status()
+    assert status["state"] == "partial_failure"
+    assert status["mappings"][1]["state"] == "failed"  # type: ignore[index]
+    assert status["mappings"][2]["state"] == "success"  # type: ignore[index]
+    assert (tmp_path / "allowed" / "ok.strm").is_file()
+
+
+def test_stop_finishes_current_atomic_write_then_stops_before_next_file(tmp_path: Path) -> None:
+    """停止请求在当前原子写入后生效，后续文件不再开始。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "stop",
+                    "name": "停止实例",
+                    "scan_url": "https://stop.example.invalid",
+                    "api_token": "stop-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path)}],
+                }
+            ]
+        }
+    )
+    queue = _Queue()
+    coordinator: ScanCoordinator
+    writes: list[str] = []
+
+    class FileSystem:
+        """在第一项原子写入完成后发出停止请求。"""
+
+        def exists(self, target: Path) -> bool:
+            """返回目标是否存在。"""
+
+            return target.exists()
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """写入第一项后请求停止。"""
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            writes.append(target.name)
+            if len(writes) == 1:
+                assert coordinator.stop().as_dict() == {"accepted": True, "message": "扫描正在停止"}
+            return True
+
+        def replace_text_atomic(self, target: Path, content: str) -> None:
+            """该场景不更新既有目标。"""
+
+            raise AssertionError("不应更新既有目标")
+
+        def write_bytes_atomic(self, target: Path, chunks: Any) -> bool:
+            """该场景不下载附件。"""
+
+            raise AssertionError("不应下载附件")
+
+    class Reader:
+        """返回两个视频，验证第二项不会开始。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回两个视频。"""
+
+            return [RemoteEntry("first.mkv", False), RemoteEntry("second.mkv", False)]
+
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv",),
+        filesystem=FileSystem(),
+    )
+
+    assert coordinator.trigger().accepted is True
+    assert coordinator.status()["running"] is True
+    queue.run()
+
+    status = coordinator.status()
+    assert status["state"] == "stopped"
+    assert status["running"] is False
+    assert status["counters"]["generated"] == 1  # type: ignore[index]
+    assert writes == ["first.strm"]
+    assert not (tmp_path / "second.strm").exists()
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+    assert coordinator.stop().accepted is False
+
+
+def test_stop_before_queued_job_is_idle_safe_and_next_trigger_is_fresh_scan(tmp_path: Path) -> None:
+    """排队任务停止后不执行；下一次触发重新读取完整目录。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "fresh",
+                    "name": "重新扫描实例",
+                    "scan_url": "https://fresh.example.invalid",
+                    "api_token": "fresh-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path)}],
+                }
+            ]
+        }
+    )
+    queue = _Queue()
+    reads = 0
+
+    class Reader:
+        """记录每次全量扫描的目录读取次数。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """每次返回同一视频。"""
+
+            nonlocal reads
+            reads += 1
+            return [RemoteEntry("movie.mkv", False)]
+
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    assert coordinator.stop().as_dict() == {"accepted": True, "message": "扫描正在停止"}
+    assert coordinator.status()["state"] == "stopped"
+    queue.run()
+    assert reads == 0
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert reads == 1
+    assert (tmp_path / "movie.strm").is_file()
+
+
+def test_scan_shutdown_closes_client_resources() -> None:
+    """停止服务时已创建的客户端最终释放资源。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "release",
+                    "name": "释放实例",
+                    "scan_url": "https://release.example.invalid",
+                    "api_token": "release-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": "/tmp/release-output"}],
+                }
+            ]
+        }
+    )
+    queue = _Queue()
+    released: list[str] = []
+
+    class Reader:
+        """提供可观察的 close 资源。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回空目录。"""
+
+            return []
+
+        def close(self) -> None:
+            """记录关闭。"""
+
+            released.append("closed")
+
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    coordinator.shutdown()
+    assert released == ["closed"]
 
 
 def test_playback_url_encodes_each_path_segment_without_double_encoding() -> None:

@@ -66,3 +66,8 @@ export function startMappingScan(
 export function readScanStatus(api: PluginApi, pluginId: string): Promise<ScanStatus> {
   return api.get<ScanStatus>(pluginPath(pluginId, 'scan/status'))
 }
+
+/** 请求停止当前扫描；服务端结束后台任务后才会返回 stopped 状态。 */
+export function stopScan(api: PluginApi, pluginId: string): Promise<ScanTriggerResponse> {
+  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan/stop'), {})
+}

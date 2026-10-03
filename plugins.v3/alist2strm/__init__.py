@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -236,6 +237,11 @@ class Alist2Strm(_PluginBase):
                 client_factory=getattr(self, "_scan_client_factory", None),
                 media_suffix_provider=getattr(self, "_scan_media_suffix_provider", None),
                 whitelist_suffix_provider=getattr(self, "_scan_whitelist_suffix_provider", None),
+                filesystem=getattr(self, "_scan_filesystem", None),
+                clock=getattr(self, "_scan_clock", time.time),
+                sleep=getattr(self, "_scan_sleep", None),
+                retry_backoff=getattr(self, "_scan_retry_backoff", None),
+                max_retries=getattr(self, "_scan_max_retries", 2),
             )
             self._scan_coordinator = coordinator
         return coordinator
@@ -311,6 +317,14 @@ class Alist2Strm(_PluginBase):
 
         return self.get_scan_status()
 
+    def stop_scan(
+        self,
+        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
+    ) -> dict[str, object]:
+        """请求停止当前扫描，实际结束前状态保持正在停止。"""
+
+        return self._get_scan_coordinator().stop().as_dict()
+
     def read_config(self, _: Any = Depends(get_current_active_superuser_async)) -> dict[str, object]:  # noqa: B008 - FastAPI 权限注入
         """返回已保存的安全配置投影。"""
 
@@ -372,11 +386,27 @@ class Alist2Strm(_PluginBase):
                 "auth": "bear",
                 "summary": "读取扫描状态",
             },
+            {
+                "path": "/scan/stop",
+                "endpoint": self.stop_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "停止当前扫描",
+            },
         ]
 
     def stop_service(self) -> None:
-        """停止当前票据没有创建的后台工作，不触碰保存配置。"""
+        """取消尚未执行的一次性任务、请求活动扫描停止并释放资源。"""
 
+        try:
+            from app.sdk.scheduler import remove_plugin_once_job
+
+            remove_plugin_once_job(self._plugin_id(), "manual-scan")
+        except Exception:  # noqa: BLE001 - 卸载时调度器可能已经关闭
+            logger.warning("Alist2Strm 一次性扫描任务取消失败")
+        coordinator = getattr(self, "_scan_coordinator", None)
+        if isinstance(coordinator, ScanCoordinator):
+            coordinator.shutdown()
         self._stopped = True
 
 

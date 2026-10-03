@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-import { getErrorMessage, readConfiguration, readScanStatus, startMappingScan, startScan } from '@/api'
+import { getErrorMessage, readConfiguration, readScanStatus, startMappingScan, startScan, stopScan } from '@/api'
 import { configurationEditorState } from '@/configState'
 import type {
   ConfigModel,
@@ -32,6 +32,7 @@ const config = ref<ConfigModel>(emptyConfig())
 const status = ref<ScanStatus>(emptyStatus())
 const loading = ref(true)
 const triggering = ref(false)
+const stopping = ref(false)
 const message = ref('')
 const messageTone = ref<'success' | 'warning' | 'error'>('success')
 let pollTimer: ReturnType<typeof window.setInterval> | null = null
@@ -40,13 +41,17 @@ let pageMounted = false
 const hasUnsavedChanges = computed(() => configurationEditorState.dirty)
 const statusLabel = computed(() => {
   if (status.value.state === 'running') return '进行中'
+  if (status.value.state === 'stopping') return '正在停止'
+  if (status.value.state === 'stopped') return '已停止'
   if (status.value.state === 'success') return '已完成'
-  if (status.value.state === 'failed') return '部分失败'
+  if (status.value.state === 'partial_failure') return '部分失败'
+  if (status.value.state === 'failed') return '失败'
   return '空闲'
 })
 const statusColor = computed(() => {
-  if (status.value.state === 'failed') return 'error'
+  if (status.value.state === 'failed' || status.value.state === 'partial_failure') return 'error'
   if (status.value.state === 'success') return 'success'
+  if (status.value.state === 'stopped' || status.value.state === 'stopping') return 'warning'
   return 'info'
 })
 const counterRows = computed(() => [
@@ -167,6 +172,19 @@ async function runMapping(instance: OpenListInstance, mapping: DirectoryMapping,
   }
 }
 
+async function stopScanRun(): Promise<void> {
+  stopping.value = true
+  try {
+    const response = await stopScan(props.api, pluginId.value)
+    showResult('warning', response.message)
+  } catch (error) {
+    showResult('error', `停止扫描失败：${getErrorMessage(error, '请稍后重试')}`)
+  } finally {
+    stopping.value = false
+    await refreshStatus()
+  }
+}
+
 function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
   messageTone.value = tone
   message.value = text
@@ -174,8 +192,11 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
 
 function mappingStatus(mapping: ScanMappingStatus): string {
   if (mapping.state === 'running') return '进行中'
-  if (mapping.state === 'success') return '已完成'
+  if (mapping.state === 'stopping') return '正在停止'
+  if (mapping.state === 'stopped') return '已停止'
+  if (mapping.state === 'partial_failure') return '部分失败'
   if (mapping.state === 'failed') return '失败'
+  if (mapping.state === 'success') return '已完成'
   return '等待中'
 }
 </script>
@@ -208,6 +229,15 @@ function mappingStatus(mapping: ScanMappingStatus): string {
               @click="runAll"
             >
               运行全部
+            </VBtn>
+            <VBtn
+              color="warning"
+              prepend-icon="mdi-stop"
+              :loading="stopping"
+              :disabled="loading || stopping || triggering || !status.running"
+              @click="stopScanRun"
+            >
+              停止扫描
             </VBtn>
             <VChip :color="statusColor" variant="tonal">状态：{{ statusLabel }}</VChip>
             <span v-if="status.current_mapping" class="text-body-2">当前映射：{{ status.current_mapping }}</span>
@@ -252,6 +282,9 @@ function mappingStatus(mapping: ScanMappingStatus): string {
 
           <div v-if="status.mappings.length" class="mt-6">
             <div class="text-subtitle-1 mb-2">本次映射状态</div>
+            <div v-if="status.counters.failed" class="text-caption text-medium-emphasis mb-2">
+              失败请按运行时间、实例和映射查阅宿主日志。
+            </div>
             <VTable density="compact">
               <thead>
                 <tr>

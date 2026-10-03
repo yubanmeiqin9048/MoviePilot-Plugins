@@ -65,6 +65,7 @@ export interface ScanMappingStatus {
   status: string
   counters: ScanCounters
   error?: string | null
+  cleanup_eligible?: boolean
 }
 
 export interface ScanStatus {
