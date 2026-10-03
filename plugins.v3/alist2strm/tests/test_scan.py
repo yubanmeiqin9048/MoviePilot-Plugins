@@ -9,7 +9,11 @@ from typing import Any
 import pytest
 
 from app.plugins.alist2strm import scan as scan_module  # ty: ignore[unresolved-import]
-from app.plugins.alist2strm.config import build_configuration  # ty: ignore[unresolved-import]
+from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
+    ConfigurationValidationError,
+    PluginConfiguration,
+    build_configuration,
+)
 from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     DownloadResponse,
     HttpResponse,
@@ -18,6 +22,7 @@ from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     OpenListError,
     RemoteEntry,
     ScanCoordinator,
+    ScanTarget,
     build_playback_url,
 )
 
@@ -1407,7 +1412,7 @@ def test_stop_before_queued_job_is_idle_safe_and_next_trigger_is_fresh_scan(tmp_
     assert (tmp_path / "movie.strm").is_file()
 
 
-def test_scan_shutdown_closes_client_resources() -> None:
+def test_scan_shutdown_closes_client_resources(tmp_path: Path) -> None:
     """停止服务时已创建的客户端最终释放资源。"""
 
     configuration = build_configuration(
@@ -1418,7 +1423,7 @@ def test_scan_shutdown_closes_client_resources() -> None:
                     "name": "释放实例",
                     "scan_url": "https://release.example.invalid",
                     "api_token": "release-token",
-                    "mappings": [{"source_dir": "/library", "output_dir": "/tmp/release-output"}],
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path / "release-output")}],
                 }
             ]
         }
@@ -1588,6 +1593,83 @@ def test_empty_complete_scan_cleans_all_currently_managed_files(tmp_path: Path) 
     assert status["state"] == "success"
     assert status["counters"]["deleted"] == 2  # type: ignore[index]
     assert status["mappings"][0]["cleanup_eligible"] is True  # type: ignore[index]
+
+
+def test_removed_video_suffix_preserves_only_current_strm_and_deletes_stale_strm(tmp_path: Path) -> None:
+    """移除一个视频后缀但仍管理另一视频后缀时只保留当前预期 STRM。"""
+
+    output = tmp_path / "video-suffixes"
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "video-suffixes",
+                    "name": "视频后缀实例",
+                    "scan_url": "https://video-suffixes.example.invalid",
+                    "api_token": "video-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".mp4"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    second = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "video-suffixes",
+                    "name": "视频后缀实例",
+                    "scan_url": "https://video-suffixes.example.invalid",
+                    "api_token": "video-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mp4"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    current = [first]
+
+    class Reader:
+        """先返回两个视频，后续只保留仍管理的视频后缀。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回当前任务的源快照。"""
+
+            if current[0] is first:
+                return [RemoteEntry("Current.mp4", False), RemoteEntry("Removed.mkv", False)]
+            return [RemoteEntry("Current.mp4", False)]
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv", ".mp4"),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert (output / "Current.strm").is_file()
+    assert (output / "Removed.strm").is_file()
+
+    current[0] = second
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert (output / "Current.strm").is_file()
+    assert not (output / "Removed.strm").exists()
+    assert coordinator.status()["counters"]["deleted"] == 1  # type: ignore[index]
 
 
 def test_removed_suffix_is_preserved_while_strm_management_follows_video_whitelist(tmp_path: Path) -> None:
@@ -1762,6 +1844,54 @@ def test_incomplete_scan_or_cleanup_enumeration_never_cleans(tmp_path: Path, fai
     assert status["counters"]["failed"] >= 1  # type: ignore[index]
 
 
+def test_child_directory_failure_preserves_stale_candidates(tmp_path: Path) -> None:
+    """子目录读取最终失败时不清理已有受管产物。"""
+
+    output = tmp_path / "child-failure"
+    output.mkdir()
+    stale = output / "stale.strm"
+    stale.write_text("must remain", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "child-failure",
+                    "name": "子目录失败实例",
+                    "scan_url": "https://child-failure.example.invalid",
+                    "api_token": "child-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+                }
+            ]
+        }
+    )
+
+    class Reader:
+        """返回一个正常根目录和失败子目录。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """在子目录边界报告失败。"""
+
+            if path == "/library":
+                return [RemoteEntry("Season", True)]
+            raise OpenListError("子目录读取失败", retryable=False)
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert stale.is_file()
+    status = coordinator.status()
+    assert status["state"] == "failed"
+    assert status["mappings"][0]["state"] == "failed"  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
 def test_cleanup_never_unlinks_candidate_outside_current_output_root(tmp_path: Path) -> None:
     """注入枚举即使返回根目录外路径，也只能删除当前根内文件。"""
 
@@ -1810,6 +1940,160 @@ def test_cleanup_never_unlinks_candidate_outside_current_output_root(tmp_path: P
     assert coordinator.status()["counters"]["deleted"] == 1  # type: ignore[index]
 
 
+def test_output_relocation_does_not_clean_old_mapping_root(tmp_path: Path) -> None:
+    """源配置迁移到新输出目录时只管理新根并保留旧产物。"""
+
+    old_output = tmp_path / "old-output"
+    new_output = tmp_path / "new-output"
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "relocation",
+                    "name": "迁移实例",
+                    "scan_url": "https://relocation.example.invalid",
+                    "api_token": "relocation-token",
+                    "mappings": [{"source_dir": "/old", "output_dir": str(old_output)}],
+                }
+            ]
+        }
+    )
+    second = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "relocation",
+                    "name": "迁移实例",
+                    "scan_url": "https://relocation.example.invalid",
+                    "api_token": "relocation-token",
+                    "mappings": [{"source_dir": "/new", "output_dir": str(new_output)}],
+                }
+            ]
+        }
+    )
+    current = [first]
+    transport = _Transport(
+        {
+            "https://relocation.example.invalid": {
+                "/old": [{"name": "Movie.mkv", "is_dir": False}],
+                "/new": [],
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    old_target = old_output / "Movie.strm"
+    assert old_target.is_file()
+
+    current[0] = second
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert old_target.is_file()
+    assert not new_output.exists()
+    assert coordinator.status()["state"] == "success"
+
+
+def test_symlink_aliases_disqualify_selected_cleanup_and_configuration_validation(tmp_path: Path) -> None:
+    """符号链接别名配置被拒绝，绕过保存校验时单映射清理仍保守跳过。"""
+
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    alias_output = tmp_path / "alias-output"
+    alias_output.symlink_to(real_output, target_is_directory=True)
+    stale = real_output / "stale.strm"
+    stale.write_text("must remain", encoding="utf-8")
+    payload = {
+        "instances": [
+            {
+                "id": "real",
+                "name": "真实目录实例",
+                "scan_url": "https://real-output.example.invalid",
+                "api_token": "real-token",
+                "mappings": [
+                    {"source_dir": "/library", "output_dir": str(real_output)},
+                    {"source_dir": "/alias", "output_dir": str(alias_output)},
+                ],
+            }
+        ]
+    }
+    with pytest.raises(ConfigurationValidationError, match="输出目录不能重复或互相包含"):
+        build_configuration(payload)
+
+    configuration = PluginConfiguration.model_validate(payload)
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: _EmptyReader(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger(ScanTarget(instance_id="real", mapping_index=1)).accepted is True
+    queue.run()
+
+    assert stale.is_file()
+    status = coordinator.status()
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
+def test_local_filesystem_child_enumeration_failure_blocks_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """本地输出根的子目录枚举失败时保留候选并使映射失败。"""
+
+    output = tmp_path / "unreadable-root"
+    blocked = output / "blocked"
+    blocked.mkdir(parents=True)
+    stale = blocked / "stale.strm"
+    stale.write_text("must remain", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "local-enumeration",
+                    "name": "本地枚举实例",
+                    "scan_url": "https://local-enumeration.example.invalid",
+                    "api_token": "local-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+                }
+            ]
+        }
+    )
+    original_scandir = scan_module.os.scandir
+
+    def failing_scandir(path: Any) -> Any:
+        """仅让受管输出根的子目录读取失败。"""
+
+        if Path(path) == blocked:
+            raise OSError("child directory unreadable")
+        return original_scandir(path)
+
+    monkeypatch.setattr(scan_module.os, "scandir", failing_scandir)
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: _EmptyReader(),
+        filesystem=LocalFileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert stale.is_file()
+    status = coordinator.status()
+    assert status["state"] == "failed"
+    assert status["mappings"][0]["state"] == "failed"  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
 class _EmptyReader:
     """清理测试使用的空源目录替身。"""
 
@@ -1819,7 +2103,7 @@ class _EmptyReader:
         return []
 
 
-def test_cleanup_delete_failure_continues_and_marks_run_failed(tmp_path: Path) -> None:
+def test_cleanup_delete_failure_continues_and_marks_run_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """单项删除失败后继续删除其他候选并计入失败。"""
 
     output = tmp_path / "delete-failure"
@@ -1858,6 +2142,17 @@ def test_cleanup_delete_failure_continues_and_marks_run_failed(tmp_path: Path) -
             super().unlink(target)
 
     queue = _Queue()
+    logs: list[str] = []
+
+    class Logger:
+        """捕获宿主日志边界。"""
+
+        def warning(self, message: str) -> None:
+            """记录一条警告。"""
+
+            logs.append(message)
+
+    monkeypatch.setattr(scan_module, "logger", Logger())
     coordinator = ScanCoordinator(
         lambda: configuration,
         dispatch=queue,
@@ -1877,6 +2172,14 @@ def test_cleanup_delete_failure_continues_and_marks_run_failed(tmp_path: Path) -
     assert status["counters"]["failed"] == 1  # type: ignore[index]
     assert status["mappings"][0]["state"] == "failed"  # type: ignore[index]
     assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+    assert any(
+        "受管产物清理失败" in message
+        and "删除失败实例" in message
+        and "映射 1" in message
+        and str(first) in message
+        and "unlink failed" in message
+        for message in logs
+    )
 
 
 def test_cleanup_stop_finishes_current_unlink_and_blocks_next_candidate(tmp_path: Path) -> None:
@@ -1937,3 +2240,76 @@ def test_cleanup_stop_finishes_current_unlink_and_blocks_next_candidate(tmp_path
     assert status["counters"]["deleted"] == 1  # type: ignore[index]
     assert status["counters"]["failed"] == 0  # type: ignore[index]
     assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
+def test_cleanup_stop_does_not_start_subsequent_mapping(tmp_path: Path) -> None:
+    """清理停止后不启动后续映射。"""
+
+    first_output = tmp_path / "first-mapping"
+    second_output = tmp_path / "second-mapping"
+    first_output.mkdir()
+    second_output.mkdir()
+    first_stale = first_output / "stale.strm"
+    second_stale = second_output / "stale.strm"
+    first_stale.write_text("first", encoding="utf-8")
+    second_stale.write_text("second", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "stop-following",
+                    "name": "后续映射实例",
+                    "scan_url": "https://stop-following.example.invalid",
+                    "api_token": "stop-following-token",
+                    "mappings": [
+                        {"source_dir": "/first", "output_dir": str(first_output)},
+                        {"source_dir": "/second", "output_dir": str(second_output)},
+                    ],
+                }
+            ]
+        }
+    )
+    calls: list[str] = []
+    coordinator: ScanCoordinator
+
+    class Reader:
+        """记录每个映射是否开始读取。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回空目录并记录源路径。"""
+
+            calls.append(path)
+            return []
+
+    class FileSystem(LocalFileSystem):
+        """第一映射清理后请求停止。"""
+
+        def iter_files(self, root: Path) -> Any:
+            """返回对应映射的清理候选。"""
+
+            return [first_stale] if root == first_output else [second_stale]
+
+        def unlink(self, target: Path) -> None:
+            """完成第一项删除后发出停止请求。"""
+
+            super().unlink(target)
+            if target == first_stale:
+                assert coordinator.stop().accepted is True
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        filesystem=FileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert calls == ["/first"]
+    assert not first_stale.exists()
+    assert second_stale.is_file()
+    status = coordinator.status()
+    assert status["state"] == "stopped"
+    assert status["mappings"][1]["state"] == "stopped"  # type: ignore[index]

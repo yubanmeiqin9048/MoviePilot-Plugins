@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -143,19 +144,30 @@ class LocalFileSystem:
         return self._write_atomic(target, write, text=False)
 
     def iter_files(self, root: Path) -> Iterable[Path]:
-        """枚举输出根目录下的文件，不跟随目录符号链接。"""
+        """显式递归枚举输出根目录下的文件并传播目录或 stat 错误。"""
 
-        for target in root.rglob("*"):
-            if target == root:
-                continue
-            try:
-                relative = target.relative_to(root)
-            except ValueError:
-                continue
-            if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
-                continue
-            if target.is_file():
-                yield target
+        try:
+            os.stat(root)
+        except FileNotFoundError, NotADirectoryError:
+            return
+
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entry_path = Path(entry.path)
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        pending.append(entry_path)
+                        continue
+                    if stat.S_ISREG(entry_stat.st_mode):
+                        yield entry_path
+                        continue
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        target_stat = entry.stat(follow_symlinks=True)
+                        if stat.S_ISREG(target_stat.st_mode):
+                            yield entry_path
 
     def unlink(self, target: Path) -> None:
         """删除一个本地产物文件。"""
@@ -765,6 +777,7 @@ class _ScanRun:
     mappings: list[_MappingRun]
     video_suffixes: frozenset[str]
     started_at: float
+    cleanup_disqualified: bool = False
     state: str = "running"
     current_mapping: str | None = None
     finished_at: float | None = None
@@ -1025,6 +1038,9 @@ class ScanCoordinator:
             return ScanTriggerResult(False, "没有可运行的已保存配置")
         snapshot = configuration.model_copy(deep=True)
         video_suffixes = self._normalise_suffixes(self._media_suffix_provider)
+        cleanup_disqualified = self._has_overlapping_output_roots(
+            Path(mapping.output_dir) for instance in snapshot.instances for mapping in instance.mappings
+        )
         try:
             host_whitelist = self._normalise_values(self._whitelist_suffix_provider())
         except Exception:  # noqa: BLE001 - 宿主设置异常按空白名单处理
@@ -1075,7 +1091,28 @@ class ScanCoordinator:
             return ScanTriggerResult(False, "未找到指定的目录映射")
         if not mappings:
             return ScanTriggerResult(False, "没有可运行的目录映射")
-        return _ScanRun(mappings=mappings, video_suffixes=video_suffixes, started_at=self._clock())
+        return _ScanRun(
+            mappings=mappings,
+            video_suffixes=video_suffixes,
+            started_at=self._clock(),
+            cleanup_disqualified=cleanup_disqualified,
+        )
+
+    @staticmethod
+    def _has_overlapping_output_roots(roots: Iterable[Path]) -> bool:
+        """检查所有配置输出根的解析路径，解析失败时保守禁止清理。"""
+
+        resolved: list[Path] = []
+        for root in roots:
+            try:
+                resolved.append(root.resolve(strict=False))
+            except OSError, RuntimeError:
+                return True
+        for index, first in enumerate(resolved):
+            for second in resolved[index + 1 :]:
+                if first == second or first in second.parents or second in first.parents:
+                    return True
+        return False
 
     @classmethod
     def _normalise_suffixes(cls, provider: Callable[[], Sequence[str]]) -> frozenset[str]:
@@ -1147,7 +1184,7 @@ class ScanCoordinator:
                         else:
                             self._remember_playback_identity(mapping)
                             mapping.status.state = "success"
-                            mapping.status.cleanup_eligible = True
+                            mapping.status.cleanup_eligible = not run.cleanup_disqualified
                 except ScanStopped:
                     self._mark_mapping_stopped(mapping)
                     raise
@@ -1335,8 +1372,17 @@ class ScanCoordinator:
     def _cleanup_mapping(self, mapping: _MappingRun, run: _ScanRun) -> None:
         """按本轮完整快照清理当前输出根目录内的受管文件。"""
 
+        if run.cleanup_disqualified:
+            mapping.status.cleanup_eligible = False
+            logger.warning(
+                f"Alist2Strm 已跳过受管产物清理：实例“{mapping.instance_name}”，"
+                f"映射 {mapping.mapping_index}（{mapping.source_dir}），解析后的输出目录存在重叠"
+            )
+            return
+
         managed_suffixes = self._managed_output_suffixes(mapping.allowed_suffixes, run.video_suffixes)
         self._observe_stop(run)
+        candidates: list[Path] = []
         for raw_target in self._filesystem.iter_files(mapping.output_dir):
             self._observe_stop(run)
             target = Path(raw_target)
@@ -1344,15 +1390,34 @@ class ScanCoordinator:
                 continue
             if target in mapping.expected_outputs or target.suffix.casefold() not in managed_suffixes:
                 continue
+            candidates.append(target)
+
+        for target in candidates:
+            self._observe_stop(run)
             try:
                 self._filesystem.unlink(target)
             except ScanStopped:
                 raise
             except Exception as error:  # noqa: BLE001 - 单项删除失败不得阻断其他产物
                 mapping.status.counters.failed += 1
+                self._log_cleanup_failure(mapping, target, error)
                 self._record_mapping_error(mapping, f"清理文件 {target}：删除失败（{error}）")
                 continue
             mapping.status.counters.deleted += 1
+
+    def _log_cleanup_failure(self, mapping: _MappingRun, target: Path, error: Exception) -> None:
+        """在宿主日志中记录每项脱敏的清理失败。"""
+
+        safe_instance = self._safe_error(mapping, mapping.instance_name)
+        safe_source = self._safe_error(mapping, mapping.source_dir)
+        safe_output = self._safe_error(mapping, str(mapping.output_dir))
+        safe_path = self._safe_error(mapping, str(target))
+        safe_reason = self._safe_error(mapping, str(error))
+        logger.warning(
+            f"Alist2Strm 受管产物清理失败：实例“{safe_instance}”，"
+            f"映射 {mapping.mapping_index}（源目录“{safe_source}”，输出目录“{safe_output}”），"
+            f"路径“{safe_path}”，原因：{safe_reason}"
+        )
 
     @staticmethod
     def _managed_output_suffixes(allowed_suffixes: frozenset[str], video_suffixes: frozenset[str]) -> frozenset[str]:
@@ -1365,15 +1430,19 @@ class ScanCoordinator:
 
     @staticmethod
     def _within_output_root(root: Path, target: Path) -> bool:
-        """判断候选文件是否位于当前输出根目录下。"""
+        """判断候选文件按解析路径位于当前输出根目录下。"""
 
         if target == root:
             return False
         try:
             relative = target.relative_to(root)
-        except ValueError:
+            resolved_root = root.resolve(strict=False)
+            resolved_target = target.resolve(strict=False)
+        except OSError, RuntimeError, ValueError:
             return False
-        return bool(relative.parts) and not any(part in {"", ".", ".."} for part in relative.parts)
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            return False
+        return resolved_target != resolved_root and resolved_root in resolved_target.parents
 
     def _run_for_mapping(self, mapping: _MappingRun) -> _ScanRun:
         """取得映射所属运行，供目录与文件边界观察停止请求。"""

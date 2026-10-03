@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Mapping, Sequence
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -117,11 +117,23 @@ def _normalise_keywords(value: object) -> list[str]:
 
 
 def _is_path_overlap(first: str, second: str) -> bool:
-    """返回两个已规范化 POSIX 路径是否相等或互为父子。"""
+    """返回两个输出路径按词法或符号链接解析后是否相等或互为父子。"""
 
     first_path = PurePosixPath(first)
     second_path = PurePosixPath(second)
-    return first_path == second_path or first_path in second_path.parents or second_path in first_path.parents
+    if first_path == second_path or first_path in second_path.parents or second_path in first_path.parents:
+        return True
+    try:
+        resolved_first = Path(first).resolve(strict=False)
+        resolved_second = Path(second).resolve(strict=False)
+    except OSError, RuntimeError:
+        # 无法确认输出边界时拒绝保存，避免把清理范围交给不确定的路径。
+        return True
+    return (
+        resolved_first == resolved_second
+        or resolved_first in resolved_second.parents
+        or resolved_second in resolved_first.parents
+    )
 
 
 def _valid_cron(value: str) -> str:
