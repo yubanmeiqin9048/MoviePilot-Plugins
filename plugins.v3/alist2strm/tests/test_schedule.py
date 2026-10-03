@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import app.scheduler.oncejob as oncejob_module
+import app.scheduler.reconcile as reconcile_module
+import app.sdk.scheduler as scheduler_sdk
 from app.plugins.alist2strm import Alist2Strm  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
     ConfigurationValidationError,
     build_configuration,
 )
 from app.plugins.alist2strm.scan import RemoteEntry  # ty: ignore[unresolved-import]
+from app.scheduler.oncejob import SchedulerPluginOnceJobOwner
+from app.scheduler.reconcile import SchedulerReconcileOwner
 
 
 class _Queue:
@@ -35,6 +44,75 @@ class _Queue:
 
         assert len(self.jobs) == 1
         self.jobs.pop()()
+
+
+class _HostOwner(SchedulerReconcileOwner, SchedulerPluginOnceJobOwner):
+    """按宿主调度器的对账与一次性任务 owner 组合测试。"""
+
+    plugin: Alist2Strm
+    manager: Any
+
+
+@pytest.fixture
+def _host_scheduler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[tuple[Alist2Strm, _HostOwner]]:
+    """构造真实宿主一次性任务保留逻辑使用的离线调度器。"""
+
+    plugin = _plugin(_payload(enabled=True, output_dir=str(tmp_path / "old")))
+
+    def get_plugin_services(*, pid: str) -> list[dict[str, Any]]:
+        """按宿主的关键字参数契约返回当前插件服务声明。"""
+
+        assert pid == plugin._plugin_id()
+        return plugin.get_service()
+
+    manager = SimpleNamespace(
+        running_plugins={plugin._plugin_id(): plugin},
+        get_plugin_attr=lambda _pid, _attr: "Alist2Strm",
+        get_plugin_services=get_plugin_services,
+    )
+    monkeypatch.setattr(reconcile_module, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(oncejob_module, "get_plugin_manager", lambda: manager)
+
+    scheduler = BackgroundScheduler(timezone="UTC")
+    owner = _HostOwner.__new__(_HostOwner)
+    owner._scheduler = scheduler
+    owner._lock = threading.RLock()
+    owner._jobs = {}
+    owner._assign_job_generation = lambda _job_id, job: job.setdefault("_generation", 0)
+    owner._accepting_submissions = lambda: True
+    owner._is_job_active = lambda _job_id: False
+
+    def start(job_id: str) -> bool:
+        """执行测试中明确选定的一次性任务回调。"""
+
+        job = owner._jobs[job_id]
+        job["func"](**job["kwargs"])
+        return True
+
+    owner.start = start
+    owner.plugin = plugin
+    owner.manager = manager
+
+    def add_once(
+        pid: str,
+        job_id: str,
+        func: Any,
+        name: str,
+        delay_seconds: float = 0,
+        func_kwargs: dict[str, Any] | None = None,
+    ) -> bool:
+        """将插件提交的任务延迟到测试显式执行，保留宿主登记状态。"""
+
+        del delay_seconds
+        return owner.add_plugin_once_job(pid, job_id, func, name, delay_seconds=60, func_kwargs=func_kwargs)
+
+    monkeypatch.setattr(scheduler_sdk, "add_plugin_once_job", add_once)
+    plugin._schedule_update = owner.update_plugin_job
+    scheduler.start()
+    try:
+        yield plugin, owner
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 class _Reader:
@@ -171,6 +249,76 @@ def test_service_registration_and_save_do_not_scan() -> None:
 
     assert plugin.scan_invocations == 0
     assert queue.jobs == []
+
+
+def test_save_refresh_preserves_host_pending_scan_snapshot(
+    _host_scheduler: tuple[Alist2Strm, _HostOwner], tmp_path: Path
+) -> None:
+    """宿主刷新计划时保留插件绑定的一次性任务及其原始配置快照。"""
+
+    plugin, owner = _host_scheduler
+    old_output = tmp_path / "old"
+    new_output = tmp_path / "new"
+    plugin._scan_client_factory = lambda _url, _token: _Reader()
+    plugin._scan_media_suffix_provider = lambda: (".mkv",)
+    plugin._scan_whitelist_suffix_provider = lambda: (".mkv",)
+    plugin.update_config = lambda _config, plugin_id=None: True
+    plugin.save_data = lambda _key, _value, plugin_id=None: None
+
+    assert plugin.trigger_scan()["accepted"] is True
+    once_job_id = "Alist2Strm_once_manual-scan"
+    pending = owner._jobs[once_job_id]
+    assert pending["_plugin_instance"] is plugin
+    assert owner._scheduler.get_job(once_job_id) is not None
+
+    plugin.save_configuration(_payload(enabled=True, cron="*/20 * * * *", output_dir=str(new_output)))
+
+    periodic_job_id = "Alist2Strm_shared-scan"
+    periodic_job = owner._scheduler.get_job(periodic_job_id)
+    assert periodic_job is not None
+    assert periodic_job_id in owner._jobs
+    assert str(periodic_job.trigger) == str(CronTrigger.from_crontab("*/20 * * * *"))
+    assert owner._scheduler.get_job(once_job_id) is not None
+    retained = owner._jobs[once_job_id]
+    assert retained["_plugin_instance"] is plugin
+    retained["func"](**retained["kwargs"])
+
+    assert (old_output / "Movie.strm").is_file()
+    assert not new_output.exists()
+    assert plugin.get_scan_status()["state"] == "success"
+
+
+def test_stop_service_removes_periodic_jobs_and_rejects_retained_schedule_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停止先封闭扫描入口，再移除周期任务并拒绝已留存的定时回调。"""
+
+    plugin = _plugin(_payload(enabled=True))
+    retained_callback = plugin.get_service()[0]["func"]
+    removals: list[tuple[str, str, bool]] = []
+
+    def remove_periodic(plugin_id: str) -> None:
+        """观察公开 SDK 的周期任务移除及停止状态顺序。"""
+
+        removals.append(("periodic", plugin_id, plugin._stopped))
+
+    def remove_once(plugin_id: str, job_id: str) -> None:
+        """观察待执行一次性任务清理。"""
+
+        removals.append((job_id, plugin_id, plugin._stopped))
+
+    monkeypatch.setattr(scheduler_sdk, "remove_plugin_job", remove_periodic)
+    monkeypatch.setattr(scheduler_sdk, "remove_plugin_once_job", remove_once)
+
+    plugin.stop_service()
+
+    assert removals == [
+        ("periodic", "Alist2Strm", True),
+        ("manual-scan", "Alist2Strm", True),
+    ]
+    assert retained_callback() == {"accepted": False, "message": "没有可运行的已保存配置"}
+    assert plugin.trigger_scan()["accepted"] is False
+    assert plugin.scan_invocations == 0
 
 
 def test_scheduled_callback_uses_manual_guard_and_start_snapshot(tmp_path: Path) -> None:
