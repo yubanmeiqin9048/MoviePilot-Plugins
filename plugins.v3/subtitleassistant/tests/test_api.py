@@ -14,6 +14,8 @@ from pydantic import ValidationError
 
 from app.plugins.subtitleassistant import SubtitleAssistant
 from app.plugins.subtitleassistant.api import ApiController
+from app.plugins.subtitleassistant.attribution import AttributionService
+from app.plugins.subtitleassistant.search import SubtitleSearch, SearchSessions
 from app.plugins.subtitleassistant.record import RecordCommitter
 from app.plugins.subtitleassistant.schemas.candidate import (
     CandidateRecognition,
@@ -53,11 +55,8 @@ from app.plugins.subtitleassistant.schemas.record import (
     RetargetPreview,
     RetargetResult,
 )
-from app.plugins.subtitleassistant.schemas.search import (
-    ManualSearchResult,
-    ManualSourceView,
-    ManualSubmitResult,
-)
+from app.plugins.subtitleassistant.schemas.task import ManualSubmitResult
+from app.plugins.subtitleassistant.schemas.search import ManualSearchResult, ManualSourceView
 from app.plugins.subtitleassistant.schemas.source import SourcePlanEntry, SourceSearchResult, SubtitleSource
 from app.plugins.subtitleassistant.schemas.target import MediaType, SearchTarget, SubtitleTarget
 from app.plugins.subtitleassistant.schemas.task import SubtitleTask, TaskStatus
@@ -253,7 +252,7 @@ class _ApiPlugin:
         self.record_maintenance = _ApiRetargeting()
         self.credential_updates: list[tuple[SubtitleSource, dict[str, str]]] = []
         self.targets = SimpleNamespace(list_targets=AsyncMock())
-        self.manual_search = SimpleNamespace(
+        self.search_requests = SimpleNamespace(
             search=AsyncMock(),
             submit=AsyncMock(),
         )
@@ -284,17 +283,25 @@ class _ApiPlugin:
 def _controller(plugin: _ApiPlugin) -> ApiController:
     """以显式 capability facade 创建 API 控制器。"""
 
-    return ApiController(
+    controller = ApiController(
         tasks=plugin.coordinator,
         records=plugin.record_catalog,
         maintenance=plugin.record_maintenance,
         filesystem=plugin.filesystem,
         targets=plugin.targets,
-        search=plugin.manual_search,
+        search=SubtitleSearch(plugin.source_service),
+        sessions=SearchSessions(),
+        matcher=AttributionService(),
         sources=plugin.source_service,
         update_credentials=plugin.update_source_credentials,
         clear_credentials=plugin.clear_source_credentials,
     )
+    # HTTP 契约测试在请求编排结果边界注入替身；完整编排由人工搜索测试覆盖。
+    if hasattr(plugin.search_requests, "search"):
+        controller._search_target = plugin.search_requests.search
+    if hasattr(plugin.search_requests, "submit"):
+        controller._submit_candidate = plugin.search_requests.submit
+    return controller
 
 
 def _task(
@@ -560,7 +567,7 @@ async def test_target_search_plans_delegate_to_source_facade_structured_plans() 
             return ManualSearchResult(session_id=None, target=target, sources=[])
 
     plugin = _ApiPlugin()
-    plugin.manual_search = _ManualSearch()
+    plugin.search_requests = _ManualSearch()
     plugin.source_service = SimpleNamespace(
         statuses=AsyncMock(return_value=[]),
         default_queries=default_queries,
@@ -1104,7 +1111,7 @@ async def test_manual_search_api_requires_recognition_status_without_internal_ev
 
     plugin = _ApiPlugin()
     search = _ManualSearch()
-    plugin.manual_search = search
+    plugin.search_requests = search
     plugin.source_service = SimpleNamespace(
         statuses=AsyncMock(return_value=[]),
         default_queries=lambda source, context: (),
@@ -1173,7 +1180,7 @@ async def test_manual_download_api_maps_submit_domain_failures(
             return submit_result
 
     plugin = _ApiPlugin()
-    plugin.manual_search = _ManualSearch()
+    plugin.search_requests = _ManualSearch()
 
     with pytest.raises(HTTPException) as exc_info:
         await _controller(plugin).download_search_candidate(
@@ -1203,7 +1210,7 @@ async def test_manual_download_api_returns_coordinator_snapshot_without_store_re
             return ManualSubmitResult(status="success", task=task)
 
     plugin = _ApiPlugin()
-    plugin.manual_search = _ManualSearch()
+    plugin.search_requests = _ManualSearch()
 
     response = await _controller(plugin).download_search_candidate(
         "session-1",
@@ -1230,7 +1237,7 @@ async def test_manual_download_api_maps_unexpected_submit_error_to_500() -> None
             raise RuntimeError("secret internal detail")
 
     plugin = _ApiPlugin()
-    plugin.manual_search = _ManualSearch()
+    plugin.search_requests = _ManualSearch()
 
     with pytest.raises(HTTPException) as exc_info:
         await _controller(plugin).download_search_candidate(

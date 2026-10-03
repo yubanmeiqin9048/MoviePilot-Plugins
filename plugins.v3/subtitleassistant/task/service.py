@@ -16,10 +16,13 @@ from app.sdk.logging import logger
 
 from ..attribution import AttributionService
 from ..candidate import admit_automatic_candidates, candidate_rank, describe_rejections
+from ..download import DownloadService
 from ..record import RecordCommitter, SubtitleEventPublisher
+from ..schemas.attribution import PackageAttributionStrategy
 from ..schemas.base import elapsed_ms, utc_now
 from ..schemas.candidate import SubtitleCandidate
 from ..schemas.config import PluginConfig
+from ..schemas.download import DownloadRequest, DownloadResult, DownloadRetention, DownloadStatus
 from ..schemas.event import SubtitleWrittenEvent, SubtitleWrittenOperation
 from ..schemas.file import ExtractedSubtitle
 from ..schemas.record import CommittedFileFact, InventoryConsumeResult, MatchRecord, RecordStatus
@@ -34,25 +37,18 @@ from ..schemas.source import (
 )
 from ..schemas.target import MediaType, PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 from ..schemas.task import (
-    AttemptResult,
-    CandidateAttemptReasonCode,
     SubtitleTask,
     TaskStatus,
     TaskTrigger,
     TaskWorkItem,
 )
+from ..search import SubtitleSearch
 from ..source import (
     SOURCE_NAMES,
     SOURCE_SKIP_REASONS,
     SourceAdministration,
     describe_source_run,
     source_run_is_warning,
-)
-from .attempt import (
-    CandidateAttemptRequest,
-    CandidateAttemptResult,
-    CandidateAttemptService,
-    FailureResultRetention,
 )
 
 
@@ -133,12 +129,12 @@ TRIGGER_NAMES = {
 }
 
 ATTEMPT_RESULT_NAMES = {
-    AttemptResult.SUCCESS: "处理成功",
-    AttemptResult.DOWNLOAD_FAILED: "下载失败",
-    AttemptResult.EXTRACT_FAILED: "解包失败",
-    AttemptResult.NO_MATCH: "没有匹配到当前目标字幕",
-    AttemptResult.WRITE_FAILED: "落盘失败",
-    AttemptResult.INTERRUPTED: "处理已中断",
+    DownloadStatus.SUCCESS: "处理成功",
+    DownloadStatus.DOWNLOAD_FAILED: "下载失败",
+    DownloadStatus.EXTRACT_FAILED: "解包失败",
+    DownloadStatus.NO_MATCH: "没有匹配到当前目标字幕",
+    DownloadStatus.WRITE_FAILED: "落盘失败",
+    DownloadStatus.INTERRUPTED: "处理已中断",
 }
 
 
@@ -152,6 +148,7 @@ class TaskOperations:
         archive: _TaskArchivePort,
         matcher: AttributionService,
         sources: SourceAdministration,
+        search: SubtitleSearch,
         config: PluginConfig,
         inventory: RecordCommitter,
         media_extensions: Sequence[str],
@@ -168,13 +165,14 @@ class TaskOperations:
         self._matcher = matcher
         self._attribution = attributor
         self._sources = sources
+        self._search = search
         self._target_catalog = target_catalog
         self._config = config
         self._inventory = inventory
         self._media_extensions = frozenset(f".{value.lower().lstrip('.')}" for value in media_extensions)
         self._manage_resources = manage_resources
         self._publisher = publisher
-        self._candidate_attempt = CandidateAttemptService(
+        self._download = DownloadService(
             filesystem=self._filesystem,
             archive=self._archive,
             matcher=self._matcher,
@@ -437,7 +435,7 @@ class TaskOperations:
     async def _search_sources(self, task: SubtitleTask, item: TaskWorkItem) -> list[CandidateHandle]:
         """查询共享来源批次，在准入处执行自动漏斗并与当前目标匹配。"""
 
-        batch = await self._sources.query(item.context)
+        batch = await self._search.search(item.context)
         handles: list[CandidateHandle] = []
         self._source_conclusions = []
         for source, result in batch.sources.items():
@@ -704,18 +702,21 @@ class TaskOperations:
         handle: CandidateHandle,
         *,
         operation: SubtitleWrittenOperation | None = None,
-        retention: FailureResultRetention | None = None,
-    ) -> CandidateAttemptResult:
-        """委托候选尝试模块处理单个候选并记录业务结论。"""
+        retention: DownloadRetention | None = None,
+    ) -> DownloadResult:
+        """提供明确策略，委托共享下载能力处理候选并记录结论。"""
 
         operation = operation or item.attempt_operation or SubtitleWrittenOperation.AUTOMATIC_CANDIDATE
-        retention = retention or FailureResultRetention(item.attempt_retention or FailureResultRetention.DISCARD.value)
-        result = await self._candidate_attempt.attempt(
-            CandidateAttemptRequest(
+        retention = retention or DownloadRetention(item.attempt_retention or DownloadRetention.DISCARD.value)
+        result = await self._download.download(
+            DownloadRequest(
                 task_id=task.id,
                 handle=handle,
                 target=item.context,
-                operation=operation,
+                trust_direct_file=(
+                    operation is SubtitleWrittenOperation.MANUAL_CANDIDATE
+                    or self._strategy is PackageAttributionStrategy.TRUST_PACKAGE
+                ),
                 retention=retention,
                 package_attribution_strategy=self._strategy,
                 attempt_number=self._next_attempt_number(),
@@ -727,7 +728,7 @@ class TaskOperations:
             )
         )
         self._log_candidate_attempt(task, handle.candidate, result)
-        if result.result is AttemptResult.INTERRUPTED:
+        if result.result is DownloadStatus.INTERRUPTED:
             await self._publish_committed_files(task, operation, result.committed_files)
             raise asyncio.CancelledError
         return result
@@ -736,17 +737,17 @@ class TaskOperations:
         self,
         task: SubtitleTask,
         candidate: SubtitleCandidate,
-        result: CandidateAttemptResult,
+        result: DownloadResult,
     ) -> None:
         """输出候选处理结论，不在任务中保存产物副本。"""
 
         written_count = sum(1 for record in result.committed_media_records if record.status is RecordStatus.MATCHED)
         log = (
             logger.warning
-            if result.result is not AttemptResult.SUCCESS or result.error_summary and written_count > 0
+            if result.result is not DownloadStatus.SUCCESS or result.error_summary and written_count > 0
             else logger.info
         )
-        if result.result is AttemptResult.SUCCESS:
+        if result.result is DownloadStatus.SUCCESS:
             log(
                 f"{self._task_label(task)}候选尝试成功：{self._candidate_label(candidate)}已落盘 {written_count} 个字幕"
             )
@@ -768,7 +769,7 @@ class TaskOperations:
                 return
             if item.manual_handle is not None:
                 item.attempt_operation = SubtitleWrittenOperation.MANUAL_CANDIDATE
-                item.attempt_retention = FailureResultRetention.PRESERVE.value
+                item.attempt_retention = DownloadRetention.PRESERVE.value
                 candidate_result = await self._try_candidate(task, item, item.manual_handle)
                 media_records = self._normalize_records(candidate_result.committed_media_records)
                 await self._publish_committed_files(
@@ -779,13 +780,13 @@ class TaskOperations:
                 retained_records = self._normalize_records(candidate_result.records)
                 if media_records:
                     await self._finish_task(task, TaskStatus.SUCCESS, "subtitle_written", "人工选择的字幕已落盘")
-                elif retained_records and candidate_result.result is not AttemptResult.WRITE_FAILED:
+                elif retained_records and candidate_result.result is not DownloadStatus.WRITE_FAILED:
                     await self._finish_task(task, TaskStatus.SUCCESS, "subtitle_retained", "人工选择的字幕已安全保留")
                 else:
                     reason_code = (
                         candidate_result.reason_code.value
                         if candidate_result.reason_code is not None
-                        else CandidateAttemptReasonCode.MANUAL_CANDIDATE_FAILED.value
+                        else "manual_candidate_failed"
                     )
                     await self._finish_task(
                         task,
@@ -824,7 +825,7 @@ class TaskOperations:
             attempt_count = 0
             for handle in ordered[: self._config.max_candidate_attempts]:
                 item.attempt_operation = SubtitleWrittenOperation.AUTOMATIC_CANDIDATE
-                item.attempt_retention = FailureResultRetention.DISCARD.value
+                item.attempt_retention = DownloadRetention.DISCARD.value
                 attempt_count += 1
                 candidate_result = await self._try_candidate(task, item, handle)
                 records = self._normalize_records(candidate_result.committed_media_records)

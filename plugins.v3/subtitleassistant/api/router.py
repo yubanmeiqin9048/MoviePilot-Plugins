@@ -17,8 +17,11 @@ from app.api.dependencies.auth import (
     get_current_active_superuser_async,
 )
 from app.schemas import Response
+from app.sdk.logging import logger
 
+from ..attribution import AttributionService
 from ..record import RecordCatalog, RecordFilePort, RecordMaintenance
+from ..schemas.candidate import CandidateRecognition, CandidateRecognitionStatus
 from ..schemas.http.page import PageSize
 from ..schemas.http.record import (
     BatchRecordDeletePreflightItem,
@@ -57,11 +60,13 @@ from ..schemas.record import (
     RecordStatus,
     RetargetMapping,
 )
-from ..schemas.source import SubtitleSource
-from ..schemas.task import SubtitleTask, TaskStatus
-from ..search import ManualSearch
-from ..source import SourceAdministration
-from ..target import TargetCatalog
+from ..schemas.search import ManualSearchResult, ManualSourceView, SearchSelectionError
+from ..schemas.source import CandidateHandle, SourceSearchResult, SubtitleSource
+from ..schemas.target import SearchTarget
+from ..schemas.task import ManualSubmitResult, ManualSubmitStatus, SubtitleTask, TaskStatus, TaskWorkItem
+from ..search import SearchSessions, SubtitleSearch
+from ..source import SOURCE_NAMES, SourceAdministration, describe_source_run, source_run_is_warning
+from ..target import MediaResolver, TargetCatalog, enrich_search_target
 from ..task import TaskOperations
 from .projection import source_item, target_item
 
@@ -79,10 +84,13 @@ class ApiController:
         maintenance: RecordMaintenance,
         filesystem: RecordFilePort,
         targets: TargetCatalog,
-        search: ManualSearch,
+        search: SubtitleSearch,
+        sessions: SearchSessions,
+        matcher: AttributionService,
         sources: SourceAdministration,
         update_credentials: Callable[[SubtitleSource, dict[str, str]], Awaitable[bool]],
         clear_credentials: Callable[[SubtitleSource], Awaitable[bool]],
+        media_resolver: MediaResolver | None = None,
     ) -> None:
         """创建仅依赖能力 facade 与文件路径 adapter 的 HTTP 控制器。"""
 
@@ -92,6 +100,9 @@ class ApiController:
         self._filesystem = filesystem
         self._targets = targets
         self._search = search
+        self._sessions = sessions
+        self._matcher = matcher
+        self._media_resolver = media_resolver
         self._sources = sources
         self._update_credentials = update_credentials
         self._clear_credentials = clear_credentials
@@ -419,6 +430,98 @@ class ApiController:
             total=result.total,
         )
 
+    def _annotate_candidates(
+        self,
+        run: SourceSearchResult,
+        target: SearchTarget,
+    ) -> tuple[list[CandidateRecognition], list[CandidateHandle]]:
+        """对手动来源候选逐条执行识别标注，不筛除任何候选。"""
+
+        recognitions: list[CandidateRecognition] = []
+        handles: list[CandidateHandle] = []
+        for handle in run.candidates:
+            try:
+                recognition = self._matcher.recognize_candidate(
+                    handle.candidate,
+                    target.context,
+                    target.match_context,
+                )
+            except Exception:  # noqa: BLE001 - 单候选异常必须降级且保留会话
+                recognition = CandidateRecognition(
+                    candidate=handle.candidate.model_copy(deep=True),
+                    status=CandidateRecognitionStatus.UNRECOGNIZED,
+                )
+                logger.warning(f"人工字幕搜索候选 {handle.candidate.candidate_key} 识别异常，已按未识别候选保留")
+            recognitions.append(recognition)
+            handles.append(CandidateHandle(candidate=recognition.candidate, download_handle=handle.download_handle))
+        return recognitions, handles
+
+    @staticmethod
+    def _log_source_result(history_id: int, run: SourceSearchResult) -> None:
+        """为一次人工来源搜索记录归一后的中文业务结论。"""
+
+        log = logger.warning if source_run_is_warning(run) else logger.info
+        prefix = f"整理历史 {history_id} 的人工字幕搜索 {SOURCE_NAMES[run.source]} "
+        log(f"{prefix}{describe_source_run(run)}")
+
+    async def _search_target(
+        self,
+        history_id: int,
+        custom_queries: dict[SubtitleSource | str, str | None] | None = None,
+    ) -> ManualSearchResult:
+        """批量查询三个来源，有候选时创建三十分钟短期会话。"""
+
+        target = await self._targets.get_target(history_id)
+        if target is None:
+            raise LookupError("目标整理历史不存在或已不可用")
+        target = await enrich_search_target(target, self._media_resolver)
+        values = custom_queries or {}
+        ordered_sources = list(SubtitleSource)
+        normalized_queries = {source: values.get(source, values.get(source.value)) for source in ordered_sources}
+        batch = await self._search.search(target.context, normalized_queries)
+        runs = [batch.sources[source] for source in ordered_sources]
+        for run in runs:
+            self._log_source_result(history_id, run)
+        recognitions_by_run: list[list[CandidateRecognition]] = []
+        handles_by_run: list[list[CandidateHandle]] = []
+        for run in runs:
+            recognitions, handles = self._annotate_candidates(run, target)
+            recognitions_by_run.append(recognitions)
+            handles_by_run.append(handles)
+        session_id = await self._sessions.create(target, [handle for handles in handles_by_run for handle in handles])
+        views = [
+            ManualSourceView(run=run, candidates=recognitions)
+            for run, recognitions in zip(runs, recognitions_by_run, strict=True)
+        ]
+        candidate_count = sum(len(item.candidates) for item in runs)
+        if session_id:
+            logger.info(
+                f"整理历史 {history_id} 的人工字幕搜索完成，共返回 {candidate_count} 个候选，搜索会话为 {session_id}"
+            )
+        else:
+            logger.warning(f"整理历史 {history_id} 的人工字幕搜索完成，但三个来源都没有返回可下载候选")
+        return ManualSearchResult(session_id=session_id, target=target, sources=views)
+
+    async def _submit_candidate(self, session_id: str, candidate_key: str) -> ManualSubmitResult:
+        """解析人工选择后交给任务能力提交，搜索不持有任务依赖。"""
+
+        selection = await self._sessions.resolve(session_id, candidate_key)
+        if isinstance(selection, SearchSelectionError):
+            return ManualSubmitResult(status=ManualSubmitStatus(selection.value))
+        target = selection.target
+        task = await self._tasks.enqueue(
+            TaskWorkItem(
+                context=target.context,
+                match_context=target.match_context,
+                target_history_id=target.history_id,
+                history_target=True,
+                manual_handle=selection.candidate,
+            )
+        )
+        if task is None:
+            return ManualSubmitResult(status=ManualSubmitStatus.REJECTED)
+        return ManualSubmitResult(status=ManualSubmitStatus.SUCCESS, task=task)
+
     async def search_subtitles(
         self,
         payload: ManualSearchRequest,
@@ -427,7 +530,7 @@ class ApiController:
         """并发执行三源人工字幕搜索。"""
 
         try:
-            result = await self._search.search(
+            result = await self._search_target(
                 int(payload.target_history_id),
                 {
                     SubtitleSource.MOVIEPILOT: payload.moviepilot_keyword,
@@ -449,10 +552,10 @@ class ApiController:
         payload: ManualDownloadRequest,
         _: Any = Depends(get_current_active_manage_user_async),  # noqa: B008 - FastAPI 依赖注入
     ) -> ManualDownloadResponse:
-        """把人工选定候选交给人工搜索应用服务并映射稳定结果。"""
+        """校验人工选择并提交下载任务，映射为稳定 HTTP 结果。"""
 
         try:
-            result = await self._search.submit(session_id, payload.candidate_key)
+            result = await self._submit_candidate(session_id, payload.candidate_key)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

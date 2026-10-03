@@ -1,4 +1,4 @@
-"""人工字幕搜索来源与会话应用服务测试。"""
+"""人工搜索请求编排与会话行为测试。"""
 
 from __future__ import annotations
 
@@ -31,12 +31,35 @@ from app.plugins.subtitleassistant.schemas.source import (
 )
 from app.plugins.subtitleassistant.schemas.target import MediaType, SearchTarget, SubtitleTarget
 from app.plugins.subtitleassistant.schemas.task import SubtitleTask
-from app.plugins.subtitleassistant.search import ManualSearch
-from app.plugins.subtitleassistant.search import service as searches_module
-from app.plugins.subtitleassistant.search.service import ManualSearchSession
+from app.plugins.subtitleassistant.api import ApiController
+from app.plugins.subtitleassistant.api import router as requests_module
+from app.plugins.subtitleassistant.search import SubtitleSearch, SearchSessions
+from app.plugins.subtitleassistant.search import session as searches_module
+from app.plugins.subtitleassistant.search.session import SearchSession
 from app.plugins.subtitleassistant.target import TargetCatalog
 
 pytestmark = pytest.mark.anyio
+
+
+def _controller(
+    *,
+    targets: Any,
+    candidate_pool: Any,
+    matcher: Any,
+    cache: Any = None,
+    coordinator: Any = None,
+    media_resolver: Any = None,
+) -> ApiController:
+    """绕过生命周期，仅装配人工搜索和任务提交所需的能力。"""
+
+    controller = object.__new__(ApiController)
+    controller._targets = targets
+    controller._search = SubtitleSearch(candidate_pool)
+    controller._sessions = SearchSessions(cache)
+    controller._matcher = matcher
+    controller._tasks = coordinator
+    controller._media_resolver = media_resolver
+    return controller
 
 
 @pytest.fixture
@@ -421,7 +444,7 @@ async def test_manual_search_service_groups_partial_results_and_caches_handles()
             )
 
     coordinator = _ManualCoordinator()
-    service = ManualSearch(
+    service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         matcher=AttributionService(),
@@ -429,11 +452,11 @@ async def test_manual_search_service_groups_partial_results_and_caches_handles()
         coordinator=coordinator,
     )
 
-    result = await service.search(7, custom_queries={})
+    result = await service._search_target(7, custom_queries={})
 
     assert result.session_id
     assert [run.run.source for run in result.sources] == list(SubtitleSource)
-    submitted = await service.submit(result.session_id, handle.candidate.candidate_key)
+    submitted = await service._submit_candidate(result.session_id, handle.candidate.candidate_key)
     assert submitted.status == "success"
     assert submitted.task is not None
     assert coordinator.items[0].manual_handle.download_handle == handle.download_handle
@@ -498,14 +521,14 @@ async def test_manual_search_uses_shared_candidate_pool_instead_of_source_search
                 }
             )
 
-    service = ManualSearch(
+    service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         matcher=AttributionService(),
         cache=_FakeCache(),
     )
 
-    result = await service.search(7, custom_queries={SubtitleSource.MOVIEPILOT: ""})
+    result = await service._search_target(7, custom_queries={SubtitleSource.MOVIEPILOT: ""})
 
     assert result.session_id is not None
     assert result.sources[0].run.matched_query == "共享查询"
@@ -532,7 +555,7 @@ async def test_manual_search_session_cache_uses_host_async_cache_factory(
         return cache
 
     monkeypatch.setattr(searches_module, "AsyncCache", fake_async_cache)
-    service = ManualSearch(
+    service = _controller(
         targets=object(),
         candidate_pool=object(),
         matcher=object(),
@@ -637,7 +660,7 @@ async def test_manual_search_keeps_recognized_and_unrecognized_candidates_downlo
 
     cache = _FakeCache()
     coordinator = _ManualCoordinator()
-    service = ManualSearch(
+    service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         cache=cache,
@@ -645,7 +668,7 @@ async def test_manual_search_keeps_recognized_and_unrecognized_candidates_downlo
         coordinator=coordinator,
     )
 
-    result = await service.search(7)
+    result = await service._search_target(7)
 
     candidates = result.sources[0].candidates
     assert [item.candidate.candidate_key for item in candidates] == [
@@ -664,20 +687,20 @@ async def test_manual_search_keeps_recognized_and_unrecognized_candidates_downlo
     assert candidates[1].candidate.episodes == [4]
     assert result.session_id is not None
     for handle in handles:
-        submitted = await service.submit(result.session_id, handle.candidate.candidate_key)
+        submitted = await service._submit_candidate(result.session_id, handle.candidate.candidate_key)
         assert submitted.status == "success"
         assert coordinator.items[-1].manual_handle.download_handle == handle.download_handle
 
-    invalid = await service.submit("invalid", "moviepilot:recognized")
+    invalid = await service._submit_candidate("invalid", "moviepilot:recognized")
     assert invalid.status == "session_not_found"
-    missing = await service.submit(result.session_id, "moviepilot:missing")
+    missing = await service._submit_candidate(result.session_id, "moviepilot:missing")
     assert missing.status == "candidate_not_found"
     assert cache.set_calls[-1][1] == 30 * 60
 
     stored = next(
         value for (region, _key), value in cache.values.items() if region == searches_module.SEARCH_SESSION_REGION
     )
-    assert isinstance(stored, ManualSearchSession)
+    assert isinstance(stored, SearchSession)
     assert not hasattr(stored, "session_id")
     assert not hasattr(stored, "target_session_id")
     stored_candidate = stored.candidates["moviepilot:recognized"]
@@ -686,21 +709,21 @@ async def test_manual_search_keeps_recognized_and_unrecognized_candidates_downlo
     assert not hasattr(stored_candidate, "target")
 
     rejecting = _ManualCoordinator(reject=True)
-    rejecting_service = ManualSearch(
+    rejecting_service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         matcher=_ExplodingMatcher(),
         cache=cache,
         coordinator=rejecting,
     )
-    rejected = await rejecting_service.submit(result.session_id, "moviepilot:recognized")
+    rejected = await rejecting_service._submit_candidate(result.session_id, "moviepilot:recognized")
     assert rejected.status == "rejected"
     cache.expired = True
-    expired = await service.submit(result.session_id, "moviepilot:recognized")
+    expired = await service._submit_candidate(result.session_id, "moviepilot:recognized")
     assert expired.status == "session_not_found"
     cache.expired = False
 
-    bad_candidate = await service.submit(result.session_id, "")
+    bad_candidate = await service._submit_candidate(result.session_id, "")
     assert bad_candidate.status == "candidate_not_found"
 
 
@@ -759,14 +782,14 @@ async def test_manual_session_shape_deduplicates_target_and_session_id() -> None
             )
 
     cache = _FakeCache()
-    service = ManualSearch(
+    service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         matcher=AttributionService(),
         cache=cache,
     )
 
-    result = await service.search(7)
+    result = await service._search_target(7)
     assert result.session_id is not None
 
     stored = next(
@@ -778,7 +801,7 @@ async def test_manual_session_shape_deduplicates_target_and_session_id() -> None
 
 
 async def test_manual_chain_keeps_candidates_that_automatic_admission_would_reject() -> None:
-    """准入是唯一分叉点：手动链全量展示并被自动准入拒绝的候选，仍可提交。"""
+    """手动链全量展示被自动准入拒绝的候选，仍可提交。"""
 
     target = SearchTarget(
         history_id=7,
@@ -838,7 +861,7 @@ async def test_manual_chain_keeps_candidates_that_automatic_admission_would_reje
     assert rejected == {"language": 1}
 
     coordinator = _ManualCoordinator()
-    service = ManualSearch(
+    service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         matcher=AttributionService(),
@@ -846,12 +869,12 @@ async def test_manual_chain_keeps_candidates_that_automatic_admission_would_reje
         coordinator=coordinator,
     )
 
-    result = await service.search(7)
+    result = await service._search_target(7)
 
     assert result.session_id is not None
     manual_candidates = result.sources[1].candidates
     assert [item.candidate.candidate_key for item in manual_candidates] == ["opensubtitles:english-only"]
-    submitted = await service.submit(result.session_id, "opensubtitles:english-only")
+    submitted = await service._submit_candidate(result.session_id, "opensubtitles:english-only")
     assert submitted.status == "success"
     assert coordinator.items[-1].manual_handle.download_handle == english_only.download_handle
 
@@ -933,18 +956,18 @@ async def test_manual_search_logs_each_source_with_chinese_semantics(
 
     logs = _Logs()
     monkeypatch.setattr(
-        searches_module,
+        requests_module,
         "logger",
         SimpleNamespace(info=logs.info_log, warning=logs.warning_log),
     )
-    service = ManualSearch(
+    service = _controller(
         targets=_Targets(),
         candidate_pool=_CandidatePool(),
         matcher=AttributionService(),
         cache=_FakeCache(),
     )
 
-    result = await service.search(7, custom_queries={})
+    result = await service._search_target(7, custom_queries={})
 
     assert result.session_id
     messages = logs.info + logs.warning
@@ -954,7 +977,7 @@ async def test_manual_search_logs_each_source_with_chinese_semantics(
     assert any("共返回 1 个候选" in item for item in messages)
     assert not any("event=" in item or "source=" in item or "status=" in item for item in messages)
 
-    ManualSearch._log_source_result(
+    ApiController._log_source_result(
         7,
         SourceSearchResult(
             source=SubtitleSource.MOVIEPILOT,

@@ -16,7 +16,8 @@ from app.plugins.subtitleassistant.schemas.candidate import PackageScope, Subtit
 from app.plugins.subtitleassistant.schemas.record import FileLocation, RecordStatus
 from app.plugins.subtitleassistant.schemas.source import SourceHealth, SubtitleSource
 from app.plugins.subtitleassistant.schemas.target import MediaType
-from app.plugins.subtitleassistant.schemas.task import AttemptResult, TaskStatus
+from app.plugins.subtitleassistant.schemas.download import DownloadStatus
+from app.plugins.subtitleassistant.schemas.task import TaskStatus
 
 
 def _candidate(candidate_key: str, **overrides: Any) -> SubtitleCandidate:
@@ -47,7 +48,7 @@ def test_enum_values_are_stable_api_contracts() -> None:
         SourceHealth: ["pending", "healthy", "limited", "error", "disabled"],
         FileLocation: ["media_directory", "plugin_data"],
         MediaType: ["movie", "tv", "unknown"],
-        AttemptResult: [
+        DownloadStatus: [
             "success",
             "download_failed",
             "extract_failed",

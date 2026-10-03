@@ -25,7 +25,7 @@ from ..schemas.attribution import (
 )
 from ..schemas.candidate import SubtitleCandidate
 from ..schemas.config import PluginConfig
-from ..schemas.event import SubtitleWrittenOperation
+from ..schemas.download import DownloadReasonCode, DownloadRequest, DownloadResult, DownloadRetention, DownloadStatus
 from ..schemas.file import ExtractedSubtitle
 from ..schemas.record import (
     CommittedFileFact,
@@ -36,16 +36,8 @@ from ..schemas.record import (
 from ..schemas.source import CandidateHandle, DownloadedAsset
 from ..schemas.target import (
     MediaType,
-    PathMappingSnapshot,
     SubtitleDestination,
     SubtitleTarget,
-)
-from ..schemas.task import (
-    AttemptResult,
-    CandidateAttemptReasonCode,
-)
-from ..schemas.task import (
-    _CandidateAttemptRetention as FailureResultRetention,
 )
 from ..source import SourceAdministration
 
@@ -59,44 +51,13 @@ class AttributedSubtitle:
 
 
 @dataclass(frozen=True, slots=True)
-class CandidateAttemptRequest:
-    """候选尝试所需的冻结输入，不持有任务或人工会话实体。"""
-
-    task_id: str
-    handle: CandidateHandle
-    target: SubtitleTarget
-    operation: SubtitleWrittenOperation
-    retention: FailureResultRetention
-    package_attribution_strategy: PackageAttributionStrategy
-    attempt_number: int
-    target_history_id: int | None = None
-    history_target_path: Path | None = None
-    matched_path_mapping: PathMappingSnapshot | None = None
-    target_file_exists: bool | None = None
-    destination: SubtitleDestination | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateAttemptResult:
-    """候选尝试返回的唯一业务结论。"""
-
-    records: tuple[MatchRecord, ...]
-    result: AttemptResult
-    reason_code: CandidateAttemptReasonCode | None = None
-    error_summary: str | None = None
-    committed_media_records: tuple[MatchRecord, ...] = ()
-    committed_files: tuple[CommittedFileFact, ...] = ()
-    warnings: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class _CandidateWriteResult:
     """单个候选字幕写入的结构化结果。"""
 
     record: MatchRecord | None = None
     committed_file: CommittedFileFact | None = None
     error_summary: str | None = None
-    reason_code: CandidateAttemptReasonCode | None = None
+    reason_code: DownloadReasonCode | None = None
 
 
 class _AttemptPhase(StrEnum):
@@ -108,7 +69,7 @@ class _AttemptPhase(StrEnum):
     WRITE = "write"
 
 
-class CandidateAttemptFileSystemPort(Protocol):
+class DownloadFileSystemPort(Protocol):
     """候选尝试所需的字幕文件操作能力。"""
 
     async def make_task_directory(self, task_id: str) -> Path:
@@ -120,7 +81,7 @@ class CandidateAttemptFileSystemPort(Protocol):
         """检查目标字幕目录是否可用。"""
 
 
-class CandidateAttemptArchivePort(Protocol):
+class DownloadArchivePort(Protocol):
     """候选尝试所需的字幕归档解包能力。"""
 
     async def extract(
@@ -132,11 +93,11 @@ class CandidateAttemptArchivePort(Protocol):
         """解包下载结果并返回受支持的字幕文件。"""
 
 
-_PHASE_RESULTS: Mapping[_AttemptPhase, AttemptResult] = {
-    _AttemptPhase.DOWNLOAD: AttemptResult.DOWNLOAD_FAILED,
-    _AttemptPhase.EXTRACT: AttemptResult.EXTRACT_FAILED,
-    _AttemptPhase.MATCH: AttemptResult.NO_MATCH,
-    _AttemptPhase.WRITE: AttemptResult.WRITE_FAILED,
+_PHASE_RESULTS: Mapping[_AttemptPhase, DownloadStatus] = {
+    _AttemptPhase.DOWNLOAD: DownloadStatus.DOWNLOAD_FAILED,
+    _AttemptPhase.EXTRACT: DownloadStatus.EXTRACT_FAILED,
+    _AttemptPhase.MATCH: DownloadStatus.NO_MATCH,
+    _AttemptPhase.WRITE: DownloadStatus.WRITE_FAILED,
 }
 
 _PHASE_NAMES: Mapping[_AttemptPhase, str] = {
@@ -150,13 +111,13 @@ CandidateLabel = Callable[[SubtitleCandidate], str]
 TaskLabel = Callable[[str], str]
 
 
-class CandidateAttemptService:
+class DownloadService:
     """处理一个字幕候选，不读取任务触发方式或任务队列状态。"""
 
     def __init__(
         self,
-        filesystem: CandidateAttemptFileSystemPort,
-        archive: CandidateAttemptArchivePort,
+        filesystem: DownloadFileSystemPort,
+        archive: DownloadArchivePort,
         matcher: AttributionService,
         sources: SourceAdministration,
         config: PluginConfig,
@@ -178,14 +139,14 @@ class CandidateAttemptService:
         self._task_label = task_label or (lambda task_id: f"任务 {task_id}")
         self._candidate_label = candidate_label or (lambda candidate: f"候选“{candidate.name}”")
 
-    async def attempt(self, request: CandidateAttemptRequest) -> CandidateAttemptResult:
+    async def download(self, request: DownloadRequest) -> DownloadResult:
         """执行单个候选的下载、解包、归属和落盘并返回业务结论。"""
 
         context = request.target
         handle = request.handle
         retention = request.retention
         candidate = handle.candidate
-        attempt_result = AttemptResult.NO_MATCH
+        attempt_result = DownloadStatus.NO_MATCH
         error_summary: str | None = None
         active_phase = _AttemptPhase.DOWNLOAD
         selected_results: list[AttributedSubtitle] = []
@@ -196,30 +157,19 @@ class CandidateAttemptService:
         preserved_records: list[MatchRecord] = []
         warnings: list[str] = []
         first_write_failure_seen = False
-        write_reason_code: CandidateAttemptReasonCode | None = None
-
-        def result_reason_code(
-            reason_code: CandidateAttemptReasonCode | None,
-        ) -> CandidateAttemptReasonCode | None:
-            """把通用失败收敛为保留策略对应的人工失败原因。"""
-
-            if reason_code is not None or retention is FailureResultRetention.DISCARD:
-                return reason_code
-            if attempt_result is AttemptResult.INTERRUPTED:
-                return None
-            return CandidateAttemptReasonCode.MANUAL_CANDIDATE_FAILED
+        write_reason_code: DownloadReasonCode | None = None
 
         def conclude(
             records: Sequence[MatchRecord],
-            reason_code: CandidateAttemptReasonCode | None,
+            reason_code: DownloadReasonCode | None,
             committed: Sequence[CommittedFileFact] = (),
-        ) -> CandidateAttemptResult:
+        ) -> DownloadResult:
             """把业务记录、终态原因与已提交文件收敛为候选结论。"""
 
-            return CandidateAttemptResult(
+            return DownloadResult(
                 records=(*records, *preserved_records),
                 result=attempt_result,
-                reason_code=result_reason_code(reason_code),
+                reason_code=reason_code,
                 error_summary=error_summary,
                 committed_media_records=tuple(records),
                 committed_files=tuple(committed),
@@ -240,7 +190,7 @@ class CandidateAttemptService:
             archive_extensions = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "cab", "iso"}
             allowed_extensions = {value.lower().lstrip(".") for value in self.config.format_priority}
             if (
-                retention is FailureResultRetention.PRESERVE
+                retention is DownloadRetention.PRESERVE
                 and asset_extension not in allowed_extensions | archive_extensions
             ):
                 unsupported = AttributedSubtitle(
@@ -265,13 +215,13 @@ class CandidateAttemptService:
                     bind_target=True,
                 )
                 preserved_records.append(record)
-                attempt_result = AttemptResult.NO_MATCH
+                attempt_result = DownloadStatus.NO_MATCH
                 error_summary = "字幕格式未知或不受宿主支持，文件已保存为未匹配"
                 logger.warning(
                     f"{self._task_label(request.task_id)}下载的文件“{asset.file_name}”格式不受宿主支持，"
                     f"已保存为未匹配记录 {record.id}"
                 )
-                return conclude([], CandidateAttemptReasonCode.UNSUPPORTED_FORMAT)
+                return conclude([], DownloadReasonCode.UNSUPPORTED_FORMAT)
 
             active_phase = _AttemptPhase.EXTRACT
             extracted_files = await self.archive.extract(
@@ -280,7 +230,7 @@ class CandidateAttemptService:
                 set(self.config.format_priority),
             )
             if not extracted_files:
-                attempt_result = AttemptResult.NO_MATCH
+                attempt_result = DownloadStatus.NO_MATCH
                 error_summary = "候选包没有允许格式字幕"
                 return conclude([], None)
             logger.info(
@@ -295,8 +245,8 @@ class CandidateAttemptService:
                 extracted_files,
             )
             if not selected_results:
-                attempt_result = AttemptResult.NO_MATCH
-                if retention is FailureResultRetention.PRESERVE:
+                attempt_result = DownloadStatus.NO_MATCH
+                if retention is DownloadRetention.PRESERVE:
                     saved, save_warnings = await self._save_additional_results(
                         request,
                         context,
@@ -308,9 +258,9 @@ class CandidateAttemptService:
                     error_summary = "候选包未找到当前目标字幕，其他有效结果已保留"
                 else:
                     error_summary = "候选包未找到当前目标字幕"
-                return conclude([], CandidateAttemptReasonCode.CANDIDATE_MISSING_TARGET_SUBTITLE)
+                return conclude([], DownloadReasonCode.CANDIDATE_MISSING_TARGET_SUBTITLE)
 
-            if retention is FailureResultRetention.PRESERVE:
+            if retention is DownloadRetention.PRESERVE:
                 directory_available, directory_error = await self.filesystem.target_directory_status(
                     context.target_path, request.destination
                 )
@@ -323,9 +273,9 @@ class CandidateAttemptService:
                     )
                     preserved_records.extend(saved)
                     warnings.extend(save_warnings)
-                    attempt_result = AttemptResult.WRITE_FAILED
+                    attempt_result = DownloadStatus.WRITE_FAILED
                     error_summary = f"目标目录不可用：{directory_error or '无法写入'}，下载结果已保留"
-                    return conclude([], CandidateAttemptReasonCode.TARGET_DIRECTORY_UNAVAILABLE)
+                    return conclude([], DownloadReasonCode.TARGET_DIRECTORY_UNAVAILABLE)
 
             active_phase = _AttemptPhase.WRITE
             write_errors: list[str] = []
@@ -354,9 +304,9 @@ class CandidateAttemptService:
                     f"匹配记录为 {record.id}"
                 )
             if not written_records:
-                attempt_result = AttemptResult.WRITE_FAILED
+                attempt_result = DownloadStatus.WRITE_FAILED
                 error_summary = write_errors[0] if write_errors else "没有形成已匹配记录"
-                if retention is FailureResultRetention.PRESERVE:
+                if retention is DownloadRetention.PRESERVE:
                     saved, save_warnings = await self._save_additional_results(
                         request,
                         context,
@@ -379,15 +329,15 @@ class CandidateAttemptService:
             )
             preserved_records.extend(saved)
             warnings.extend(save_warnings)
-            attempt_result = AttemptResult.SUCCESS
+            attempt_result = DownloadStatus.SUCCESS
             return conclude(written_records, None, committed_files)
         except asyncio.CancelledError:
-            attempt_result = AttemptResult.INTERRUPTED
+            attempt_result = DownloadStatus.INTERRUPTED
             return conclude(written_records, None, committed_files)
         except FileExistsError:
-            attempt_result = AttemptResult.WRITE_FAILED
+            attempt_result = DownloadStatus.WRITE_FAILED
             error_summary = "目标字幕已存在，未覆盖"
-            if retention is FailureResultRetention.PRESERVE and selected_results:
+            if retention is DownloadRetention.PRESERVE and selected_results:
                 try:
                     saved, save_warnings = await self._save_additional_results(
                         request,
@@ -400,15 +350,11 @@ class CandidateAttemptService:
                     error_summary = "目标字幕已存在，下载结果已保留"
                 except Exception as exc:  # noqa: BLE001 - 保留下载结果失败应返回安全失败
                     error_summary = f"目标字幕已存在，下载结果保留失败：{type(exc).__name__}"
-            return conclude(written_records, CandidateAttemptReasonCode.SUBTITLE_DESTINATION_CONFLICT, committed_files)
+            return conclude(written_records, DownloadReasonCode.SUBTITLE_DESTINATION_CONFLICT, committed_files)
         except OSError as exc:
-            attempt_result = AttemptResult.WRITE_FAILED
+            attempt_result = DownloadStatus.WRITE_FAILED
             error_summary = f"文件操作失败：{type(exc).__name__}"
-            if (
-                retention is FailureResultRetention.PRESERVE
-                and active_phase is _AttemptPhase.WRITE
-                and selected_results
-            ):
+            if retention is DownloadRetention.PRESERVE and active_phase is _AttemptPhase.WRITE and selected_results:
                 try:
                     saved, save_warnings = await self._save_additional_results(
                         request,
@@ -436,7 +382,7 @@ class CandidateAttemptService:
 
     async def _candidate_files(
         self,
-        request: CandidateAttemptRequest,
+        request: DownloadRequest,
         context: SubtitleTarget,
         handle: CandidateHandle,
         files: list[ExtractedSubtitle],
@@ -447,10 +393,7 @@ class CandidateAttemptService:
         snapshot = self.matcher.candidate_snapshot(candidate)
         attributed: list[AttributedSubtitle] = []
         other_media_count = 0
-        use_direct_file_evidence = (
-            request.operation is SubtitleWrittenOperation.MANUAL_CANDIDATE
-            or request.package_attribution_strategy is PackageAttributionStrategy.TRUST_PACKAGE
-        )
+        use_direct_file_evidence = request.trust_direct_file
         host_file_count = sum(1 for extracted in files if not extracted.is_direct_file or not use_direct_file_evidence)
         if request.package_attribution_strategy is PackageAttributionStrategy.HOST_RECOGNITION and host_file_count:
             logger.info(
@@ -542,7 +485,7 @@ class CandidateAttemptService:
 
     async def _make_record(
         self,
-        request: CandidateAttemptRequest,
+        request: DownloadRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         result: AttributedSubtitle,
@@ -609,7 +552,7 @@ class CandidateAttemptService:
 
     async def _write_candidate_file(
         self,
-        request: CandidateAttemptRequest,
+        request: DownloadRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         result: AttributedSubtitle,
@@ -639,7 +582,7 @@ class CandidateAttemptService:
         except FileExistsError:
             return _CandidateWriteResult(
                 error_summary="目标字幕已存在，未覆盖",
-                reason_code=CandidateAttemptReasonCode.SUBTITLE_DESTINATION_CONFLICT,
+                reason_code=DownloadReasonCode.SUBTITLE_DESTINATION_CONFLICT,
             )
         except OSError as exc:
             return _CandidateWriteResult(error_summary=f"文件操作失败：{type(exc).__name__}")
@@ -662,7 +605,7 @@ class CandidateAttemptService:
 
     async def _save_plugin_result(
         self,
-        request: CandidateAttemptRequest,
+        request: DownloadRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         result: AttributedSubtitle,
@@ -688,7 +631,7 @@ class CandidateAttemptService:
 
     async def _save_additional_results(
         self,
-        request: CandidateAttemptRequest,
+        request: DownloadRequest,
         context: SubtitleTarget,
         candidate: SubtitleCandidate,
         results: list[AttributedSubtitle],

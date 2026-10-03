@@ -14,6 +14,7 @@ CAPABILITIES = {
     "candidate",
     "config",
     "event",
+    "download",
     "file",
     "plugin",
     "record",
@@ -60,7 +61,8 @@ INTERFACES = {
     "attribution": {"AttributionService"},
     "record": {"RecordCatalog", "RecordCommitter", "RecordMaintenance"},
     "task": {"TaskOperations"},
-    "search": {"ManualSearch"},
+    "search": {"SubtitleSearch", "SearchSessions"},
+    "download": {"DownloadService"},
     "config": {"load_config", "public_config"},
     "file": {"ArchiveExtractor", "SubtitleFiles"},
     "store": {"PluginDataStore", "StoreInitializationError"},
@@ -117,8 +119,8 @@ SCHEMA_EXPORTS = {
     "search": {
         "ManualSearchResult",
         "ManualSourceView",
-        "ManualSubmitResult",
-        "ManualSubmitStatus",
+        "SearchSelection",
+        "SearchSelectionError",
     },
     "source": {
         "AssrtDownloadHandle",
@@ -146,9 +148,10 @@ SCHEMA_EXPORTS = {
         "SearchTarget",
         "SubtitleTarget",
     },
+    "download": {"DownloadStatus", "DownloadReasonCode", "DownloadRetention", "DownloadRequest", "DownloadResult"},
     "task": {
-        "AttemptResult",
-        "CandidateAttemptReasonCode",
+        "ManualSubmitResult",
+        "ManualSubmitStatus",
         "SubtitleTask",
         "TaskStatus",
         "TaskTrigger",
@@ -203,9 +206,10 @@ ALLOWLIST = {
     "target": {"schemas"},
     "attribution": {"schemas"},
     "record": {"schemas", "candidate", "file", "target"},
-    "task": {"schemas", "candidate", "source", "target", "attribution", "record", "file"},
-    "search": {"schemas", "source", "target", "attribution"},
-    "api": {"schemas", "task", "record", "target", "search", "source"},
+    "task": {"schemas", "candidate", "source", "target", "attribution", "record", "file", "search", "download"},
+    "download": {"schemas", "source", "attribution", "record"},
+    "search": {"schemas", "source"},
+    "api": {"schemas", "task", "record", "target", "search", "source", "attribution"},
     "plugin": CAPABILITIES - {"plugin"},
 }
 STABLE_HOST_SDK_MODULES = {
@@ -222,7 +226,7 @@ STABLE_HOST_SDK_MODULES = {
 HOST_CAPABILITIES = {"root", "plugin", "api", "store", "event", "source", "target", "attribution", "search"}
 TEST_IMPLEMENTATION_EXCEPTIONS = {
     "tests/test_external_sources.py": {"source.assrt", "source.limiter", "source.opensubtitles"},
-    "tests/test_manual_search.py": {"search.service"},
+    "tests/test_manual_search.py": {"search.session", "api.router"},
     "tests/test_matching.py": {"attribution.matching"},
     "tests/test_moviepilot_source.py": {"source.base", "source.common", "source.moviepilot"},
     "tests/test_path_mapping.py": {"target.mapping"},
@@ -455,11 +459,12 @@ def _defined_functions(path: Path) -> set[str]:
     }
 
 
-def test_manual_and_automatic_chains_share_search_prefix_and_fork_only_at_admission() -> None:
-    """自动链与手动链共用目标投影、来源 facade 与来源结论文案，只在准入处分叉。"""
+def test_manual_and_automatic_chains_share_search_without_merging_business_rules() -> None:
+    """两条业务链共用搜索能力，准入、识别与任务提交保留在各自入口。"""
 
     automatic = ROOT / "task" / "service.py"
-    manual = ROOT / "search" / "service.py"
+    manual = ROOT / "api" / "router.py"
+    shared = ROOT / "search" / "service.py"
     event_runtime = ROOT / "plugin" / "runtime.py"
     automatic_names = _plugin_import_names(automatic)
     manual_names = _plugin_import_names(manual)
@@ -467,9 +472,10 @@ def test_manual_and_automatic_chains_share_search_prefix_and_fork_only_at_admiss
     # 两链都经 target 包投影获得 match_context（自动为事件投影，手动为 enrich 投影）。
     assert {"build_media_context", "match_context_from_mediainfo"} <= _plugin_import_names(event_runtime)
     assert "enrich_search_target" in manual_names
-    # 两链都经统一 source facade(SourceAdministration)查询。
-    assert "SourceAdministration" in automatic_names
-    assert "SourceAdministration" in manual_names
+    # 两链都经同一搜索能力查询，完整来源批次不执行业务筛选。
+    assert "SubtitleSearch" in automatic_names
+    assert "SubtitleSearch" in manual_names
+    assert "SourceAdministration" in _plugin_import_names(shared)
     # 两链都经统一的来源结论文案记录。
     assert "describe_source_run" in automatic_names
     assert "describe_source_run" in manual_names
@@ -484,13 +490,30 @@ def test_manual_and_automatic_chains_share_search_prefix_and_fork_only_at_admiss
 
     # search 零依赖 task 死边保持。
     assert "task" not in ALLOWLIST["search"]
-    assert "task" not in {parts[0] for parts in _imported_capabilities(manual)}
+    assert "task" not in {parts[0] for parts in _imported_capabilities(shared)}
+    assert "AttributionService" not in _plugin_import_names(shared)
+    assert "admit_automatic_candidates" not in _plugin_import_names(shared)
 
 
 def _imported_capabilities(path: Path) -> set[tuple[str, ...]]:
     """返回文件导入的跨插件限界模块路径。"""
 
     return {tuple(parts) for parts, _ in _imports(path) if parts and parts[0] in CAPABILITIES}
+
+
+def test_shared_download_and_sessions_do_not_depend_on_task_or_trigger_contracts() -> None:
+    """下载和会话独立于任务，触发方式仅由任务入口解释。"""
+
+    assert not (ROOT / "task" / "attempt.py").exists()
+    for directory in (ROOT / "download", ROOT / "search"):
+        for path in _files(directory):
+            imports = _imported_capabilities(path)
+            assert not any(parts[0] == "task" or parts[:2] == ("schemas", "task") for parts in imports)
+            assert "TaskTrigger" not in _plugin_import_names(path)
+            assert "SubtitleWrittenOperation" not in _plugin_import_names(path)
+    assert "DownloadService" in _plugin_import_names(ROOT / "task" / "service.py")
+    assert "submit" not in _defined_functions(ROOT / "search" / "session.py")
+    assert "submit" not in _defined_functions(ROOT / "search" / "service.py")
 
 
 def test_api_layer_owns_search_http_projection_and_search_service_drops_it() -> None:

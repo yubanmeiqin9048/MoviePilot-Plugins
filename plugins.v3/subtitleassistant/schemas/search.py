@@ -1,4 +1,4 @@
-"""人工字幕搜索对外结果的公共契约。"""
+"""搜索展示与会话选择的公共契约。"""
 
 from __future__ import annotations
 
@@ -6,25 +6,15 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .candidate import CandidateRecognition
-from .source import SourceSearchResult
+from .source import CandidateHandle, SourceSearchResult
 from .target import SearchTarget
-from .task import SubtitleTask
 
 __all__ = [
     "ManualSearchResult",
     "ManualSourceView",
-    "ManualSubmitResult",
-    "ManualSubmitStatus",
+    "SearchSelection",
+    "SearchSelectionError",
 ]
-
-
-class ManualSubmitStatus(StrEnum):
-    """人工候选提交的稳定结果状态。"""
-
-    SUCCESS = "success"
-    SESSION_NOT_FOUND = "session_not_found"
-    CANDIDATE_NOT_FOUND = "candidate_not_found"
-    REJECTED = "rejected"
 
 
 @dataclass(slots=True)
@@ -50,15 +40,16 @@ class ManualSearchResult:
     sources: list[ManualSourceView]
 
 
-@dataclass(slots=True)
-class ManualSubmitResult:
-    """人工候选提交的稳定领域结果。"""
+class SearchSelectionError(StrEnum):
+    """搜索会话无法解析用户选择的原因。"""
 
-    status: ManualSubmitStatus
-    task: SubtitleTask | None = None
+    SESSION_NOT_FOUND = "session_not_found"
+    CANDIDATE_NOT_FOUND = "candidate_not_found"
 
-    def __post_init__(self) -> None:
-        """把边界处的提交状态收敛为搜索能力枚举。"""
 
-        if not isinstance(self.status, ManualSubmitStatus):
-            self.status = ManualSubmitStatus(self.status)
+@dataclass(frozen=True, slots=True)
+class SearchSelection:
+    """通过会话校验的目标与完整下载句柄。"""
+
+    target: SearchTarget
+    candidate: CandidateHandle

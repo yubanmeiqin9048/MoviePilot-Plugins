@@ -31,13 +31,9 @@ from app.plugins.subtitleassistant.schemas.source import (
     SubtitleSource,
 )
 from app.plugins.subtitleassistant.schemas.target import SubtitleDestination, MediaType, SubtitleTarget
-from app.plugins.subtitleassistant.schemas.task import (
-    AttemptResult,
-    CandidateAttemptReasonCode,
-    SubtitleTask,
-    TaskStatus,
-    TaskWorkItem,
-)
+from app.plugins.subtitleassistant.schemas.download import DownloadStatus, DownloadReasonCode
+from app.plugins.subtitleassistant.schemas.task import SubtitleTask, TaskStatus, TaskWorkItem
+from app.plugins.subtitleassistant.search import SubtitleSearch
 from app.plugins.subtitleassistant.task import TaskOperations
 from app.plugins.subtitleassistant.target import TargetCatalog
 
@@ -383,7 +379,11 @@ class _CandidatePool:
         self._handle = handle
         self._source = source
 
-    async def query(self, _context: SubtitleTarget) -> SourceSearchBatch:
+    async def query(
+        self,
+        _context: SubtitleTarget,
+        custom_queries: dict[SubtitleSource, str | None] | None = None,
+    ) -> SourceSearchBatch:
         """返回单一可下载候选。"""
 
         return SourceSearchBatch(
@@ -478,12 +478,14 @@ def _workflow_case(
     store = _Store()
     inventory = _RecordCommitter(store, filesystem)
     matcher = _Matcher(context, episodes)
+    candidate_pool = _CandidatePool(handle, source)
     coordinator = TaskOperations(
         store=store,
         filesystem=filesystem,
         archive=_Archive(extracted or []),
         matcher=matcher,
-        sources=_CandidatePool(handle, source),
+        sources=candidate_pool,
+        search=SubtitleSearch(candidate_pool),
         config=PluginConfig(format_priority=["SRT"], package_attribution_strategy=package_attribution_strategy),
         inventory=inventory,
         media_extensions=["mkv"],
@@ -539,23 +541,23 @@ async def test_manual_candidate_workflow_accepts_preserved_results(tmp_path: Pat
     """人工候选在安全保留字幕时成功受理，下载失败仍保留失败结论。"""
 
     cases = [
-        ("unsupported", {"suffix": ".bin"}, CandidateAttemptReasonCode.UNSUPPORTED_FORMAT),
+        ("unsupported", {"suffix": ".bin"}, DownloadReasonCode.UNSUPPORTED_FORMAT),
         (
             "missing",
             {"extracted": [_subtitle(tmp_path / "missing", "other.srt")], "episodes": {"other.srt": 2}},
-            CandidateAttemptReasonCode.CANDIDATE_MISSING_TARGET_SUBTITLE,
+            DownloadReasonCode.CANDIDATE_MISSING_TARGET_SUBTITLE,
         ),
         (
             "directory",
             {"extracted": [_subtitle(tmp_path / "directory", "current.srt")], "directory_available": False},
-            CandidateAttemptReasonCode.TARGET_DIRECTORY_UNAVAILABLE,
+            DownloadReasonCode.TARGET_DIRECTORY_UNAVAILABLE,
         ),
         (
             "conflict",
             {"extracted": [_subtitle(tmp_path / "conflict", "current.srt")], "conflict": True},
-            CandidateAttemptReasonCode.SUBTITLE_DESTINATION_CONFLICT,
+            DownloadReasonCode.SUBTITLE_DESTINATION_CONFLICT,
         ),
-        ("download", {"download_error": RuntimeError("下载失败")}, CandidateAttemptReasonCode.MANUAL_CANDIDATE_FAILED),
+        ("download", {"download_error": RuntimeError("下载失败")}, "manual_candidate_failed"),
     ]
     for name, options, reason_code in cases:
         coordinator, context, handle, _filesystem, _store, _source = _workflow_case(tmp_path / name, **options)
@@ -564,7 +566,7 @@ async def test_manual_candidate_workflow_accepts_preserved_results(tmp_path: Pat
 
         if name in {"download", "directory", "conflict"}:
             assert task.status is TaskStatus.FAILED
-            assert task.reason_code == reason_code.value
+            assert task.reason_code == reason_code
         else:
             assert task.status is TaskStatus.SUCCESS
             assert task.reason_code == "subtitle_retained"

@@ -1,5 +1,6 @@
-"""人工字幕搜索能力的调用侧契约。"""
+"""共享字幕搜索与人工搜索会话的调用侧契约。"""
 
-from .service import ManualSearchService as ManualSearch
+from .service import SubtitleSearch
+from .session import SearchSessions
 
-__all__ = ["ManualSearch"]
+__all__ = ["SearchSessions", "SubtitleSearch"]

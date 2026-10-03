@@ -23,7 +23,7 @@ from ..record import RecordCatalog, RecordCommitter, RecordMaintenance, Subtitle
 from ..schemas.config import PluginConfig
 from ..schemas.source import SourceHealth, SourceStatus, SubtitleSource
 from ..schemas.task import TaskWorkItem
-from ..search import ManualSearch
+from ..search import SearchSessions, SubtitleSearch
 from ..source import SourceAdministration
 from ..store import PluginDataStore, StoreInitializationError
 from ..target import TargetCatalog, build_media_context, match_context_from_mediainfo
@@ -89,7 +89,8 @@ class PluginRuntime:
         self.coordinator: TaskOperations | None = None
         self.api_controller: ApiController | None = None
         self.targets: TargetCatalog | None = None
-        self.manual_search: ManualSearch | None = None
+        self.search: SubtitleSearch | None = None
+        self.search_sessions: SearchSessions | None = None
         self.source_service: SourceAdministration | None = None
         self.archive: ArchiveExtractor | None = None
         self._stopped = False
@@ -153,12 +154,15 @@ class PluginRuntime:
         matcher = AttributionService()
         targets = TargetCatalog(config_provider=lambda: self.config)
         archive = ArchiveExtractor()
+        search = SubtitleSearch(source_service)
+        sessions = SearchSessions()
         coordinator = TaskOperations(
             store=store,
             filesystem=filesystem,
             archive=archive,
             matcher=matcher,
             sources=source_service,
+            search=search,
             config=self.config,
             inventory=record_committer,
             media_extensions=settings.RMT_MEDIAEXT,
@@ -174,12 +178,8 @@ class PluginRuntime:
         self.targets = targets
         self.source_service = source_service
         self.archive = archive
-        self.manual_search = ManualSearch(
-            targets=targets,
-            candidate_pool=source_service,
-            matcher=matcher,
-            coordinator=coordinator,
-        )
+        self.search = search
+        self.search_sessions = sessions
         self.record_catalog = record_committer.catalog()
         self.record_maintenance = record_committer.maintenance(targets, publisher)
         self.api_controller = ApiController(
@@ -188,7 +188,9 @@ class PluginRuntime:
             maintenance=self.record_maintenance,
             filesystem=filesystem,
             targets=targets,
-            search=self.manual_search,
+            search=search,
+            sessions=sessions,
+            matcher=matcher,
             sources=source_service,
             update_credentials=self.update_source_credentials,
             clear_credentials=self.clear_source_credentials,
@@ -381,12 +383,12 @@ class PluginRuntime:
         self._stopped = True
         self._enabled = False
         coordinator = self.coordinator
-        search = self.manual_search
+        sessions = self.search_sessions
         source_service = self.source_service
         archive = self.archive
         for name, close in (
             ("字幕任务", coordinator.shutdown if coordinator is not None else None),
-            ("人工搜索", search.clear_sessions if search is not None else None),
+            ("人工搜索", sessions.clear_sessions if sessions is not None else None),
             ("字幕来源", source_service.close if source_service is not None else None),
             ("字幕归档", archive.cancel if archive is not None else None),
         ):
@@ -397,7 +399,8 @@ class PluginRuntime:
             except Exception as exc:  # noqa: BLE001 - 其他资源仍必须继续释放
                 logger.error(f"字幕助手停止时释放{name}失败：{type(exc).__name__}")
         self.api_controller = None
-        self.manual_search = None
+        self.search = None
+        self.search_sessions = None
         self.coordinator = None
         self.source_service = None
         self.archive = None

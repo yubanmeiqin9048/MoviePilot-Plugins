@@ -54,14 +54,10 @@ from app.plugins.subtitleassistant.schemas.source import (
     SubtitleSource,
 )
 from app.plugins.subtitleassistant.schemas.target import MediaType, PathMapping, SubtitleDestination, SubtitleTarget
-from app.plugins.subtitleassistant.schemas.task import (
-    AttemptResult,
-    SubtitleTask,
-    TaskStatus,
-    TaskTrigger,
-    TaskWorkItem,
-)
+from app.plugins.subtitleassistant.schemas.download import DownloadResult, DownloadRetention, DownloadStatus
+from app.plugins.subtitleassistant.schemas.task import SubtitleTask, TaskStatus, TaskTrigger, TaskWorkItem
 from app.plugins.subtitleassistant.source import SourceAdministration
+from app.plugins.subtitleassistant.search import SubtitleSearch
 from app.plugins.subtitleassistant.task import TaskOperations
 from app.plugins.subtitleassistant.task import service as task_service
 from app.schemas.types import EventType
@@ -594,7 +590,7 @@ def _candidate_result(records: list[MatchRecord], candidate: SubtitleCandidate) 
             )
             for record in records
         ),
-        result=AttemptResult.SUCCESS,
+        result=DownloadStatus.SUCCESS,
         error_summary=None,
         reason_code=None,
     )
@@ -660,12 +656,14 @@ def _coordinator(
         source_priority=[source.value for source in active_config.source_priority],
     )
     active_matcher = matcher or _TaskMatcher()
+    active_sources = candidate_pool or _TaskCandidatePool(source_map)
     return TaskOperations(
         store=active_store,
         filesystem=active_filesystem,
         archive=archive or _TaskArchive(),
         matcher=active_matcher,
-        sources=candidate_pool or _TaskCandidatePool(source_map),
+        sources=active_sources,
+        search=SubtitleSearch(active_sources),
         config=active_config,
         inventory=active_inventory,
         media_extensions=["mkv"],
@@ -2163,7 +2161,7 @@ async def test_interrupted_candidate_still_publishes_already_committed_files(
     )
     result = SimpleNamespace(
         records=(record,),
-        result=AttemptResult.INTERRUPTED,
+        result=DownloadStatus.INTERRUPTED,
         error_summary=None,
         committed_media_records=(record,),
         committed_files=(fact,),
@@ -2181,7 +2179,7 @@ async def test_interrupted_candidate_still_publishes_already_committed_files(
 
         return result
 
-    monkeypatch.setattr(coordinator._candidate_attempt, "attempt", interrupted)
+    monkeypatch.setattr(coordinator._download, "download", interrupted)
 
     with pytest.raises(asyncio.CancelledError):
         await coordinator._try_candidate(task, item, candidate)
@@ -2758,3 +2756,62 @@ async def test_cleanup_with_source_administration_closes_owned_resources_once(
 
     assert source.close_calls == int(manage_resources)
     assert archive.cancel_calls == int(manage_resources)
+
+
+@pytest.mark.parametrize(
+    ("operation", "strategy", "trust_direct_file", "retention"),
+    [
+        (
+            SubtitleWrittenOperation.MANUAL_CANDIDATE,
+            PackageAttributionStrategy.HOST_RECOGNITION,
+            True,
+            DownloadRetention.PRESERVE,
+        ),
+        (
+            SubtitleWrittenOperation.AUTOMATIC_CANDIDATE,
+            PackageAttributionStrategy.HOST_RECOGNITION,
+            False,
+            DownloadRetention.DISCARD,
+        ),
+        (
+            SubtitleWrittenOperation.AUTOMATIC_CANDIDATE,
+            PackageAttributionStrategy.TRUST_PACKAGE,
+            True,
+            DownloadRetention.DISCARD,
+        ),
+    ],
+)
+async def test_task_translates_business_rules_to_explicit_download_policies(
+    tmp_path: Path,
+    operation: SubtitleWrittenOperation,
+    strategy: PackageAttributionStrategy,
+    trust_direct_file: bool,
+    retention: DownloadRetention,
+) -> None:
+    """任务把人工选择和配置转换为归属信任及保留策略，下载无需触发标志。"""
+
+    from unittest.mock import AsyncMock
+
+    coordinator = _coordinator(tmp_path, config=PluginConfig(package_attribution_strategy=strategy))
+    item = _work_item(tmp_path, "explicit-policy")
+    candidate = _candidate("policy-candidate")
+    task = SubtitleTask(
+        media_title=item.context.title,
+        target_file_name=item.context.target_file_name,
+        target_path=item.context.target_path,
+    )
+    expected = DownloadResult(records=(), result=DownloadStatus.NO_MATCH)
+    download = AsyncMock(return_value=expected)
+    coordinator._download = SimpleNamespace(download=download)
+
+    result = await coordinator._try_candidate(task, item, candidate, operation=operation, retention=retention)
+
+    assert result is expected
+    request = download.await_args.args[0]
+    assert request.trust_direct_file is trust_direct_file
+    assert request.retention is retention
+    assert request.package_attribution_strategy is strategy
+    assert request.handle is candidate
+    assert not hasattr(request, "operation")
+    assert not hasattr(request, "trigger")
+    await coordinator.shutdown("测试清理")

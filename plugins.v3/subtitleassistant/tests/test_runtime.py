@@ -1,8 +1,9 @@
 """插件组合根与运行态生命周期测试。"""
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from app.plugins.subtitleassistant import SubtitleAssistant
@@ -21,7 +22,8 @@ def _runtime() -> PluginRuntime:
     runtime._stopped = False
     runtime._enabled = True
     runtime.coordinator = SimpleNamespace(shutdown=AsyncMock())
-    runtime.manual_search = SimpleNamespace(clear_sessions=AsyncMock())
+    runtime.search = object()
+    runtime.search_sessions = SimpleNamespace(clear_sessions=AsyncMock())
     runtime.source_service = SimpleNamespace(close=AsyncMock())
     runtime.archive = SimpleNamespace(cancel=AsyncMock())
     runtime.api_controller = object()
@@ -40,7 +42,7 @@ async def test_runtime_stop_releases_resources_once_in_reverse_dependency_order(
     calls: list[str] = []
     runtime = _runtime()
     runtime.coordinator.shutdown.side_effect = lambda: calls.append("task")
-    runtime.manual_search.clear_sessions.side_effect = lambda: calls.append("search")
+    runtime.search_sessions.clear_sessions.side_effect = lambda: calls.append("search")
     runtime.source_service.close.side_effect = lambda: calls.append("source")
     runtime.archive.cancel.side_effect = lambda: calls.append("archive")
 
@@ -49,7 +51,8 @@ async def test_runtime_stop_releases_resources_once_in_reverse_dependency_order(
 
     assert calls == ["task", "search", "source", "archive"]
     assert runtime.coordinator is None
-    assert runtime.manual_search is None
+    assert runtime.search is None
+    assert runtime.search_sessions is None
     assert runtime.source_service is None
     assert runtime.archive is None
 
@@ -69,7 +72,8 @@ async def test_runtime_reset_stops_then_clears_data_and_remains_empty() -> None:
     assert runtime.filesystem is None
     assert runtime.store is None
     assert runtime.coordinator is None
-    assert runtime.manual_search is None
+    assert runtime.search is None
+    assert runtime.search_sessions is None
 
 
 async def test_runtime_cleanup_continues_after_a_resource_failure() -> None:
@@ -77,7 +81,7 @@ async def test_runtime_cleanup_continues_after_a_resource_failure() -> None:
 
     runtime = _runtime()
     runtime.coordinator.shutdown.side_effect = RuntimeError("task failure")
-    search = runtime.manual_search
+    search = runtime.search_sessions
     source_service = runtime.source_service
     archive = runtime.archive
     filesystem = runtime.filesystem
@@ -92,7 +96,8 @@ async def test_runtime_cleanup_continues_after_a_resource_failure() -> None:
     filesystem.clear_data_directory.assert_awaited_once()
     store.reset.assert_awaited_once()
     assert runtime.coordinator is None
-    assert runtime.manual_search is None
+    assert runtime.search is None
+    assert runtime.search_sessions is None
 
 
 async def test_runtime_reset_continues_after_data_cleanup_failures() -> None:
@@ -140,6 +145,39 @@ def test_build_runtime_normalizes_unexpected_initialization_failures(monkeypatch
 
     with pytest.raises(RuntimeInitializationError, match="插件运行态初始化失败"):
         build_runtime(SimpleNamespace(), {})
+
+
+async def test_runtime_shares_search_between_api_and_tasks_and_owns_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实装配共用一个搜索实例，会话独立归运行态释放。"""
+
+    from app.plugins.subtitleassistant.plugin import runtime as runtime_module
+
+    store = SimpleNamespace(
+        initialize=Mock(),
+        mark_nonterminal_interrupted_sync=Mock(return_value=[]),
+        ensure_source_statuses_sync=Mock(),
+        list_records_sync=Mock(return_value=[]),
+        get_credentials_sync=Mock(return_value={}),
+    )
+    monkeypatch.setattr(runtime_module, "PluginDataStore", lambda _host: store)
+    runtime = PluginRuntime(SimpleNamespace(get_data_path=lambda: tmp_path))
+    try:
+        runtime.initialize({"moviepilot_enabled": False, "opensubtitles_enabled": False, "assrt_enabled": False})
+
+        assert runtime.search is not None
+        assert runtime.search_sessions is not None
+        assert runtime.coordinator._search is runtime.search
+        assert runtime.api_controller._search is runtime.search
+        assert runtime.api_controller._sessions is runtime.search_sessions
+        assert runtime.search._sources is runtime.source_service
+        assert runtime.coordinator._download.sources is runtime.source_service
+    finally:
+        await runtime.stop()
+    assert runtime.search is None
+    assert runtime.search_sessions is None
 
 
 class _CredentialStore:

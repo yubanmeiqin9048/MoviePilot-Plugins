@@ -34,11 +34,8 @@ from app.plugins.subtitleassistant.schemas.record import (
     MatchRecord,
     RecordStatus,
 )
-from app.plugins.subtitleassistant.schemas.search import (
-    ManualSearchResult,
-    ManualSourceView,
-    ManualSubmitStatus,
-)
+from app.plugins.subtitleassistant.schemas.task import ManualSubmitStatus
+from app.plugins.subtitleassistant.schemas.search import ManualSearchResult, ManualSourceView
 from app.plugins.subtitleassistant.schemas.source import (
     CandidateHandle,
     DownloadedAsset,
@@ -59,22 +56,17 @@ from app.plugins.subtitleassistant.schemas.target import (
     SearchTarget,
     SubtitleTarget,
 )
-from app.plugins.subtitleassistant.schemas.task import (
-    AttemptResult,
-    CandidateAttemptReasonCode,
-    SubtitleTask,
-    TaskStatus,
-    TaskTrigger,
-    TaskWorkItem,
-)
+from app.plugins.subtitleassistant.schemas.download import DownloadStatus, DownloadReasonCode
+from app.plugins.subtitleassistant.schemas.task import SubtitleTask, TaskStatus, TaskTrigger, TaskWorkItem
 
 EXPECTED_EXPORTS = {
+    "download": {"DownloadStatus", "DownloadReasonCode", "DownloadRetention", "DownloadRequest", "DownloadResult"},
     "task": {
         "SubtitleTask",
         "TaskStatus",
         "TaskTrigger",
-        "AttemptResult",
-        "CandidateAttemptReasonCode",
+        "ManualSubmitResult",
+        "ManualSubmitStatus",
         "TaskWorkItem",
     },
     "candidate": {
@@ -103,8 +95,8 @@ EXPECTED_EXPORTS = {
     "search": {
         "ManualSourceView",
         "ManualSearchResult",
-        "ManualSubmitResult",
-        "ManualSubmitStatus",
+        "SearchSelection",
+        "SearchSelectionError",
     },
     "target": {
         "SubtitleTarget",
@@ -462,8 +454,8 @@ def test_public_contract_defaults_enums_and_event_fact_are_stable() -> None:
     assert task.status is TaskStatus.QUEUED
     assert task.trigger is TaskTrigger.TRANSFER_EVENT
     assert not hasattr(task, "stage")
-    assert AttemptResult.NO_MATCH.value == "no_match"
-    assert CandidateAttemptReasonCode.UNSUPPORTED_FORMAT.value == "unsupported_format"
+    assert DownloadStatus.NO_MATCH.value == "no_match"
+    assert DownloadReasonCode.UNSUPPORTED_FORMAT.value == "unsupported_format"
 
     event = SubtitleWrittenEvent(
         plugin_id="SubtitleAssistant",

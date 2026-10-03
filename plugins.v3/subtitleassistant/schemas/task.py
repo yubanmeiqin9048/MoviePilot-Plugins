@@ -1,4 +1,4 @@
-"""字幕任务生命周期与候选尝试公共契约。"""
+"""字幕任务生命周期与人工提交公共契约。"""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ if TYPE_CHECKING:
     from .attribution import CandidateMatchContext
 
 __all__ = [
-    "AttemptResult",
-    "CandidateAttemptReasonCode",
+    "ManualSubmitResult",
+    "ManualSubmitStatus",
     "SubtitleTask",
     "TaskStatus",
     "TaskTrigger",
@@ -44,34 +44,6 @@ class TaskTrigger(StrEnum):
 
     TRANSFER_EVENT = "transfer_event"
     MANUAL_CANDIDATE = "manual_candidate"
-
-
-class AttemptResult(StrEnum):
-    """候选下载尝试的业务结论。"""
-
-    SUCCESS = "success"
-    DOWNLOAD_FAILED = "download_failed"
-    EXTRACT_FAILED = "extract_failed"
-    NO_MATCH = "no_match"
-    WRITE_FAILED = "write_failed"
-    INTERRUPTED = "interrupted"
-
-
-class CandidateAttemptReasonCode(StrEnum):
-    """字幕任务候选尝试失败时使用的稳定原因码。"""
-
-    MANUAL_CANDIDATE_FAILED = "manual_candidate_failed"
-    TARGET_DIRECTORY_UNAVAILABLE = "target_directory_unavailable"
-    SUBTITLE_DESTINATION_CONFLICT = "subtitle_destination_conflict"
-    UNSUPPORTED_FORMAT = "unsupported_format"
-    CANDIDATE_MISSING_TARGET_SUBTITLE = "candidate_missing_target_subtitle"
-
-
-class _CandidateAttemptRetention(StrEnum):
-    """候选尝试失败结果的保留策略。"""
-
-    PRESERVE = "preserve"
-    DISCARD = "discard"
 
 
 class SubtitleTask(StrictModel):
@@ -129,3 +101,26 @@ class TaskWorkItem:
     attempt_retention: Literal["preserve", "discard"] | None = None
     task_id: str | None = None
     destination: SubtitleDestination | None = None
+
+
+class ManualSubmitStatus(StrEnum):
+    """人工候选提交的稳定结果状态。"""
+
+    SUCCESS = "success"
+    SESSION_NOT_FOUND = "session_not_found"
+    CANDIDATE_NOT_FOUND = "candidate_not_found"
+    REJECTED = "rejected"
+
+
+@dataclass(slots=True)
+class ManualSubmitResult:
+    """人工候选提交的稳定领域结果。"""
+
+    status: ManualSubmitStatus
+    task: SubtitleTask | None = None
+
+    def __post_init__(self) -> None:
+        """把边界处的提交状态收敛为任务提交枚举。"""
+
+        if not isinstance(self.status, ManualSubmitStatus):
+            self.status = ManualSubmitStatus(self.status)
