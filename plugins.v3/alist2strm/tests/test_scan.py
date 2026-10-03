@@ -11,6 +11,7 @@ import pytest
 from app.plugins.alist2strm import scan as scan_module  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.config import build_configuration  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
+    DownloadResponse,
     HttpResponse,
     OpenListClient,
     ScanCoordinator,
@@ -26,6 +27,7 @@ class _Transport:
 
         self.trees = trees
         self.calls: list[dict[str, Any]] = []
+        self.stream_factory: Any = None
 
     def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
         """模拟 fs/list，不访问真实网络。"""
@@ -50,10 +52,22 @@ class _Transport:
             },
         )
 
+    def get_stream(self, url: str, headers: dict[str, str]) -> DownloadResponse:
+        """模拟无签名附件下载，并记录请求认证头。"""
+
+        self.calls.append({"url": url, "headers": dict(headers), "payload": {}})
+        if callable(self.stream_factory):
+            return self.stream_factory(url, headers)
+        return DownloadResponse(status_code=200, body=(f"download:{url}".encode(),), url=url)
+
     def pages(self, path: str) -> list[int]:
         """返回目录请求的页码。"""
 
-        return [int(call["payload"]["page"]) for call in self.calls if call["payload"]["path"] == path]
+        return [
+            int(call["payload"]["page"])
+            for call in self.calls
+            if "path" in call["payload"] and call["payload"]["path"] == path
+        ]
 
 
 class _Queue:
@@ -113,8 +127,8 @@ def _config(tmp_path: Path) -> object:
     )
 
 
-def test_scan_entry_generates_relative_video_strm_with_pages_and_safe_urls(tmp_path: Path) -> None:
-    """多实例、多映射、深层路径和分页只生成视频 STRM，并跳过既有目标。"""
+def test_scan_entry_generates_relative_video_strm_with_pages_and_downloads_attachment(tmp_path: Path) -> None:
+    """多实例、多映射、深层路径和分页生成视频 STRM 并下载白名单附件。"""
 
     trees = {
         "https://scan-a.example.invalid": {
@@ -165,7 +179,9 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_safe_urls(tmp_p
     )
     assert existing.read_text(encoding="utf-8") == "hand made"
     assert orphan.read_text(encoding="utf-8") == "keep"
-    assert not (tmp_path / "a" / "notes.strm").exists()
+    assert (tmp_path / "a" / "notes.srt").read_bytes() == (
+        b"download:https://scan-a.example.invalid/d/media/movies/notes.srt"
+    )
     assert transport.pages("/media/movies") == [1, 2, 3]
 
     status = coordinator.status()
@@ -173,7 +189,7 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_safe_urls(tmp_p
     assert status["current_mapping"] is None
     assert status["counters"] == {
         "generated": 3,
-        "downloaded": 0,
+        "downloaded": 1,
         "updated": 0,
         "skipped": 1,
         "deleted": 0,
@@ -669,6 +685,279 @@ def test_duplicate_trigger_skips_and_running_task_keeps_start_snapshot(tmp_path:
     assert (tmp_path / "a" / "Film.strm").exists() is False
     assert (tmp_path / "a" / "movie.strm").is_file()
     assert not (tmp_path / "new").exists()
+
+
+def test_scan_entry_selects_and_downloads_non_video_files(tmp_path: Path) -> None:
+    """白名单内的字幕无需同名视频即可原样下载并保留相对路径。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "attachments",
+                    "name": "附件实例",
+                    "scan_url": "https://scan-attachments.example.invalid",
+                    "api_token": "test-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".MKV", ".SRT", ".NFO"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    transport = _Transport(
+        {
+            "https://scan-attachments.example.invalid": {
+                "/library": [
+                    {"name": "Movie.MKV", "is_dir": False},
+                    {"name": "orphan.SRT", "is_dir": False},
+                    {"name": "metadata.NFO", "is_dir": False},
+                    {"name": "ignored.txt", "is_dir": False},
+                ]
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+        whitelist_suffix_provider=lambda: (".mkv", ".srt", ".nfo"),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert (tmp_path / "Movie.strm").is_file()
+    assert (
+        tmp_path / "orphan.SRT"
+    ).read_bytes() == b"download:https://scan-attachments.example.invalid/d/library/orphan.SRT"
+    assert (tmp_path / "metadata.NFO").is_file()
+    assert not (tmp_path / "ignored.txt").exists()
+    assert coordinator.status()["counters"] == {
+        "generated": 1,
+        "downloaded": 2,
+        "updated": 0,
+        "skipped": 0,
+        "deleted": 0,
+        "failed": 0,
+    }
+
+
+def test_scan_excludes_matching_directory_subtree_by_name(tmp_path: Path) -> None:
+    """目录名称命中排除关键字时不读取其任意深度的子树。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "exclude",
+                    "name": "排除实例",
+                    "scan_url": "https://scan-exclude.example.invalid",
+                    "api_token": "test-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".srt"],
+                            "exclude_keywords": "SaMpLe",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    transport = _Transport(
+        {
+            "https://scan-exclude.example.invalid": {
+                "/library": [
+                    {"name": "Sample Directory", "is_dir": True},
+                    {"name": "keep.MKV", "is_dir": False},
+                ],
+                "/library/Sample Directory": [{"name": "deep", "is_dir": True}],
+                "/library/Sample Directory/deep": [{"name": "hidden.MKV", "is_dir": False}],
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mKv",),
+        whitelist_suffix_provider=lambda: (".MKV", ".SRT"),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert (tmp_path / "keep.strm").is_file()
+    assert not (tmp_path / "Sample Directory").exists()
+    assert transport.pages("/library/Sample Directory") == []
+    assert transport.pages("/library/Sample Directory/deep") == []
+
+
+def test_interrupted_attachment_download_leaves_no_target_and_retries(tmp_path: Path) -> None:
+    """下载流中断时只留下失败计数，下一次扫描可以重新创建目标。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "retry",
+                    "name": "中断实例",
+                    "scan_url": "https://scan-retry.example.invalid",
+                    "api_token": "test-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".nfo"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    transport = _Transport(
+        {"https://scan-retry.example.invalid": {"/library": [{"name": "info.nfo", "is_dir": False}]}}
+    )
+    attempts = 0
+
+    def interrupted_once(url: str, headers: dict[str, str]) -> DownloadResponse:
+        """第一次流只返回部分内容后抛出中断。"""
+
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+
+            def body() -> Any:
+                """产生部分正文后中断。"""
+
+                yield b"partial"
+                raise OSError("interrupted")
+
+            return DownloadResponse(status_code=200, body=body(), url=url)
+        return DownloadResponse(status_code=200, body=(f"download:{url}".encode(),), url=url)
+
+    transport.stream_factory = interrupted_once
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+        whitelist_suffix_provider=lambda: (".nfo",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert not (tmp_path / "info.nfo").exists()
+    assert coordinator.status()["counters"]["failed"] == 1
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert (tmp_path / "info.nfo").read_bytes().startswith(b"download:")
+    assert coordinator.status()["counters"] == {
+        "generated": 0,
+        "downloaded": 1,
+        "updated": 0,
+        "skipped": 0,
+        "deleted": 0,
+        "failed": 0,
+    }
+
+
+def test_existing_attachment_target_is_skipped_without_download(tmp_path: Path) -> None:
+    """已有附件目标直接跳过，不启动下载或比较内容。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "existing",
+                    "name": "已有实例",
+                    "scan_url": "https://scan-existing.example.invalid",
+                    "api_token": "test-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".srt"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    target = tmp_path / "subtitle.srt"
+    target.write_bytes(b"keep")
+    transport = _Transport(
+        {"https://scan-existing.example.invalid": {"/library": [{"name": "subtitle.srt", "is_dir": False}]}}
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+        whitelist_suffix_provider=lambda: (".srt",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert target.read_bytes() == b"keep"
+    assert not any(
+        "/d/library/subtitle.srt" in call["url"] for call in transport.calls if call["url"].endswith("subtitle.srt")
+    )
+    assert coordinator.status()["counters"]["skipped"] == 1
+
+
+def test_cross_origin_redirect_drops_authorization_and_url_credentials() -> None:
+    """下载重定向到代理源时不携带管理员认证头或 URL 用户信息。"""
+
+    class RedirectTransport:
+        """返回跨源重定向的下载替身。"""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        def get_stream(self, url: str, headers: dict[str, str]) -> DownloadResponse:
+            """首次重定向，第二次返回正文。"""
+
+            self.calls.append((url, dict(headers)))
+            if len(self.calls) == 1:
+                return DownloadResponse(
+                    status_code=302,
+                    headers={"Location": "https://user:password@proxy.example.invalid/file"},
+                    url=url,
+                )
+            return DownloadResponse(status_code=200, body=(b"file",), url=url)
+
+        def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+            """该测试不使用目录 API。"""
+
+            return HttpResponse(500)
+
+    transport = RedirectTransport()
+    client = OpenListClient("https://scan.example.invalid", "test-token", transport=transport)
+
+    with client.open_download("/library/file.nfo") as chunks:
+        assert b"".join(chunks) == b"file"
+
+    assert transport.calls[0][1] == {"Authorization": "test-token"}
+    assert transport.calls[1][1] == {}
+    assert "user:password" not in transport.calls[1][0]
 
 
 def test_playback_url_encodes_each_path_segment_without_double_encoding() -> None:

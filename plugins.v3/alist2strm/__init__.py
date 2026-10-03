@@ -235,6 +235,7 @@ class Alist2Strm(_PluginBase):
                 dispatch=self._dispatch_scan,
                 client_factory=getattr(self, "_scan_client_factory", None),
                 media_suffix_provider=getattr(self, "_scan_media_suffix_provider", None),
+                whitelist_suffix_provider=getattr(self, "_scan_whitelist_suffix_provider", None),
             )
             self._scan_coordinator = coordinator
         return coordinator

@@ -11,6 +11,7 @@ from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
     build_configuration,
     public_configuration,
 )
+from app.sdk.config import settings
 
 
 def _instance(name: str, output_dir: str, *, source_dir: str = "/library") -> dict[str, object]:
@@ -22,6 +23,72 @@ def _instance(name: str, output_dir: str, *, source_dir: str = "/library") -> di
         "api_token": "configured",
         "mappings": [{"source_dir": source_dir, "output_dir": output_dir}],
     }
+
+
+def test_follow_host_defaults_refresh_and_custom_whitelist_restores_follow_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认模式读取宿主当前媒体和字幕后缀，自定义值保持且恢复默认后重新跟随。"""
+
+    monkeypatch.setattr(settings, "RMT_MEDIAEXT", [".MKV"])
+    monkeypatch.setattr(settings, "RMT_SUBEXT", [".SRT"])
+    payload = {
+        "instances": [
+            {
+                "id": "filters",
+                "name": "筛选实例",
+                "scan_url": "https://openlist.example.invalid",
+                "api_token": "test-token",
+                "mappings": [{"source_dir": "/library", "output_dir": "/strm"}],
+            }
+        ]
+    }
+
+    follow = build_configuration(payload)
+    assert public_configuration(follow)["instances"][0]["mappings"][0]["effective_extensions"] == [".mkv", ".srt"]
+
+    monkeypatch.setattr(settings, "RMT_MEDIAEXT", [".MP4"])
+    monkeypatch.setattr(settings, "RMT_SUBEXT", [".ASS"])
+    assert public_configuration(follow)["instances"][0]["mappings"][0]["effective_extensions"] == [".mp4", ".ass"]
+
+    custom_payload = {
+        **payload,
+        "instances": [
+            {
+                **payload["instances"][0],
+                "mappings": [
+                    {
+                        "source_dir": "/library",
+                        "output_dir": "/strm",
+                        "whitelist_mode": "custom",
+                        "extensions": [".NFO"],
+                    }
+                ],
+            }
+        ],
+    }
+    custom = build_configuration(custom_payload)
+    assert public_configuration(custom)["instances"][0]["mappings"][0]["effective_extensions"] == [".nfo"]
+
+    restored_payload = {
+        **custom_payload,
+        "instances": [
+            {
+                **custom_payload["instances"][0],
+                "mappings": [
+                    {
+                        "source_dir": "/library",
+                        "output_dir": "/strm",
+                        "whitelist_mode": "follow_host",
+                        "extensions": [".NFO"],
+                    }
+                ],
+            }
+        ],
+    }
+    restored = build_configuration(restored_payload)
+    assert restored.instances[0].mappings[0].extensions == [".nfo"]
+    assert public_configuration(restored)["instances"][0]["mappings"][0]["effective_extensions"] == [".mp4", ".ass"]
 
 
 def test_valid_configuration_supports_multiple_instances_and_overlapping_sources() -> None:

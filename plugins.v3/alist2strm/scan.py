@@ -6,12 +6,13 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from app.sdk.config import settings
 from app.sdk.logging import logger
@@ -22,6 +23,7 @@ FS_LIST_PATH = "/api/fs/list"
 LIST_PER_PAGE = 100
 DOWNLOAD_PREFIX = "/d"
 STRM_SUFFIX = ".strm"
+MAX_DOWNLOAD_REDIRECTS = 10
 
 
 @dataclass(frozen=True)
@@ -32,11 +34,128 @@ class HttpResponse:
     payload: object = None
 
 
+@dataclass
+class DownloadResponse:
+    """一次受控下载响应，正文以字节迭代器延迟读取。"""
+
+    status_code: int
+    headers: Mapping[str, str] = field(default_factory=dict)
+    body: Iterable[bytes] = field(default_factory=tuple)
+    url: str = ""
+    _close: Callable[[], None] | None = None
+
+    def iter_bytes(self) -> Iterator[bytes]:
+        """返回响应正文的字节迭代器。"""
+
+        if isinstance(self.body, bytes):
+            return iter((self.body,))
+        return iter(self.body)
+
+    def close(self) -> None:
+        """关闭底层响应，允许替身记录资源释放。"""
+
+        if self._close is not None:
+            close, self._close = self._close, None
+            close()
+
+
 class HttpTransport(Protocol):
-    """可替换的 OpenList JSON 传输边界。"""
+    """可替换的 OpenList JSON 与下载传输边界。"""
 
     def post_json(self, url: str, payload: Mapping[str, Any], headers: Mapping[str, str]) -> HttpResponse:
         """发送 JSON POST 并返回状态码及已解析响应体。"""
+
+    def get_stream(self, url: str, headers: Mapping[str, str]) -> DownloadResponse:
+        """发送不自动跟随重定向的流式 GET。"""
+
+
+class OutputFileSystem(Protocol):
+    """可替换的本地产物文件系统边界。"""
+
+    def exists(self, target: Path) -> bool:
+        """判断目标是否已经存在。"""
+
+    def write_text_atomic(self, target: Path, content: str) -> bool:
+        """原子创建文本目标，返回是否由本次调用创建。"""
+
+    def replace_text_atomic(self, target: Path, content: str) -> None:
+        """原子替换已有文本目标，失败时保留原目标。"""
+
+    def write_bytes_atomic(self, target: Path, chunks: Iterable[bytes]) -> bool:
+        """原子创建二进制目标，返回是否由本次调用创建。"""
+
+
+class LocalFileSystem:
+    """使用本地临时文件和硬链接完成原子创建的默认边界。"""
+
+    def exists(self, target: Path) -> bool:
+        """判断本地目标是否存在。"""
+
+        return target.exists()
+
+    def write_text_atomic(self, target: Path, content: str) -> bool:
+        """完整写入并原子创建文本目标。"""
+
+        return self._write_atomic(target, lambda stream: stream.write(content), text=True)
+
+    def replace_text_atomic(self, target: Path, content: str) -> None:
+        """完整写入临时目标后原子替换已有文本目标。"""
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def write_bytes_atomic(self, target: Path, chunks: Iterable[bytes]) -> bool:
+        """流式写入并原子创建二进制目标。"""
+
+        def write(stream: Any) -> None:
+            """把下载块写入临时文件。"""
+
+            for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError("下载响应必须返回字节块")
+                stream.write(chunk)
+
+        return self._write_atomic(target, write, text=False)
+
+    @staticmethod
+    def _write_atomic(target: Path, writer: Callable[[Any], None], *, text: bool) -> bool:
+        """在同一目录完成临时写入和原子创建。"""
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            mode = "w" if text else "wb"
+            with os.fdopen(
+                descriptor, mode, encoding="utf-8" if text else None, newline="" if text else None
+            ) as stream:
+                writer(stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                return False
+            return True
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 class HostHttpTransport:
@@ -65,6 +184,34 @@ class HostHttpTransport:
         except Exception:  # noqa: BLE001 - 非 JSON 响应由客户端处理
             body = None
         return HttpResponse(status_code=int(getattr(response, "status_code", 0) or 0), payload=body)
+
+    def get_stream(self, url: str, headers: Mapping[str, str]) -> DownloadResponse:
+        """发送不自动跟随重定向的流式 GET。"""
+
+        from app.sdk.network import RequestUtils
+
+        request = RequestUtils(headers=dict(headers), timeout=self._timeout, proxies=self._proxies)
+        try:
+            manager = request.get_stream(url, allow_redirects=False)
+            response = manager.__enter__()
+        except Exception as error:
+            raise OpenListError("OpenList 下载请求失败", retryable=True) from error
+        if response is None:
+            manager.__exit__(None, None, None)
+            return DownloadResponse(status_code=0, url=url)
+
+        def close() -> None:
+            """释放宿主流式响应和其临时连接池。"""
+
+            manager.__exit__(None, None, None)
+
+        return DownloadResponse(
+            status_code=int(getattr(response, "status_code", 0) or 0),
+            headers={str(key): str(value) for key, value in getattr(response, "headers", {}).items()},
+            body=response.iter_content(chunk_size=1024 * 1024),
+            url=str(getattr(response, "url", "") or url),
+            _close=close,
+        )
 
 
 def default_transport() -> HttpTransport:
@@ -184,6 +331,51 @@ class OpenListClient:
             page += 1
         return entries
 
+    @contextmanager
+    def open_download(self, remote_path: str) -> Iterator[Iterable[bytes]]:
+        """打开一个无签名下载流，并在跨源重定向时移除管理员 Token。"""
+
+        if not remote_path.startswith("/"):
+            raise OpenListError("下载路径必须是全站绝对路径", retryable=False)
+        url = build_download_url(self._scan_url, remote_path)
+        headers: Mapping[str, str] = self._headers()
+        response: DownloadResponse | None = None
+        for _ in range(MAX_DOWNLOAD_REDIRECTS + 1):
+            try:
+                response = self._transport.get_stream(url, headers)
+            except OpenListError:
+                raise
+            except Exception as error:
+                raise OpenListError("OpenList 下载请求失败", retryable=True) from error
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = _response_header(response.headers, "location")
+                response.close()
+                response = None
+                if not location:
+                    raise OpenListError("OpenList 下载重定向缺少目标", retryable=False)
+                next_url = _strip_url_credentials(urljoin(url, location))
+                headers = self._headers() if _same_origin(url, next_url) else {}
+                url = next_url
+                continue
+            if 200 <= response.status_code < 300:
+                try:
+                    yield response.iter_bytes()
+                finally:
+                    response.close()
+                return
+            status_code = response.status_code
+            response.close()
+            response = None
+            retryable = status_code == 0 or status_code >= 500
+            raise OpenListError(
+                f"OpenList 下载失败（HTTP {status_code}）",
+                retryable=retryable,
+                status_code=status_code,
+            )
+        if response is not None:
+            response.close()
+        raise OpenListError("OpenList 下载重定向过多", retryable=False)
+
 
 def encode_remote_path(remote_path: str) -> str:
     """按路径段编码绝对源路径，保留分隔符且不编码整条 URL。"""
@@ -212,6 +404,57 @@ def build_playback_url(playback_base: str, remote_path: str) -> str:
     return f"{safe_base.rstrip('/')}{DOWNLOAD_PREFIX}{encode_remote_path(remote_path)}"
 
 
+def build_download_url(scan_base: str, remote_path: str) -> str:
+    """拼出扫描地址下的无签名附件下载链接。"""
+
+    return build_playback_url(scan_base, remote_path)
+
+
+def _response_header(headers: Mapping[str, str], name: str) -> str | None:
+    """不区分大小写读取一个 HTTP 响应头。"""
+
+    wanted = name.casefold()
+    for key, value in headers.items():
+        if str(key).casefold() == wanted:
+            return str(value)
+    return None
+
+
+def _strip_url_credentials(url: str) -> str:
+    """移除重定向地址中的用户信息，避免凭据进入后续 URL。"""
+
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        port = ""
+    return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, parsed.query, parsed.fragment))
+
+
+def _same_origin(first: str, second: str) -> bool:
+    """判断两个下载地址是否属于同一协议、主机和端口。"""
+
+    first_parts = urlsplit(first)
+    second_parts = urlsplit(second)
+    if not first_parts.scheme or not first_parts.netloc or not second_parts.scheme or not second_parts.netloc:
+        return False
+    try:
+        first_port = first_parts.port or (443 if first_parts.scheme.casefold() == "https" else 80)
+        second_port = second_parts.port or (443 if second_parts.scheme.casefold() == "https" else 80)
+    except ValueError:
+        return False
+    return (
+        first_parts.scheme.casefold() == second_parts.scheme.casefold()
+        and (first_parts.hostname or "").casefold() == (second_parts.hostname or "").casefold()
+        and first_port == second_port
+    )
+
+
 def is_video_name(name: str, suffixes: frozenset[str]) -> bool:
     """按文件最后一个扩展名匹配宿主媒体后缀，且忽略大小写。"""
 
@@ -222,13 +465,19 @@ def is_video_name(name: str, suffixes: frozenset[str]) -> bool:
 def local_strm_path(output_dir: Path, source_dir: str, remote_path: str) -> Path:
     """保留源目录下相对结构，仅替换最后扩展名为 ``.strm``。"""
 
+    return local_file_path(output_dir, source_dir, remote_path).with_suffix(STRM_SUFFIX)
+
+
+def local_file_path(output_dir: Path, source_dir: str, remote_path: str) -> Path:
+    """保留源目录下相对结构，原样返回附件目标路径。"""
+
     try:
         relative = PurePosixPath(remote_path).relative_to(PurePosixPath(source_dir))
     except ValueError as error:
         raise ValueError("远端文件不在映射源目录下") from error
     if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
         raise ValueError("远端文件相对路径无效")
-    return Path(output_dir).joinpath(*relative.parts).with_suffix(STRM_SUFFIX)
+    return Path(output_dir).joinpath(*relative.parts)
 
 
 @dataclass
@@ -373,6 +622,7 @@ class _MappingRun:
     source_dir: str
     output_dir: Path
     mapping_index: int
+    allowed_suffixes: frozenset[str]
     exclude_keywords: tuple[str, ...]
     status: MappingScanStatus
     playback_changed: bool = False
@@ -413,6 +663,8 @@ class ScanCoordinator:
         dispatch: Callable[[Callable[[], None]], bool] | None = None,
         client_factory: Callable[[str, str], Any] | None = None,
         media_suffix_provider: Callable[[], Sequence[str]] | None = None,
+        whitelist_suffix_provider: Callable[[], Sequence[str]] | None = None,
+        filesystem: OutputFileSystem | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """绑定已保存配置、后台提交器和可替换 OpenList I/O。"""
@@ -424,6 +676,10 @@ class ScanCoordinator:
         self._media_suffix_provider = (
             media_suffix_provider if media_suffix_provider is not None else self._host_suffixes
         )
+        self._whitelist_suffix_provider = (
+            whitelist_suffix_provider if whitelist_suffix_provider is not None else self._host_whitelist_suffixes
+        )
+        self._filesystem = filesystem if filesystem is not None else LocalFileSystem()
         self._clock = clock
         self._lock = threading.Lock()
         self._run: _ScanRun | None = None
@@ -447,6 +703,12 @@ class ScanCoordinator:
         """读取宿主当前媒体后缀设置。"""
 
         return getattr(settings, "RMT_MEDIAEXT", ())
+
+    @staticmethod
+    def _host_whitelist_suffixes() -> Sequence[str]:
+        """动态读取宿主当前媒体与字幕后缀。"""
+
+        return [*getattr(settings, "RMT_MEDIAEXT", ()), *getattr(settings, "RMT_SUBEXT", ())]
 
     def trigger(self, target: ScanTarget | None = None) -> ScanTriggerResult:
         """捕获已保存配置并提交一次后台扫描；运行中触发不排队。"""
@@ -537,6 +799,11 @@ class ScanCoordinator:
         if not isinstance(configuration, PluginConfiguration):
             return ScanTriggerResult(False, "没有可运行的已保存配置")
         snapshot = configuration.model_copy(deep=True)
+        video_suffixes = self._normalise_suffixes(self._media_suffix_provider)
+        try:
+            host_whitelist = self._normalise_values(self._whitelist_suffix_provider())
+        except Exception:  # noqa: BLE001 - 宿主设置异常按空白名单处理
+            host_whitelist = frozenset()
         mappings: list[_MappingRun] = []
         for instance in snapshot.instances:
             for mapping_index, mapping in enumerate(instance.mappings, start=1):
@@ -555,6 +822,11 @@ class ScanCoordinator:
                 )
                 identity = (instance.id, mapping.source_dir, mapping.output_dir)
                 effective_playback_url = instance.effective_playback_url
+                allowed_suffixes = (
+                    host_whitelist
+                    if mapping.whitelist_mode == "follow_host"
+                    else self._normalise_values(mapping.extensions)
+                )
                 mappings.append(
                     _MappingRun(
                         instance_id=instance.id,
@@ -565,6 +837,7 @@ class ScanCoordinator:
                         source_dir=mapping.source_dir,
                         output_dir=Path(mapping.output_dir),
                         mapping_index=mapping_index,
+                        allowed_suffixes=allowed_suffixes,
                         exclude_keywords=tuple(mapping.exclude_keywords),
                         playback_changed=playback_address_changed(
                             self._last_playback_urls.get(identity),
@@ -577,18 +850,30 @@ class ScanCoordinator:
             return ScanTriggerResult(False, "未找到指定的目录映射")
         if not mappings:
             return ScanTriggerResult(False, "没有可运行的目录映射")
-        suffixes: set[str] = set()
+        return _ScanRun(mappings=mappings, video_suffixes=video_suffixes, started_at=self._clock())
+
+    @classmethod
+    def _normalise_suffixes(cls, provider: Callable[[], Sequence[str]]) -> frozenset[str]:
+        """读取并规范一组大小写不敏感的文件后缀。"""
+
         try:
-            values = self._media_suffix_provider()
+            values = provider()
         except Exception:  # noqa: BLE001 - 宿主设置异常按无视频后缀处理
             values = ()
+        return cls._normalise_values(values)
+
+    @staticmethod
+    def _normalise_values(values: Sequence[str]) -> frozenset[str]:
+        """把后缀序列规范为带点的小写集合。"""
+
+        result: set[str] = set()
         for value in values:
             suffix = str(value).strip().casefold()
             if suffix and not suffix.startswith("."):
                 suffix = f".{suffix}"
             if suffix:
-                suffixes.add(suffix)
-        return _ScanRun(mappings=mappings, video_suffixes=frozenset(suffixes), started_at=self._clock())
+                result.add(suffix)
+        return frozenset(result)
 
     def _execute_mappings(self, run: _ScanRun) -> None:
         """逐映射执行并隔离实例、目录和本地写入失败。"""
@@ -640,8 +925,8 @@ class ScanCoordinator:
         mapping.status.error = safe_error.replace(mapping.token, "<redacted>") if mapping.token else safe_error
         mapping.status.counters.failed += 1
 
-    def _scan_mapping(self, reader: Any, mapping: _MappingRun, suffixes: frozenset[str]) -> None:
-        """递归读取源目录并生成视频 STRM；不下载附件或清理输出。"""
+    def _scan_mapping(self, reader: Any, mapping: _MappingRun, video_suffixes: frozenset[str]) -> None:
+        """按任务快照递归筛选并生成视频 STRM 或下载其他白名单文件。"""
 
         pending = [mapping.source_dir]
         while pending:
@@ -655,18 +940,40 @@ class ScanCoordinator:
                 if entry.is_dir:
                     pending.append(remote_path)
                     continue
-                if not is_video_name(entry.name, suffixes):
+                suffix = PurePosixPath(entry.name).suffix.casefold()
+                if not suffix or suffix not in mapping.allowed_suffixes:
                     continue
-                target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
-                if target.exists():
-                    if mapping.playback_changed:
-                        content = build_playback_url(mapping.playback_url, remote_path)
-                        self._update_existing_target(target, content, mapping.status.counters)
-                    else:
-                        mapping.status.counters.skipped += 1
+                if is_video_name(entry.name, video_suffixes):
+                    target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
+                    if self._filesystem.exists(target):
+                        if mapping.playback_changed:
+                            content = build_playback_url(mapping.playback_url, remote_path)
+                            self._update_existing_target(target, content, mapping.status.counters)
+                        else:
+                            mapping.status.counters.skipped += 1
+                        continue
+                    content = build_playback_url(mapping.playback_url, remote_path)
+                    self._write_new_target(target, content, mapping.status.counters)
                     continue
-                content = build_playback_url(mapping.playback_url, remote_path)
-                self._write_new_target(target, content, mapping.status.counters)
+                target = local_file_path(mapping.output_dir, mapping.source_dir, remote_path)
+                if self._filesystem.exists(target):
+                    mapping.status.counters.skipped += 1
+                    continue
+                self._download_target(reader, remote_path, target, mapping.status.counters)
+
+    def _download_target(self, reader: Any, remote_path: str, target: Path, counters: ScanCounters) -> None:
+        """把附件流写入临时目标，失败时只增加失败计数并清理半成品。"""
+
+        try:
+            with reader.open_download(remote_path) as chunks:
+                created = self._filesystem.write_bytes_atomic(target, chunks)
+        except Exception:  # noqa: BLE001 - 单个附件失败不得伪造完整目标
+            counters.failed += 1
+            return
+        if created:
+            counters.downloaded += 1
+        else:
+            counters.skipped += 1
 
     @staticmethod
     def _entry(raw_entry: object) -> RemoteEntry | None:
@@ -687,60 +994,28 @@ class ScanCoordinator:
         folded = name.casefold()
         return any(keyword.casefold() in folded for keyword in keywords)
 
-    @staticmethod
-    def _update_existing_target(target: Path, content: str, counters: ScanCounters) -> None:
-        """完整写入临时文件后原子替换已有 STRM，失败时保留原文件。"""
+    def _update_existing_target(self, target: Path, content: str, counters: ScanCounters) -> None:
+        """通过注入文件系统原子替换已有 STRM，失败时保留原文件。"""
 
-        temporary: Path | None = None
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-                dir=target.parent,
-            )
-            temporary = Path(temporary_name)
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-        except OSError:
+            self._filesystem.replace_text_atomic(target, content)
+        except Exception:  # noqa: BLE001 - 更新失败必须保留原件并支持重试
             counters.failed += 1
             return
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         counters.updated += 1
 
-    @staticmethod
-    def _write_new_target(target: Path, content: str, counters: ScanCounters) -> None:
-        """以临时文件和原子创建写入新目标，避免半成品被视为完整文件。"""
+    def _write_new_target(self, target: Path, content: str, counters: ScanCounters) -> None:
+        """以注入文件系统原子创建新 STRM，避免留下半成品。"""
 
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-                dir=target.parent,
-            )
-            temporary = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                try:
-                    os.link(temporary, target)
-                except FileExistsError:
-                    counters.skipped += 1
-                    return
-            finally:
-                temporary.unlink(missing_ok=True)
-        except OSError:
+            created = self._filesystem.write_text_atomic(target, content)
+        except Exception:  # noqa: BLE001 - 本地写入失败记入映射结果
             counters.failed += 1
             return
-        counters.generated += 1
+        if created:
+            counters.generated += 1
+        else:
+            counters.skipped += 1
 
 
 def playback_address_changed(previous: str | None, current: str) -> bool:
@@ -766,22 +1041,27 @@ __all__ = [
     "FS_LIST_PATH",
     "LIST_PER_PAGE",
     "STRM_SUFFIX",
+    "DownloadResponse",
     "HostHttpTransport",
     "HttpResponse",
     "HttpTransport",
+    "LocalFileSystem",
     "MappingScanStatus",
     "OpenListClient",
     "OpenListError",
+    "OutputFileSystem",
     "RemoteEntry",
     "ScanCoordinator",
     "ScanCounters",
     "ScanStatus",
     "ScanTarget",
     "ScanTriggerResult",
+    "build_download_url",
     "build_playback_url",
     "default_transport",
     "encode_remote_path",
     "is_video_name",
+    "local_file_path",
     "local_strm_path",
     "playback_address_changed",
 ]
