@@ -261,6 +261,8 @@ class Alist2Strm(_PluginBase):
     def _configuration_for_scan(self) -> PluginConfiguration | None:
         """返回当前已保存且有效的配置，供扫描入口在启动时复制。"""
 
+        if getattr(self, "_stopped", False):
+            return None
         configuration = getattr(self, "_configuration", None)
         if not getattr(self, "_configuration_valid", False) or not isinstance(configuration, PluginConfiguration):
             return None
@@ -274,7 +276,20 @@ class Alist2Strm(_PluginBase):
             return bool(injected(task))
         from app.sdk.scheduler import add_plugin_once_job
 
-        return bool(add_plugin_once_job(self._plugin_id(), "manual-scan", task, "Alist2Strm 手动扫描"))
+        return bool(
+            add_plugin_once_job(
+                self._plugin_id(),
+                "manual-scan",
+                self._execute_dispatched_scan,
+                "Alist2Strm 手动扫描",
+                func_kwargs={"task": task},
+            )
+        )
+
+    def _execute_dispatched_scan(self, task: Any) -> None:
+        """在插件实例绑定的一次性任务中执行已捕获的扫描回调。"""
+
+        task()
 
     def _get_scan_coordinator(self) -> ScanCoordinator:
         """惰性取得全插件唯一扫描协调器，兼容无构造函数的 seam 测试对象。"""
@@ -447,8 +462,15 @@ class Alist2Strm(_PluginBase):
         ]
 
     def stop_service(self) -> None:
-        """取消尚未执行的一次性任务、请求活动扫描停止并释放资源。"""
+        """停止接收扫描、移除宿主任务、请求活动扫描停止并释放资源。"""
 
+        self._stopped = True
+        try:
+            from app.sdk.scheduler import remove_plugin_job
+
+            remove_plugin_job(self._plugin_id())
+        except Exception:  # noqa: BLE001 - 卸载时调度器可能已经关闭
+            logger.warning("Alist2Strm 周期调度任务取消失败")
         try:
             from app.sdk.scheduler import remove_plugin_once_job
 
@@ -458,7 +480,6 @@ class Alist2Strm(_PluginBase):
         coordinator = getattr(self, "_scan_coordinator", None)
         if isinstance(coordinator, ScanCoordinator):
             coordinator.shutdown()
-        self._stopped = True
 
 
 __all__ = ["Alist2Strm", "ConfigurationPersistenceError"]
