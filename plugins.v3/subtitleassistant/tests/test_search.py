@@ -41,11 +41,21 @@ def _candidate(key: str, language: str = "en") -> CandidateHandle:
     )
 
 
-@pytest.mark.parametrize("queries", [None, {SubtitleSource.MOVIEPILOT: ""}])
+@pytest.mark.parametrize(
+    ("queries", "expected_normalized"),
+    [
+        (None, {SubtitleSource.MOVIEPILOT: None, SubtitleSource.OPENSUBTITLES: None, SubtitleSource.ASSRT: None}),
+        (
+            {SubtitleSource.MOVIEPILOT: ""},
+            {SubtitleSource.MOVIEPILOT: "", SubtitleSource.OPENSUBTITLES: None, SubtitleSource.ASSRT: None},
+        ),
+    ],
+)
 async def test_shared_search_preserves_candidates_source_results_and_query_inputs(
     queries: dict[SubtitleSource, str | None] | None,
+    expected_normalized: dict[SubtitleSource, str | None],
 ) -> None:
-    """共享搜索不准入、不识别、不重排，并保留空查询词和来源失败信息。"""
+    """共享搜索标准化查询词、不准入、不识别、不重排，并保留来源失败信息。"""
 
     target = _target().context
     candidates = [_candidate("unrecognized-english"), _candidate("chinese", "zh-CN")]
@@ -67,7 +77,7 @@ async def test_shared_search_preserves_candidates_source_results_and_query_input
     assert result.sources[SubtitleSource.MOVIEPILOT].candidates == candidates
     assert candidates[0].candidate.language == "en"
     assert target.english_title is None
-    source.query.assert_awaited_once_with(target, queries)
+    source.query.assert_awaited_once_with(target, expected_normalized)
 
 
 async def test_search_session_resolves_only_its_candidates_and_preserves_first_duplicate() -> None:

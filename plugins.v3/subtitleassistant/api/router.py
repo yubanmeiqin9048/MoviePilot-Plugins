@@ -475,10 +475,8 @@ class ApiController:
         if target is None:
             raise LookupError("目标整理历史不存在或已不可用")
         target = await enrich_search_target(target, self._media_resolver)
-        values = custom_queries or {}
+        batch = await self._search.search(target.context, custom_queries)
         ordered_sources = list(SubtitleSource)
-        normalized_queries = {source: values.get(source, values.get(source.value)) for source in ordered_sources}
-        batch = await self._search.search(target.context, normalized_queries)
         runs = [batch.sources[source] for source in ordered_sources]
         for run in runs:
             self._log_source_result(history_id, run)
