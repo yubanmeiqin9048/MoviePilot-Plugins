@@ -1,0 +1,22 @@
+[tool.ty.environment]
+python-version = "3.14"
+python-platform = "linux"
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+extend-select = ["B", "W", "PERF", "UP", "I", "SIM"]
+ignore = ["SIM105"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
