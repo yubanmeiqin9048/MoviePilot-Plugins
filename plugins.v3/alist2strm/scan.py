@@ -90,6 +90,12 @@ class OutputFileSystem(Protocol):
     def write_bytes_atomic(self, target: Path, chunks: Iterable[bytes]) -> bool:
         """原子创建二进制目标，返回是否由本次调用创建。"""
 
+    def iter_files(self, root: Path) -> Iterable[Path]:
+        """枚举当前输出根目录下的文件。"""
+
+    def unlink(self, target: Path) -> None:
+        """删除一个受管产物文件。"""
+
 
 class LocalFileSystem:
     """使用本地临时文件和硬链接完成原子创建的默认边界。"""
@@ -135,6 +141,26 @@ class LocalFileSystem:
                 stream.write(chunk)
 
         return self._write_atomic(target, write, text=False)
+
+    def iter_files(self, root: Path) -> Iterable[Path]:
+        """枚举输出根目录下的文件，不跟随目录符号链接。"""
+
+        for target in root.rglob("*"):
+            if target == root:
+                continue
+            try:
+                relative = target.relative_to(root)
+            except ValueError:
+                continue
+            if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+                continue
+            if target.is_file():
+                yield target
+
+    def unlink(self, target: Path) -> None:
+        """删除一个本地产物文件。"""
+
+        target.unlink()
 
     @staticmethod
     def _write_atomic(target: Path, writer: Callable[[Any], None], *, text: bool) -> bool:
@@ -717,6 +743,7 @@ class _MappingRun:
     exclude_keywords: tuple[str, ...]
     status: MappingScanStatus
     playback_changed: bool = False
+    expected_outputs: set[Path] = field(default_factory=set)
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -1109,9 +1136,18 @@ class ScanCoordinator:
                         if not mapping.status.error:
                             mapping.status.error = "映射内存在失败操作"
                     else:
-                        self._remember_playback_identity(mapping)
-                        mapping.status.state = "success"
                         mapping.status.cleanup_eligible = True
+                        self._cleanup_mapping(mapping, run)
+                        self._observe_stop(run)
+                        if mapping.status.counters.failed:
+                            mapping.status.state = "failed"
+                            mapping.status.cleanup_eligible = False
+                            if not mapping.status.error:
+                                mapping.status.error = "映射内存在失败操作"
+                        else:
+                            self._remember_playback_identity(mapping)
+                            mapping.status.state = "success"
+                            mapping.status.cleanup_eligible = True
                 except ScanStopped:
                     self._mark_mapping_stopped(mapping)
                     raise
@@ -1258,6 +1294,7 @@ class ScanCoordinator:
                         continue
                     if is_video_name(entry.name, video_suffixes):
                         target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
+                        mapping.expected_outputs.add(target)
                         if self._filesystem.exists(target):
                             if mapping.playback_changed:
                                 content = build_playback_url(mapping.playback_url, remote_path)
@@ -1270,6 +1307,7 @@ class ScanCoordinator:
                             failure = self._write_new_target(target, content, mapping.status.counters)
                     else:
                         target = local_file_path(mapping.output_dir, mapping.source_dir, remote_path)
+                        mapping.expected_outputs.add(target)
                         if self._filesystem.exists(target):
                             mapping.status.counters.skipped += 1
                             failure = None
@@ -1293,6 +1331,49 @@ class ScanCoordinator:
                 except Exception as error:  # noqa: BLE001 - 单文件失败不得阻断同目录文件
                     mapping.status.counters.failed += 1
                     self._record_mapping_error(mapping, f"文件处理失败：{error}")
+
+    def _cleanup_mapping(self, mapping: _MappingRun, run: _ScanRun) -> None:
+        """按本轮完整快照清理当前输出根目录内的受管文件。"""
+
+        managed_suffixes = self._managed_output_suffixes(mapping.allowed_suffixes, run.video_suffixes)
+        self._observe_stop(run)
+        for raw_target in self._filesystem.iter_files(mapping.output_dir):
+            self._observe_stop(run)
+            target = Path(raw_target)
+            if not self._within_output_root(mapping.output_dir, target):
+                continue
+            if target in mapping.expected_outputs or target.suffix.casefold() not in managed_suffixes:
+                continue
+            try:
+                self._filesystem.unlink(target)
+            except ScanStopped:
+                raise
+            except Exception as error:  # noqa: BLE001 - 单项删除失败不得阻断其他产物
+                mapping.status.counters.failed += 1
+                self._record_mapping_error(mapping, f"清理文件 {target}：删除失败（{error}）")
+                continue
+            mapping.status.counters.deleted += 1
+
+    @staticmethod
+    def _managed_output_suffixes(allowed_suffixes: frozenset[str], video_suffixes: frozenset[str]) -> frozenset[str]:
+        """返回当前映射仍管理的本地产物后缀。"""
+
+        managed = set(allowed_suffixes - video_suffixes)
+        if allowed_suffixes.intersection(video_suffixes):
+            managed.add(STRM_SUFFIX)
+        return frozenset(managed)
+
+    @staticmethod
+    def _within_output_root(root: Path, target: Path) -> bool:
+        """判断候选文件是否位于当前输出根目录下。"""
+
+        if target == root:
+            return False
+        try:
+            relative = target.relative_to(root)
+        except ValueError:
+            return False
+        return bool(relative.parts) and not any(part in {"", ".", ".."} for part in relative.parts)
 
     def _run_for_mapping(self, mapping: _MappingRun) -> _ScanRun:
         """取得映射所属运行，供目录与文件边界观察停止请求。"""

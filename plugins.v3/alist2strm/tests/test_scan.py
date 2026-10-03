@@ -13,6 +13,7 @@ from app.plugins.alist2strm.config import build_configuration  # ty: ignore[unre
 from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     DownloadResponse,
     HttpResponse,
+    LocalFileSystem,
     OpenListClient,
     OpenListError,
     RemoteEntry,
@@ -180,7 +181,7 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_downloads_attac
         "https://scan-b.example.invalid/d/other/Movie.MKV"
     )
     assert existing.read_text(encoding="utf-8") == "hand made"
-    assert orphan.read_text(encoding="utf-8") == "keep"
+    assert not orphan.exists()
     assert (tmp_path / "a" / "notes.srt").read_bytes() == (
         b"download:https://scan-a.example.invalid/d/media/movies/notes.srt"
     )
@@ -194,7 +195,7 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_downloads_attac
         "downloaded": 1,
         "updated": 0,
         "skipped": 1,
-        "deleted": 0,
+        "deleted": 1,
         "failed": 0,
     }
     assert status["total_mappings"] == 3
@@ -431,6 +432,8 @@ def test_playback_update_failure_preserves_original_and_rescan_recovers(
     queue.run()
     target = tmp_path / "recovery" / "Movie.strm"
     original = target.read_text(encoding="utf-8")
+    stale = tmp_path / "recovery" / "stale.strm"
+    stale.write_text("must remain after update failure", encoding="utf-8")
 
     current[0] = replacement
 
@@ -449,6 +452,7 @@ def test_playback_update_failure_preserves_original_and_rescan_recovers(
     assert failed_status["counters"]["updated"] == 0  # type: ignore[index]
     assert failed_status["counters"]["failed"] == 1  # type: ignore[index]
     assert failed_status["mappings"][0]["state"] == "failed"  # type: ignore[index]
+    assert stale.is_file()
 
     monkeypatch.undo()
     assert coordinator.trigger().accepted is True
@@ -527,6 +531,10 @@ def test_scan_uses_empty_directories_as_success_and_isolates_bad_mapping(tmp_pat
         client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
         media_suffix_provider=lambda: (".mkv",),
     )
+    (tmp_path / "a" / "stale.strm").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "a" / "stale.strm").write_text("stale", encoding="utf-8")
+    (tmp_path / "b" / "stale.strm").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "b" / "stale.strm").write_text("stale", encoding="utf-8")
 
     assert coordinator.trigger().accepted is True
     queue.run()
@@ -535,9 +543,12 @@ def test_scan_uses_empty_directories_as_success_and_isolates_bad_mapping(tmp_pat
     assert status["state"] == "partial_failure"
     assert status["counters"]["generated"] == 1  # type: ignore[index]
     assert status["counters"]["failed"] == 1  # type: ignore[index]
+    assert status["counters"]["deleted"] == 1  # type: ignore[index]
     assert status["mappings"][1]["state"] == "success"  # type: ignore[index]
     assert status["mappings"][2]["state"] == "failed"  # type: ignore[index]
     assert (tmp_path / "a" / "ok.strm").is_file()
+    assert not (tmp_path / "a" / "stale.strm").exists()
+    assert (tmp_path / "b" / "stale.strm").is_file()
     assert not (tmp_path / "empty").exists()
 
 
@@ -1449,3 +1460,480 @@ def test_playback_url_encodes_each_path_segment_without_double_encoding() -> Non
     assert build_playback_url("https://user:password@play.example.invalid/base?token=secret", "/movie.mkv") == (
         "https://play.example.invalid/base/d/movie.mkv"
     )
+
+
+def test_complete_scan_cleans_current_snapshot_and_protects_other_files(tmp_path: Path) -> None:
+    """完整快照清理改名旧产物、排除子树和手工文件，并保护无关位置。"""
+
+    output = tmp_path / "current"
+    old_output = tmp_path / "old-location"
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "cleanup",
+                    "name": "清理实例",
+                    "scan_url": "https://cleanup.example.invalid",
+                    "api_token": "cleanup-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".srt"],
+                            "exclude_keywords": "Sample",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    output.mkdir(parents=True)
+    (output / "Renamed.strm").write_text("hand made", encoding="utf-8")
+    (output / "Original.strm").write_text("old source", encoding="utf-8")
+    (output / "manual.strm").write_text("manual", encoding="utf-8")
+    (output / "stale.srt").write_bytes(b"stale")
+    (output / "Sample subtree" / "hidden.strm").parent.mkdir(parents=True)
+    (output / "Sample subtree" / "hidden.strm").write_text("excluded", encoding="utf-8")
+    (output / "unmanaged.jpg").write_bytes(b"keep")
+    (old_output / "Original.strm").parent.mkdir(parents=True)
+    (old_output / "Original.strm").write_text("old location", encoding="utf-8")
+    transport = _Transport(
+        {
+            "https://cleanup.example.invalid": {
+                "/library": [
+                    {"name": "Renamed.mkv", "is_dir": False},
+                    {"name": "subtitle.srt", "is_dir": False},
+                    {"name": "Sample subtree", "is_dir": True},
+                ]
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert (output / "Renamed.strm").read_text(encoding="utf-8") == "hand made"
+    assert (output / "subtitle.srt").is_file()
+    assert not (output / "Original.strm").exists()
+    assert not (output / "manual.strm").exists()
+    assert not (output / "stale.srt").exists()
+    assert not (output / "Sample subtree" / "hidden.strm").exists()
+    assert (output / "unmanaged.jpg").is_file()
+    assert (old_output / "Original.strm").is_file()
+    status = coordinator.status()
+    assert status["state"] == "success"
+    assert status["counters"] == {
+        "generated": 0,
+        "downloaded": 1,
+        "updated": 0,
+        "skipped": 1,
+        "deleted": 4,
+        "failed": 0,
+    }
+    assert status["mappings"][0]["cleanup_eligible"] is True  # type: ignore[index]
+
+
+def test_empty_complete_scan_cleans_all_currently_managed_files(tmp_path: Path) -> None:
+    """成功的空目录快照也清理当前管理类型并保留无关文件。"""
+
+    output = tmp_path / "empty"
+    output.mkdir()
+    (output / "stale.strm").write_text("stale", encoding="utf-8")
+    (output / "stale.srt").write_bytes(b"stale")
+    (output / "unmanaged.txt").write_text("keep", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "empty",
+                    "name": "空目录实例",
+                    "scan_url": "https://empty-cleanup.example.invalid",
+                    "api_token": "empty-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".srt"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    queue = _Queue()
+    transport = _Transport({"https://empty-cleanup.example.invalid": {"/library": []}})
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert not (output / "stale.strm").exists()
+    assert not (output / "stale.srt").exists()
+    assert (output / "unmanaged.txt").is_file()
+    status = coordinator.status()
+    assert status["state"] == "success"
+    assert status["counters"]["deleted"] == 2  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is True  # type: ignore[index]
+
+
+def test_removed_suffix_is_preserved_while_strm_management_follows_video_whitelist(tmp_path: Path) -> None:
+    """移除附件后缀保留，视频白名单仍在时管理 STRM，退出后保留 STRM。"""
+
+    output = tmp_path / "suffixes"
+    first = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "suffixes",
+                    "name": "后缀实例",
+                    "scan_url": "https://suffixes.example.invalid",
+                    "api_token": "suffix-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    second = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "suffixes",
+                    "name": "后缀实例",
+                    "scan_url": "https://suffixes.example.invalid",
+                    "api_token": "suffix-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".srt"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    output.mkdir()
+    (output / "video.strm").write_text("managed while video enabled", encoding="utf-8")
+    (output / "removed.srt").write_bytes(b"keep after removal")
+    transport = _Transport({"https://suffixes.example.invalid": {"/library": []}})
+    current = [first]
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: current[0],
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+    assert not (output / "video.strm").exists()
+    assert (output / "removed.srt").is_file()
+
+    (output / "legacy.strm").write_text("strm is no longer managed", encoding="utf-8")
+    (output / "stale.srt").write_bytes(b"managed attachment")
+    current[0] = second
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert (output / "legacy.strm").is_file()
+    assert not (output / "removed.srt").exists()
+    assert not (output / "stale.srt").exists()
+    assert coordinator.status()["counters"]["deleted"] == 2  # type: ignore[index]
+
+
+@pytest.mark.parametrize("failure", ["directory", "generation", "download", "enumeration"])
+def test_incomplete_scan_or_cleanup_enumeration_never_cleans(tmp_path: Path, failure: str) -> None:
+    """目录、生成、下载和清理枚举失败均保留既有受管文件。"""
+
+    output = tmp_path / failure
+    output.mkdir()
+    managed_name = "stale.srt" if failure == "download" else "stale.strm"
+    managed = output / managed_name
+    managed.write_text("must remain", encoding="utf-8")
+    suffix = ".srt" if failure == "download" else ".mkv"
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": failure,
+                    "name": f"失败 {failure}",
+                    "scan_url": f"https://{failure}.example.invalid",
+                    "api_token": "failure-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [suffix],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    class Reader:
+        """提供一个受控失败或空快照。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回当前失败场景的源目录结果。"""
+
+            if failure == "directory":
+                raise OpenListError("目录读取失败", retryable=False)
+            if failure == "download":
+                return [RemoteEntry("attachment.srt", False)]
+            if failure == "generation":
+                return [RemoteEntry("movie.mkv", False)]
+            return []
+
+        def open_download(self, path: str) -> Any:
+            """让附件下载在打开阶段失败。"""
+
+            from contextlib import contextmanager
+
+            @contextmanager
+            def opened() -> Any:
+                """抛出受控下载错误。"""
+
+                raise OpenListError("下载失败", retryable=False)
+                yield ()
+
+            return opened()
+
+    class FileSystem(LocalFileSystem):
+        """在生成或清理枚举边界注入失败。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """模拟 STRM 创建失败。"""
+
+            if failure == "generation":
+                raise OSError("generation failed")
+            return super().write_text_atomic(target, content)
+
+        def iter_files(self, root: Path) -> Any:
+            """模拟清理候选枚举失败。"""
+
+            if failure == "enumeration":
+                raise OSError("enumeration failed")
+            return super().iter_files(root)
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        filesystem=FileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+        sleep=lambda _delay: None,
+        retry_backoff=lambda _attempt: 0,
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    status = coordinator.status()
+    assert managed.is_file()
+    assert status["state"] != "success"
+    assert status["mappings"][0]["state"] == "failed"  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+    assert status["counters"]["failed"] >= 1  # type: ignore[index]
+
+
+def test_cleanup_never_unlinks_candidate_outside_current_output_root(tmp_path: Path) -> None:
+    """注入枚举即使返回根目录外路径，也只能删除当前根内文件。"""
+
+    output = tmp_path / "current"
+    outside = tmp_path / "outside.strm"
+    output.mkdir()
+    inside = output / "inside.strm"
+    inside.write_text("inside", encoding="utf-8")
+    outside.write_text("outside", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "boundary",
+                    "name": "边界实例",
+                    "scan_url": "https://boundary.example.invalid",
+                    "api_token": "boundary-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+                }
+            ]
+        }
+    )
+
+    class FileSystem(LocalFileSystem):
+        """返回一个越界候选和一个当前根候选。"""
+
+        def iter_files(self, root: Path) -> Any:
+            """提供受控候选列表。"""
+
+            return [outside, inside]
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: _EmptyReader(),
+        filesystem=FileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    assert not inside.exists()
+    assert outside.is_file()
+    assert coordinator.status()["counters"]["deleted"] == 1  # type: ignore[index]
+
+
+class _EmptyReader:
+    """清理测试使用的空源目录替身。"""
+
+    def list_dir(self, path: str) -> list[RemoteEntry]:
+        """返回空目录。"""
+
+        return []
+
+
+def test_cleanup_delete_failure_continues_and_marks_run_failed(tmp_path: Path) -> None:
+    """单项删除失败后继续删除其他候选并计入失败。"""
+
+    output = tmp_path / "delete-failure"
+    output.mkdir()
+    first = output / "first.strm"
+    second = output / "second.strm"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "delete-failure",
+                    "name": "删除失败实例",
+                    "scan_url": "https://delete-failure.example.invalid",
+                    "api_token": "delete-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+                }
+            ]
+        }
+    )
+
+    class FileSystem(LocalFileSystem):
+        """让第一项删除失败而允许后续项完成。"""
+
+        def iter_files(self, root: Path) -> Any:
+            """返回稳定顺序的两个候选。"""
+
+            return [first, second]
+
+        def unlink(self, target: Path) -> None:
+            """只拒绝第一项。"""
+
+            if target == first:
+                raise OSError("unlink failed")
+            super().unlink(target)
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: _EmptyReader(),
+        filesystem=FileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    status = coordinator.status()
+    assert first.is_file()
+    assert not second.exists()
+    assert status["state"] == "partial_failure"
+    assert status["counters"]["deleted"] == 1  # type: ignore[index]
+    assert status["counters"]["failed"] == 1  # type: ignore[index]
+    assert status["mappings"][0]["state"] == "failed"  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
+def test_cleanup_stop_finishes_current_unlink_and_blocks_next_candidate(tmp_path: Path) -> None:
+    """清理期间停止完成当前删除，不启动下一项且不回滚。"""
+
+    output = tmp_path / "stop-cleanup"
+    output.mkdir()
+    first = output / "first.strm"
+    second = output / "second.strm"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "stop-cleanup",
+                    "name": "停止清理实例",
+                    "scan_url": "https://stop-cleanup.example.invalid",
+                    "api_token": "stop-token",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(output)}],
+                }
+            ]
+        }
+    )
+    coordinator: ScanCoordinator
+
+    class FileSystem(LocalFileSystem):
+        """在第一项删除完成后请求停止。"""
+
+        def iter_files(self, root: Path) -> Any:
+            """返回稳定顺序的两个候选。"""
+
+            return [first, second]
+
+        def unlink(self, target: Path) -> None:
+            """第一项完成后发出停止请求。"""
+
+            super().unlink(target)
+            if target == first:
+                assert coordinator.stop().as_dict() == {"accepted": True, "message": "扫描正在停止"}
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: _EmptyReader(),
+        filesystem=FileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    status = coordinator.status()
+    assert not first.exists()
+    assert second.is_file()
+    assert status["state"] == "stopped"
+    assert status["counters"]["deleted"] == 1  # type: ignore[index]
+    assert status["counters"]["failed"] == 0  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
