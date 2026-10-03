@@ -1844,6 +1844,71 @@ def test_incomplete_scan_or_cleanup_enumeration_never_cleans(tmp_path: Path, fai
     assert status["counters"]["failed"] >= 1  # type: ignore[index]
 
 
+def test_later_page_failure_preserves_stale_output_and_skips_cleanup(tmp_path: Path) -> None:
+    """分页后页失败时保留旧产物并禁止清理。"""
+
+    output = tmp_path / "later-page-failure"
+    output.mkdir()
+    stale = output / "stale.strm"
+    stale.write_text("must remain", encoding="utf-8")
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "later-page-failure",
+                    "name": "后页失败实例",
+                    "scan_url": "https://later-page-failure.example.invalid",
+                    "api_token": "later-page-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    class Transport(_Transport):
+        """只让目录第二页返回不可重试的服务失败。"""
+
+        def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+            """在后页边界返回服务错误。"""
+
+            if payload.get("path") == "/library" and int(payload.get("page", 0)) == 2:
+                return HttpResponse(503, {"code": 503, "data": None})
+            return super().post_json(url, payload, headers)
+
+    transport = Transport(
+        {
+            "https://later-page-failure.example.invalid": {
+                "/library": [
+                    {"name": "new.mkv", "is_dir": False},
+                    {"name": "another.mkv", "is_dir": False},
+                ]
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport, per_page=1, max_retries=0),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    status = coordinator.status()
+    assert stale.is_file()
+    assert status["state"] == "failed"
+    assert status["counters"]["deleted"] == 0  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
 def test_child_directory_failure_preserves_stale_candidates(tmp_path: Path) -> None:
     """子目录读取最终失败时不清理已有受管产物。"""
 
@@ -2041,6 +2106,65 @@ def test_symlink_aliases_disqualify_selected_cleanup_and_configuration_validatio
     assert stale.is_file()
     status = coordinator.status()
     assert status["mappings"][0]["cleanup_eligible"] is False  # type: ignore[index]
+
+
+def test_internal_output_symlink_preserves_expected_strm_by_resolved_identity(tmp_path: Path) -> None:
+    """输出根内的目录别名不会让清理删除实际预期 STRM。"""
+
+    output = tmp_path / "output"
+    real_directory = output / "real"
+    real_directory.mkdir(parents=True)
+    alias_directory = output / "alias"
+    alias_directory.symlink_to(real_directory, target_is_directory=True)
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "internal-alias",
+                    "name": "内部别名实例",
+                    "scan_url": "https://internal-alias.example.invalid",
+                    "api_token": "internal-alias-token",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    class Reader:
+        """通过输出根内的别名目录返回一个视频。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """返回别名目录和其视频。"""
+
+            if path == "/library":
+                return [RemoteEntry("alias", True)]
+            return [RemoteEntry("Movie.mkv", False)]
+
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        filesystem=LocalFileSystem(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    target = real_directory / "Movie.strm"
+    assert target.is_file()
+    status = coordinator.status()
+    assert status["state"] == "success"
+    assert status["counters"]["generated"] == 1  # type: ignore[index]
+    assert status["counters"]["deleted"] == 0  # type: ignore[index]
+    assert status["mappings"][0]["cleanup_eligible"] is True  # type: ignore[index]
 
 
 def test_local_filesystem_child_enumeration_failure_blocks_cleanup(

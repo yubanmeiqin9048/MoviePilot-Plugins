@@ -756,6 +756,8 @@ class _MappingRun:
     status: MappingScanStatus
     playback_changed: bool = False
     expected_outputs: set[Path] = field(default_factory=set)
+    expected_output_identities: set[Path] = field(default_factory=set)
+    expected_output_resolution_failed: bool = False
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -1184,7 +1186,9 @@ class ScanCoordinator:
                         else:
                             self._remember_playback_identity(mapping)
                             mapping.status.state = "success"
-                            mapping.status.cleanup_eligible = not run.cleanup_disqualified
+                            mapping.status.cleanup_eligible = (
+                                not run.cleanup_disqualified and not mapping.expected_output_resolution_failed
+                            )
                 except ScanStopped:
                     self._mark_mapping_stopped(mapping)
                     raise
@@ -1331,7 +1335,7 @@ class ScanCoordinator:
                         continue
                     if is_video_name(entry.name, video_suffixes):
                         target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
-                        mapping.expected_outputs.add(target)
+                        self._remember_expected_output(mapping, target)
                         if self._filesystem.exists(target):
                             if mapping.playback_changed:
                                 content = build_playback_url(mapping.playback_url, remote_path)
@@ -1344,7 +1348,7 @@ class ScanCoordinator:
                             failure = self._write_new_target(target, content, mapping.status.counters)
                     else:
                         target = local_file_path(mapping.output_dir, mapping.source_dir, remote_path)
-                        mapping.expected_outputs.add(target)
+                        self._remember_expected_output(mapping, target)
                         if self._filesystem.exists(target):
                             mapping.status.counters.skipped += 1
                             failure = None
@@ -1369,8 +1373,25 @@ class ScanCoordinator:
                     mapping.status.counters.failed += 1
                     self._record_mapping_error(mapping, f"文件处理失败：{error}")
 
+    def _remember_expected_output(self, mapping: _MappingRun, target: Path) -> None:
+        """记录预期产物的词法与解析身份，解析失败时保守禁用清理。"""
+
+        mapping.expected_outputs.add(target)
+        try:
+            mapping.expected_output_identities.add(target.resolve(strict=False))
+        except OSError, RuntimeError:
+            mapping.expected_output_resolution_failed = True
+
     def _cleanup_mapping(self, mapping: _MappingRun, run: _ScanRun) -> None:
         """按本轮完整快照清理当前输出根目录内的受管文件。"""
+
+        if mapping.expected_output_resolution_failed:
+            mapping.status.cleanup_eligible = False
+            logger.warning(
+                f"Alist2Strm 已跳过受管产物清理：实例“{mapping.instance_name}”，"
+                f"映射 {mapping.mapping_index}（{mapping.source_dir}），预期产物路径解析失败"
+            )
+            return
 
         if run.cleanup_disqualified:
             mapping.status.cleanup_eligible = False
@@ -1388,7 +1409,13 @@ class ScanCoordinator:
             target = Path(raw_target)
             if not self._within_output_root(mapping.output_dir, target):
                 continue
-            if target in mapping.expected_outputs or target.suffix.casefold() not in managed_suffixes:
+            try:
+                target_identity = target.resolve(strict=False)
+            except OSError, RuntimeError:
+                continue
+            if target in mapping.expected_outputs or target_identity in mapping.expected_output_identities:
+                continue
+            if target.suffix.casefold() not in managed_suffixes:
                 continue
             candidates.append(target)
 
