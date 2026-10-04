@@ -50,6 +50,7 @@ class Alist2Strm(_PluginBase):
 
     SECRET_DATA_KEY = "configuration_secrets_v1"
     HISTORY_DATA_KEY = SCAN_HISTORY_DATA_KEY
+    HISTORY_RETENTION_CRON = "0 4 * * *"
     PersistenceError = ConfigurationPersistenceError
 
     def __init__(self) -> None:
@@ -64,6 +65,7 @@ class Alist2Strm(_PluginBase):
         # 当前票据仅通过宿主一次性任务执行手动扫描；保存和启动不会调用它。
         self._scan_coordinator: ScanCoordinator | None = None
         self._history_store: HistoryStore | None = None
+        self._history_recovery_done = False
         self.scan_invocations = 0
 
     def _plugin_id(self) -> str:
@@ -151,6 +153,15 @@ class Alist2Strm(_PluginBase):
 
         self._get_history_store().record_status(status)
 
+    def _recover_or_prune_history(self, retention_days: int) -> None:
+        """仅在插件实例首次初始化执行重启恢复，后续重应用只清理保留记录。"""
+
+        if not getattr(self, "_history_recovery_done", False):
+            self._recover_history(retention_days)
+            self._history_recovery_done = True
+        else:
+            self._prune_history(retention_days)
+
     def _discard_scan_history(self, run_id: str) -> None:
         """移除调度拒绝的扫描初始记录。"""
 
@@ -169,13 +180,13 @@ class Alist2Strm(_PluginBase):
             self._secret_tokens = existing_tokens
             self._configuration_valid = False
             logger.error(f"Alist2Strm 配置无效，插件未进入运行视图：{error}")
-            self._recover_history(90)
+            self._recover_or_prune_history(90)
             return
         self._configuration = candidate
         self._secret_tokens = secret_tokens(candidate)
         self._configuration_valid = True
         self._stopped = False
-        self._recover_history(candidate.history_retention_days)
+        self._recover_or_prune_history(candidate.history_retention_days)
 
     def get_state(self) -> bool:
         """返回当前配置是否有效且可进入后续运行视图。"""
@@ -183,32 +194,51 @@ class Alist2Strm(_PluginBase):
         return bool(getattr(self, "_configuration_valid", False) and getattr(self, "_configuration", None))
 
     def get_service(self) -> list[dict[str, Any]]:
-        """按已保存的全局计划向宿主声明唯一 Cron 服务，不触发扫描。"""
+        """声明独立的历史清理 Cron，并按开关声明共用扫描 Cron。"""
 
         if getattr(self, "_stopped", False):
             return []
         configuration = getattr(self, "_configuration", None)
         if not getattr(self, "_configuration_valid", False) or not isinstance(configuration, PluginConfiguration):
             return []
+        common_kwargs = {
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": None,
+        }
+        services: list[dict[str, Any]] = [
+            {
+                "id": "history-retention",
+                "name": "Alist2Strm 历史保留清理",
+                "trigger": CronTrigger.from_crontab(self.HISTORY_RETENTION_CRON),
+                "func": self.retention_cleanup,
+                "kwargs": common_kwargs.copy(),
+            }
+        ]
         if not configuration.schedule_enabled:
-            return []
+            return services
         try:
             trigger = CronTrigger.from_crontab(configuration.schedule_cron)
         except TypeError, ValueError:
-            return []
-        return [
+            return services
+        services.insert(
+            0,
             {
                 "id": "shared-scan",
                 "name": "Alist2Strm 共用定时扫描",
                 "trigger": trigger,
                 "func": self.scheduled_scan,
-                "kwargs": {
-                    "coalesce": True,
-                    "max_instances": 1,
-                    "misfire_grace_time": None,
-                },
-            }
-        ]
+                "kwargs": common_kwargs,
+            },
+        )
+        return services
+
+    def retention_cleanup(self) -> None:
+        """执行仅历史 PluginData 的每日保留清理，不触发扫描。"""
+
+        configuration = getattr(self, "_configuration", None)
+        if isinstance(configuration, PluginConfiguration):
+            self._prune_history(configuration.history_retention_days)
 
     def scheduled_scan(self) -> dict[str, object]:
         """通过现有全量扫描入口触发一次定时运行，不创建第二套扫描流程。"""
@@ -473,16 +503,6 @@ class Alist2Strm(_PluginBase):
         _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
     ) -> dict[str, object]:
         """分页读取管理员扫描历史，不下发触发、清理或逐文件信息。"""
-
-        return self.get_history_page(page, page_size)
-
-    def history(
-        self,
-        page: int = Query(default=1, ge=1),
-        page_size: int = Query(default=DEFAULT_HISTORY_PAGE_SIZE, ge=1, le=MAX_HISTORY_PAGE_SIZE),
-        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
-    ) -> dict[str, object]:
-        """兼容调用方名称的历史分页入口。"""
 
         return self.get_history_page(page, page_size)
 

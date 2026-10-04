@@ -20,6 +20,7 @@ from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
     ConfigurationValidationError,
     build_configuration,
 )
+from app.plugins.alist2strm.history import HistoryStore  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.scan import RemoteEntry  # ty: ignore[unresolved-import]
 from app.scheduler.oncejob import SchedulerPluginOnceJobOwner
 from app.scheduler.reconcile import SchedulerReconcileOwner
@@ -126,7 +127,9 @@ class _Reader:
         return []
 
 
-def _payload(*, enabled: bool, cron: str = "0 3 * * *", output_dir: str = "/strm") -> dict[str, object]:
+def _payload(
+    *, enabled: bool, cron: str = "0 3 * * *", output_dir: str = "/strm", retention_days: int = 90
+) -> dict[str, object]:
     """构造共用计划测试使用的已保存配置载荷。"""
 
     return {
@@ -141,6 +144,7 @@ def _payload(*, enabled: bool, cron: str = "0 3 * * *", output_dir: str = "/strm
         ],
         "schedule_enabled": enabled,
         "schedule_cron": cron,
+        "history_retention_days": retention_days,
     }
 
 
@@ -158,24 +162,65 @@ def _plugin(payload: dict[str, object] | None = None) -> Alist2Strm:
 
 
 def test_enabled_configuration_registers_one_host_cron_service() -> None:
-    """启用且有效的共用计划只注册一个宿主 Cron 服务。"""
+    """启用且有效的共用计划注册扫描服务，并始终注册历史清理服务。"""
 
     plugin = _plugin(_payload(enabled=True, cron="*/15 * * * *"))
 
     services = plugin.get_service()
 
-    assert len(services) == 1
+    assert len(services) == 2
     service = services[0]
     assert service["id"] == "shared-scan"
     assert isinstance(service["trigger"], CronTrigger)
     assert service["func"].__self__ is plugin
     assert service["kwargs"] == {"coalesce": True, "max_instances": 1, "misfire_grace_time": None}
+    retention = services[1]
+    assert retention["id"] == "history-retention"
+    assert isinstance(retention["trigger"], CronTrigger)
+    assert retention["func"].__self__ is plugin
+
+
+def test_disabled_configuration_keeps_daily_history_retention_service() -> None:
+    """关闭扫描计划仍声明每日历史保留清理，执行时不触发扫描。"""
+
+    plugin = _plugin(_payload(enabled=False, retention_days=1))
+    now = 1_704_153_600.0
+    state: dict[str, object] = {
+        "value": {
+            "version": 1,
+            "items": [
+                {
+                    "id": "expired",
+                    "started_at": "2023-12-30T00:00:00+00:00",
+                    "state": "success",
+                    "counters": {},
+                    "mappings": [],
+                }
+            ],
+        }
+    }
+    plugin._history_store = HistoryStore(
+        lambda: state["value"],
+        lambda value: state.__setitem__("value", value),
+        clock=lambda: now,
+    )
+
+    services = plugin.get_service()
+    assert len(services) == 1
+    service = services[0]
+    assert service["id"] == "history-retention"
+    service["func"]()
+
+    assert plugin.get_history_page()["total"] == 0
+    assert plugin.scan_invocations == 0
 
 
 def test_disabled_or_invalid_configuration_registers_no_service() -> None:
     """关闭计划或插件配置无效时不得向宿主注册服务。"""
 
-    assert _plugin(_payload(enabled=False)).get_service() == []
+    disabled_services = _plugin(_payload(enabled=False)).get_service()
+    assert len(disabled_services) == 1
+    assert disabled_services[0]["id"] == "history-retention"
 
     plugin = _plugin(_payload(enabled=True))
     plugin._configuration = None

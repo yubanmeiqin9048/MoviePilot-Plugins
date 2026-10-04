@@ -67,6 +67,8 @@ def test_page_history_tab_uses_injected_api_and_projects_paginated_mapping_summa
         assert counter in page and counter in types
     assert "params: { page: safePage, page_size: safePageSize }" in api
     assert "HistoryMapping" in types and "HistoryPage" in types
+    assert "mapping.started_at" in page and "mapping.finished_at" in page
+    assert "started_at?: string | null" in types and "finished_at?: string | null" in types
 
 
 def test_history_frontend_contract_preserves_run_polling_and_cleanup() -> None:

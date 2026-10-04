@@ -447,6 +447,8 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
                       <th>实例 / 映射</th>
                       <th>源目录</th>
                       <th>输出目录</th>
+                      <th>开始</th>
+                      <th>结束</th>
                       <th>状态</th>
                       <th v-for="row in counterRowsFor(item.mappings[0].counters)" :key="`history-map-${item.id}-${row.key}`" class="text-center">
                         {{ row.label }}
@@ -458,6 +460,8 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
                       <td>{{ mapping.instance_name }} / {{ mapping.mapping_index }}</td>
                       <td class="history-path">{{ mapping.source_dir }}</td>
                       <td class="history-path">{{ mapping.output_dir }}</td>
+                      <td>{{ formatTimestamp(mapping.started_at) }}</td>
+                      <td>{{ formatTimestamp(mapping.finished_at) }}</td>
                       <td>
                         {{ historyMappingStatus(mapping) }}
                         <div v-if="mapping.error" class="text-error text-caption">{{ mapping.error }}</div>

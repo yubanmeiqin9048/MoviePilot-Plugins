@@ -66,6 +66,8 @@ export interface ScanMappingStatus {
   counters: ScanCounters
   error?: string | null
   cleanup_eligible?: boolean
+  started_at?: string | null
+  finished_at?: string | null
 }
 
 export interface ScanStatus {
@@ -89,6 +91,8 @@ export interface HistoryMapping {
   source_dir: string
   output_dir: string
   state: string
+  started_at?: string | null
+  finished_at?: string | null
   error?: string | null
   counters: ScanCounters
 }

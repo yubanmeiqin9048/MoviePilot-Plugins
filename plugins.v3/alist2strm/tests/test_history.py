@@ -38,6 +38,8 @@ def _status(
         "source_dir": "/library",
         "output_dir": "/strm",
         "state": state,
+        "started_at": started_at,
+        "finished_at": started_at if state in {"success", "failed", "stopped"} else None,
         "counters": {
             "generated": generated,
             "downloaded": 2,
@@ -108,6 +110,8 @@ def test_history_keeps_multiple_runs_descending_pages_summaries_and_six_counters
     item = second_page["items"][0]  # type: ignore[index]
     mapping = item["mappings"][0]
     assert mapping["identity"] == "instance-1|/library|/strm"
+    assert mapping["started_at"] == "2024-01-01T00:00:00+00:00"
+    assert mapping["finished_at"] == "2024-01-01T00:00:00+00:00"
     assert mapping["counters"] == {
         "generated": 1,
         "downloaded": 2,
@@ -156,7 +160,7 @@ def test_history_normalizes_malformed_data_and_marks_restart_interrupted() -> No
     assert recovered[0]["state"] == "interrupted"
     assert recovered[0]["counters"]["generated"] == 8  # type: ignore[index]
     assert recovered[0]["mappings"][0]["state"] == "interrupted"  # type: ignore[index]
-    assert recovered[0]["mappings"][0]["error"] == "先前错误"  # type: ignore[index]
+    assert recovered[0]["mappings"][0]["error"] == "扫描失败，详情请查阅宿主日志"  # type: ignore[index]
     stored = cast(Mapping[str, Any], state["value"])
     stored_items = cast(list[Mapping[str, object]], stored["items"])
     assert stored_items[0]["state"] == "interrupted"
@@ -187,6 +191,47 @@ def test_history_persistence_failure_is_non_fatal() -> None:
 
     assert store.record_status(_status("run", "2024-01-01T00:00:00+00:00")) is True
     assert store.page()["total"] == 0
+
+
+def test_history_loader_failure_never_persists_empty_replacement() -> None:
+    """PluginData 读取异常不得用空历史覆盖既有持久数据。"""
+
+    writes: list[object] = []
+
+    def fail_load() -> object:
+        """模拟宿主读取故障。"""
+
+        raise OSError("history load failed")
+
+    store = HistoryStore(fail_load, writes.append)
+
+    assert store.record_status(_status("run", "2024-01-01T00:00:00+00:00")) is False
+    assert store.discard("run") is False
+    assert store.recover(90) == []
+    assert store.prune(90) == []
+    assert store.page()["total"] == 0
+    assert writes == []
+
+
+def test_history_error_projection_discards_permission_file_details() -> None:
+    """清理异常中的文件名、路径和底层原因不得进入历史。"""
+
+    store, _ = _store()
+    store.record_status(
+        _status(
+            "cleanup-failure",
+            "2024-01-01T00:00:00+00:00",
+            state="failed",
+            error="清理文件 /srv/secret/movie.strm：PermissionError: [Errno 13] Permission denied",
+        )
+    )
+
+    response = store.page()
+    rendered = str(response)
+    assert "movie.strm" not in rendered
+    assert "/srv/secret" not in rendered
+    assert "PermissionError" not in rendered
+    assert "扫描失败，详情请查阅宿主日志" in rendered
 
 
 def _configuration(output_dir: str = "/strm") -> PluginConfiguration:
@@ -228,10 +273,55 @@ def test_repeated_coordinator_runs_keep_distinct_history_records(tmp_path: Path)
     second = coordinator.status().as_dict()
     assert second["state"] == "failed"
 
+    assert first["mappings"][0]["started_at"]
+    assert first["mappings"][0]["finished_at"]
+    assert second["mappings"][0]["started_at"]
+    assert second["mappings"][0]["finished_at"]
+
     page = store.page()
     assert page["total"] == 2
     assert page["items"][0]["id"] != page["items"][1]["id"]  # type: ignore[index]
-    assert page["items"][0]["counters"]["failed"] == 1  # type: ignore[index]
+    assert page["items"][0]["mappings"][0]["started_at"]  # type: ignore[index]
+    assert page["items"][0]["mappings"][0]["finished_at"]  # type: ignore[index]
+
+
+def test_never_started_mappings_keep_null_timestamps_when_stopped() -> None:
+    """排队前停止的映射保持未开始的空时间戳。"""
+
+    configuration = PluginConfiguration(
+        instances=[
+            OpenListInstance(
+                id="instance-1",
+                name="主实例",
+                scan_url="https://openlist.example.invalid",
+                mappings=[
+                    DirectoryMapping(source_dir="/one", output_dir="/strm/one"),
+                    DirectoryMapping(source_dir="/two", output_dir="/strm/two"),
+                ],
+            )
+        ]
+    )
+    jobs: list[Any] = []
+    store, _ = _store()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=lambda task: jobs.append(task) or True,
+        client_factory=lambda _url, _token: object(),
+        history_callback=store.record_status,
+        history_discard=store.discard,
+    )
+
+    assert coordinator.trigger().accepted is True
+    assert coordinator.stop().accepted is True
+    status = coordinator.status().as_dict()
+    assert all(mapping["state"] == "stopped" for mapping in status["mappings"])  # type: ignore[index]
+    assert all(mapping["started_at"] is None for mapping in status["mappings"])  # type: ignore[index]
+    assert all(mapping["finished_at"] is None for mapping in status["mappings"])  # type: ignore[index]
+    jobs.pop()()
+
+    item = store.page()["items"][0]  # type: ignore[index]
+    assert all(mapping["started_at"] is None for mapping in item["mappings"])
+    assert all(mapping["finished_at"] is None for mapping in item["mappings"])
 
 
 def test_duplicate_or_invalid_trigger_does_not_create_actual_history_run(tmp_path: Path) -> None:
@@ -289,6 +379,47 @@ def test_plugin_init_recovers_history_without_auto_scanning() -> None:
     assert page["items"][0]["state"] == "interrupted"  # type: ignore[index]
     assert page["items"][0]["counters"]["generated"] == 4  # type: ignore[index]
     assert plugin.scan_invocations == 0
+
+
+def test_same_plugin_reapplication_does_not_interrupt_active_run() -> None:
+    """同一插件实例重复应用配置只清理保留记录，不重复执行重启恢复。"""
+
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm"
+    plugin.scan_invocations = 0
+    plugin._history_clock = lambda: 1_704_326_400.0
+    persisted: dict[str, object] = {
+        plugin.SECRET_DATA_KEY: {},
+        plugin.HISTORY_DATA_KEY: {
+            "version": 1,
+            "items": [_status("previous", "2024-01-01T00:00:00+00:00", state="running", generated=4)],
+        },
+    }
+    plugin.get_config = lambda _plugin_id=None: None
+    plugin.get_data = lambda key=None, plugin_id=None: persisted.get(key)
+    plugin.save_data = lambda key, value, plugin_id=None: persisted.__setitem__(key, value)
+
+    plugin.init_plugin({"instances": [], "schedule_enabled": False})
+    plugin._get_history_store().record_status(
+        _status("active", "2024-01-02T00:00:00+00:00", state="running", generated=9)
+    )
+    plugin.init_plugin({"instances": [], "schedule_enabled": False})
+
+    page = plugin.get_history_page()
+    active = next(item for item in page["items"] if item["id"] == "active")  # type: ignore[index]
+    assert active["state"] == "running"
+    assert plugin.scan_invocations == 0
+
+    fresh = object.__new__(Alist2Strm)
+    fresh._plugin_instance_id = "Alist2Strm"
+    fresh._history_clock = lambda: 1_704_326_400.0
+    fresh.get_config = lambda _plugin_id=None: None
+    fresh.get_data = lambda key=None, plugin_id=None: persisted.get(key)
+    fresh.save_data = lambda key, value, plugin_id=None: persisted.__setitem__(key, value)
+    fresh.init_plugin({"instances": [], "schedule_enabled": False})
+    recovered = fresh.get_history_page()
+    fresh_active = next(item for item in recovered["items"] if item["id"] == "active")  # type: ignore[index]
+    assert fresh_active["state"] == "interrupted"
 
 
 def _plugin_with_store(store: HistoryStore) -> Alist2Strm:

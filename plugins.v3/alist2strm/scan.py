@@ -683,6 +683,8 @@ class MappingScanStatus:
     counters: ScanCounters = field(default_factory=ScanCounters)
     error: str | None = None
     cleanup_eligible: bool = False
+    started_at: str | None = None
+    finished_at: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """返回稳定的映射状态对象。"""
@@ -698,6 +700,8 @@ class MappingScanStatus:
             "counters": self.counters.as_dict(),
             "error": self.error,
             "cleanup_eligible": self.cleanup_eligible,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
 
 
@@ -902,33 +906,7 @@ class ScanCoordinator:
             run = self._run
             if run is None:
                 return ScanStatus()
-            counters = ScanCounters()
-            for mapping in run.mappings:
-                counters.add(mapping.status.counters)
-            state = run.state
-            return ScanStatus(
-                state=state,
-                running=state in {"running", "stopping"},
-                current_mapping=run.current_mapping,
-                counters=counters,
-                mappings=[
-                    MappingScanStatus(
-                        instance_id=item.status.instance_id,
-                        instance_name=item.status.instance_name,
-                        mapping_index=item.status.mapping_index,
-                        source_dir=item.status.source_dir,
-                        output_dir=item.status.output_dir,
-                        state=item.status.state,
-                        counters=item.status.counters.copy(),
-                        error=item.status.error,
-                        cleanup_eligible=item.status.cleanup_eligible,
-                    )
-                    for item in run.mappings
-                ],
-                started_at=_timestamp(run.started_at),
-                finished_at=_timestamp(run.finished_at),
-                run_id=run.run_id,
-            )
+            return self._status_for_run_locked(run)
 
     def _notify_history(self, run: _ScanRun) -> None:
         """把运行安全快照交给插件历史持久化边界。"""
@@ -956,32 +934,40 @@ class ScanCoordinator:
         """返回指定运行的独立状态快照，避免历史回调读取后续运行。"""
 
         with self._lock:
-            counters = ScanCounters()
-            for mapping in run.mappings:
-                counters.add(mapping.status.counters)
-            return ScanStatus(
-                run_id=run.run_id,
-                state=run.state,
-                running=run.state in {"running", "stopping"},
-                current_mapping=run.current_mapping,
-                counters=counters,
-                mappings=[
-                    MappingScanStatus(
-                        instance_id=item.status.instance_id,
-                        instance_name=item.status.instance_name,
-                        mapping_index=item.status.mapping_index,
-                        source_dir=item.status.source_dir,
-                        output_dir=item.status.output_dir,
-                        state=item.status.state,
-                        counters=item.status.counters.copy(),
-                        error=item.status.error,
-                        cleanup_eligible=item.status.cleanup_eligible,
-                    )
-                    for item in run.mappings
-                ],
-                started_at=_timestamp(run.started_at),
-                finished_at=_timestamp(run.finished_at),
-            )
+            return self._status_for_run_locked(run)
+
+    def _status_for_run_locked(self, run: _ScanRun) -> ScanStatus:
+        """在已持有协调器锁时构造运行快照。"""
+
+        counters = ScanCounters()
+        for mapping in run.mappings:
+            counters.add(mapping.status.counters)
+        state = run.state
+        return ScanStatus(
+            run_id=run.run_id,
+            state=state,
+            running=state in {"running", "stopping"},
+            current_mapping=run.current_mapping,
+            counters=counters,
+            mappings=[
+                MappingScanStatus(
+                    instance_id=item.status.instance_id,
+                    instance_name=item.status.instance_name,
+                    mapping_index=item.status.mapping_index,
+                    source_dir=item.status.source_dir,
+                    output_dir=item.status.output_dir,
+                    state=item.status.state,
+                    counters=item.status.counters.copy(),
+                    error=item.status.error,
+                    cleanup_eligible=item.status.cleanup_eligible,
+                    started_at=item.status.started_at,
+                    finished_at=item.status.finished_at,
+                )
+                for item in run.mappings
+            ],
+            started_at=_timestamp(run.started_at),
+            finished_at=_timestamp(run.finished_at),
+        )
 
     def stop(self) -> ScanTriggerResult:
         """请求停止当前任务；当前原子 I/O 结束后不再开始下一项。"""
@@ -1062,6 +1048,19 @@ class ScanCoordinator:
                     run.state = "partial_failure" if completed else "failed"
                 else:
                     run.state = "success"
+                for mapping in run.mappings:
+                    if (
+                        mapping.status.started_at
+                        and mapping.status.finished_at is None
+                        and mapping.status.state
+                        in {
+                            "success",
+                            "failed",
+                            "stopped",
+                            "interrupted",
+                        }
+                    ):
+                        mapping.status.finished_at = _timestamp(self._clock())
                 run.current_mapping = None
                 run.finished_at = self._clock()
             self._notify_history(run)
@@ -1223,6 +1222,8 @@ class ScanCoordinator:
                     raise ScanStopped()
                 with self._lock:
                     mapping.status.state = "running"
+                    mapping.status.started_at = _timestamp(self._clock())
+                    mapping.status.finished_at = None
                     run.current_mapping = mapping.label
                 try:
                     if mapping.instance_id in failed_instances:
@@ -1278,6 +1279,13 @@ class ScanCoordinator:
                     self._log_mapping_failure(mapping)
                 finally:
                     with self._lock:
+                        if mapping.status.started_at and mapping.status.state in {
+                            "success",
+                            "failed",
+                            "stopped",
+                            "interrupted",
+                        }:
+                            mapping.status.finished_at = _timestamp(self._clock())
                         run.current_mapping = None
                     self._notify_history(run)
         finally:

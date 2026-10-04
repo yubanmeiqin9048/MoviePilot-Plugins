@@ -53,7 +53,9 @@ class HistoryStore:
         """在插件初始化时标记旧进程遗留任务并清理过期记录。"""
 
         with self._lock:
-            items, changed = self._read_items()
+            items, changed, loaded = self._read_items()
+            if not loaded:
+                return []
             now = self._clock()
             now_text = _timestamp(now)
             for item in items:
@@ -67,6 +69,8 @@ class HistoryStore:
                     for mapping in mappings:
                         if isinstance(mapping, Mapping) and mapping.get("state") in NON_TERMINAL_STATES:
                             mapping["state"] = "interrupted"
+                            if mapping.get("started_at") and not mapping.get("finished_at"):
+                                mapping["finished_at"] = now_text
             items, pruned = _prune(items, retention_days, now)
             changed = changed or pruned
             if changed:
@@ -77,7 +81,9 @@ class HistoryStore:
         """按正整数保留天数删除到期记录，不依赖定时扫描开关。"""
 
         with self._lock:
-            items, changed = self._read_items()
+            items, changed, loaded = self._read_items()
+            if not loaded:
+                return []
             items, pruned = _prune(items, retention_days, self._clock())
             if changed or pruned:
                 self._persist(items)
@@ -87,7 +93,9 @@ class HistoryStore:
         """写入或更新一次已接受扫描的安全状态快照。"""
 
         with self._lock:
-            items, _ = self._read_items()
+            items, _, loaded = self._read_items()
+            if not loaded:
+                return False
             record = _record_from_status(status, self._secret_values())
             if record is None:
                 return False
@@ -110,7 +118,9 @@ class HistoryStore:
         if not identifier:
             return False
         with self._lock:
-            items, changed = self._read_items()
+            items, changed, loaded = self._read_items()
+            if not loaded:
+                return False
             retained = [item for item in items if item.get("id") != identifier]
             removed = len(retained) != len(items)
             if removed or changed:
@@ -125,7 +135,14 @@ class HistoryStore:
         safe_page = _safe_page(page, minimum=1)
         safe_page_size = _safe_page(page_size, minimum=1, maximum=MAX_HISTORY_PAGE_SIZE)
         with self._lock:
-            items, changed = self._read_items()
+            items, changed, loaded = self._read_items()
+            if not loaded:
+                return {
+                    "total": 0,
+                    "page": safe_page,
+                    "page_size": safe_page_size,
+                    "items": [],
+                }
             items, pruned = _prune(items, retention_days, self._clock())
             if changed or pruned:
                 self._persist(items)
@@ -156,16 +173,16 @@ class HistoryStore:
             sorted({str(value) for value in values if isinstance(value, str) and value}, key=len, reverse=True)
         )
 
-    def _read_items(self) -> tuple[list[HistoryRecord], bool]:
-        """读取并规范 PluginData，旧数据异常时返回空安全集合。"""
+    def _read_items(self) -> tuple[list[HistoryRecord], bool, bool]:
+        """读取并规范 PluginData，区分读取失败和合法空历史。"""
 
         try:
             raw = self._load()
         except Exception:  # noqa: BLE001 - 历史读取失败不阻断插件生命周期
-            return [], False
+            return [], False, False
         items = normalize_history(raw, secrets=self._secret_values())
         canonical = _storage_payload(items)
-        return items, raw is not None and raw != canonical
+        return items, raw is not None and raw != canonical, True
 
     def _persist(self, items: Sequence[HistoryRecord]) -> bool:
         """尽力写回完整记录集，持久化失败不影响扫描任务。"""
@@ -241,6 +258,8 @@ def _normalise_mapping(raw: object, secrets: Sequence[str]) -> dict[str, object]
     if not instance_id or mapping_index is None or not source_dir or not output_dir or state is None:
         return None
     identity = _sanitize_text(_string(raw.get("identity")) or f"{instance_id}|{source_dir}|{output_dir}", secrets)
+    started_at = _canonical_timestamp(raw.get("started_at"))
+    finished_at = _canonical_timestamp(raw.get("finished_at"))
     result: dict[str, object] = {
         "identity": identity,
         "instance_id": instance_id,
@@ -249,6 +268,8 @@ def _normalise_mapping(raw: object, secrets: Sequence[str]) -> dict[str, object]
         "source_dir": source_dir,
         "output_dir": output_dir,
         "state": state,
+        "started_at": started_at,
+        "finished_at": finished_at,
         "counters": _normalise_counters(raw.get("counters")),
     }
     error = _history_error(raw.get("error"), secrets)
@@ -262,33 +283,7 @@ def _record_from_status(status: object, secrets: Sequence[str]) -> HistoryRecord
 
     method = getattr(status, "as_dict", None)
     values: object = method() if callable(method) else status
-    if not isinstance(values, Mapping):
-        return None
-    run_id = _string(values.get("run_id", values.get("id")))
-    started_at = _canonical_timestamp(values.get("started_at"))
-    state = _state(values.get("state", values.get("status")))
-    if not run_id or started_at is None or state is None:
-        return None
-    raw_mappings = values.get("mappings", [])
-    mappings: list[dict[str, object]] = []
-    if isinstance(raw_mappings, Sequence) and not isinstance(raw_mappings, (str, bytes, bytearray)):
-        for mapping in raw_mappings:
-            normalized = _normalise_mapping(mapping, secrets)
-            if normalized is not None:
-                mappings.append(normalized)
-    record = HistoryRecord(
-        id=_sanitize_text(run_id, secrets),
-        identity=_sanitize_text(run_id, secrets),
-        started_at=started_at,
-        finished_at=_canonical_timestamp(values.get("finished_at")),
-        state=state,
-        counters=_normalise_counters(values.get("counters")),
-        mappings=mappings,
-    )
-    error = _history_error(values.get("error"), secrets)
-    if error:
-        record["error"] = error
-    return record
+    return _normalise_record(values, secrets)
 
 
 def _normalise_counters(raw: object) -> dict[str, int]:
@@ -314,16 +309,16 @@ def _state(value: object) -> str | None:
     return state if state in KNOWN_STATES else None
 
 
+HISTORY_ERROR_HINT = "扫描失败，详情请查阅宿主日志"
+
+
 def _history_error(value: object, secrets: Sequence[str]) -> str | None:
-    """去掉逐文件位置并脱敏凭据后的简短错误摘要。"""
+    """将任意持久化错误折叠为不含文件路径的通用提示。"""
 
     if value is None:
         return None
     text = _sanitize_text(str(value), secrets).strip()
-    detail_prefix = re.compile(r"^(?:文件|目录|清理文件)\s+[^:：]{1,512}[：:]\s*")
-    while detail_prefix.match(text):
-        text = detail_prefix.sub("", text, count=1).strip()
-    return text[:500] or None
+    return HISTORY_ERROR_HINT if text else None
 
 
 def _sanitize_text(value: str, secrets: Sequence[str]) -> str:
@@ -438,9 +433,6 @@ def _safe_page(value: object, *, minimum: int, maximum: int | None = None) -> in
     return result
 
 
-# 兼容中文文档和调用方可能采用的拼写。
-normalise_history = normalize_history
-
 __all__ = [
     "COUNTER_NAMES",
     "DEFAULT_HISTORY_PAGE_SIZE",
@@ -451,6 +443,5 @@ __all__ = [
     "TERMINAL_STATES",
     "HistoryRecord",
     "HistoryStore",
-    "normalise_history",
     "normalize_history",
 ]
