@@ -44,6 +44,7 @@ const historyError = ref('')
 const historyExpanded = ref<string[]>([])
 let pollTimer: ReturnType<typeof window.setInterval> | null = null
 let pageMounted = false
+let historyRequestSequence = 0
 
 const hasUnsavedChanges = computed(() => configurationEditorState.dirty)
 const statusLabel = computed(() => stateLabel(status.value.state))
@@ -68,6 +69,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   pageMounted = false
+  historyRequestSequence += 1
   stopPolling()
 })
 
@@ -144,17 +146,22 @@ function historyKey(item: HistoryItem): string {
 }
 
 async function loadHistory(): Promise<void> {
+  const requestSequence = ++historyRequestSequence
+  const requestPage = historyPageNumber.value
+  const requestPageSize = historyPageSize.value
   historyLoading.value = true
   historyError.value = ''
   try {
-    const response = await readHistory(props.api, pluginId.value, historyPageNumber.value, historyPageSize.value)
+    const response = await readHistory(props.api, pluginId.value, requestPage, requestPageSize)
+    if (requestSequence !== historyRequestSequence) return
     historyPage.value = response
     historyPageNumber.value = response.page
     historyExpanded.value = historyExpanded.value.filter((id) => response.items.some((item) => historyKey(item) === id))
   } catch (error) {
+    if (requestSequence !== historyRequestSequence) return
     historyError.value = `读取运行历史失败：${getErrorMessage(error, '请稍后重试')}`
   } finally {
-    historyLoading.value = false
+    if (requestSequence === historyRequestSequence) historyLoading.value = false
   }
 }
 

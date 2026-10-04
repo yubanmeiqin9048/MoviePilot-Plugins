@@ -126,6 +126,25 @@ def test_history_keeps_multiple_runs_descending_pages_summaries_and_six_counters
     assert "trigger" not in item and "cleanup_reason" not in item and "files" not in item
 
 
+def test_history_suppresses_stop_sentinel_but_retains_failure_errors() -> None:
+    """干净停止只保留状态，真实失败仍保留通用错误提示。"""
+
+    store, _ = _store()
+    stopped = _status("stopped", "2024-01-03T00:00:00+00:00", state="stopped", error="扫描已停止")
+    stopped["error"] = "扫描已停止"
+    failed = _status("failed", "2024-01-04T00:00:00+00:00", state="failed", error="权限检查失败")
+    failed["error"] = "权限检查失败"
+
+    assert store.record_status(stopped) is True
+    assert store.record_status(failed) is True
+    items = {item["id"]: item for item in store.page()["items"]}  # type: ignore[index]
+
+    assert "error" not in items["stopped"]
+    assert "error" not in items["stopped"]["mappings"][0]  # type: ignore[index]
+    assert items["failed"]["error"] == "扫描失败，详情请查阅宿主日志"
+    assert items["failed"]["mappings"][0]["error"] == "扫描失败，详情请查阅宿主日志"  # type: ignore[index]
+
+
 def test_history_normalizes_malformed_data_and_marks_restart_interrupted() -> None:
     """空或损坏旧数据安全忽略，重启恢复保留计数、映射和错误。"""
 

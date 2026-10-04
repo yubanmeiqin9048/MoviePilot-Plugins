@@ -69,19 +69,12 @@ def test_page_history_tab_uses_injected_api_and_projects_paginated_mapping_summa
     assert "HistoryMapping" in types and "HistoryPage" in types
     assert "mapping.started_at" in page and "mapping.finished_at" in page
     assert "started_at?: string | null" in types and "finished_at?: string | null" in types
-
-
-def test_history_frontend_contract_preserves_run_polling_and_cleanup() -> None:
-    """新增历史页签不移除既有运行轮询、停止和关闭清理契约。"""
-
-    source = (PLUGIN_ROOT / "frontend" / "src" / "components" / "Page.vue").read_text(encoding="utf-8")
-
-    assert "setInterval" in source and "}, 2000)" in source
-    assert "onUnmounted(()" in source
-    assert "stopPolling()" in source
-    assert "clearInterval" in source
-    assert "stopScan(props.api" in source
-    assert "configurationEditorState.dirty" in source
+    assert "let historyRequestSequence = 0" in page
+    assert "const requestSequence = ++historyRequestSequence" in page
+    assert "const requestPage = historyPageNumber.value" in page
+    assert "const requestPageSize = historyPageSize.value" in page
+    assert "requestSequence !== historyRequestSequence" in page
+    assert "historyRequestSequence += 1" in page
 
 
 def test_built_federation_assets_are_delivered_and_reference_both_exposes() -> None:

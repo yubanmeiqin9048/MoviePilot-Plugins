@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
@@ -179,13 +180,8 @@ class Alist2Strm(_PluginBase):
         if not hasattr(self, "_history_live_run_ids"):
             self._history_live_run_ids = set()
         lock = getattr(self, "_history_live_lock", None)
-        if lock is None:
-            if live:
-                self._history_live_run_ids.add(run_id)
-            else:
-                self._history_live_run_ids.discard(run_id)
-            return
-        with lock:
+        context = lock if lock is not None else nullcontext()
+        with context:
             if live:
                 self._history_live_run_ids.add(run_id)
             else:

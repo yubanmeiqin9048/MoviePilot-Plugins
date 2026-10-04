@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import cast
 
 from app.sdk.logging import logger
 
@@ -155,11 +154,6 @@ class HistoryStore:
             "page_size": safe_page_size,
             "items": selected,
         }
-
-    def records(self, *, retention_days: int = 90) -> list[HistoryRecord]:
-        """返回当前安全记录快照，供离线测试和内部诊断使用。"""
-
-        return cast(list[HistoryRecord], self.page(1, MAX_HISTORY_PAGE_SIZE, retention_days=retention_days)["items"])
 
     def _secret_values(self) -> tuple[str, ...]:
         """读取当前凭据值；读取失败时按无凭据继续。"""
@@ -309,6 +303,7 @@ def _state(value: object) -> str | None:
 
 
 HISTORY_ERROR_HINT = "扫描失败，详情请查阅宿主日志"
+STOP_ERROR_SENTINEL = "扫描已停止"
 
 
 def _history_error(value: object, secrets: Sequence[str]) -> str | None:
@@ -317,7 +312,7 @@ def _history_error(value: object, secrets: Sequence[str]) -> str | None:
     if value is None:
         return None
     text = _sanitize_text(str(value), secrets).strip()
-    return HISTORY_ERROR_HINT if text else None
+    return None if not text or text == STOP_ERROR_SENTINEL else HISTORY_ERROR_HINT
 
 
 def _sanitize_text(value: str, secrets: Sequence[str]) -> str:
