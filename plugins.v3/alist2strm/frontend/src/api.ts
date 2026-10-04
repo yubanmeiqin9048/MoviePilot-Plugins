@@ -1,6 +1,7 @@
 import type {
   ConfigModel,
   ConfigResponse,
+  HistoryPage,
   PluginApi,
   ScanStatus,
   ScanTarget,
@@ -65,6 +66,20 @@ export function startMappingScan(
 /** 读取可轮询的扫描状态与六类计数。 */
 export function readScanStatus(api: PluginApi, pluginId: string): Promise<ScanStatus> {
   return api.get<ScanStatus>(pluginPath(pluginId, 'scan/status'))
+}
+
+/** 分页读取管理员扫描历史，查询参数在客户端边界内规范化。 */
+export function readHistory(
+  api: PluginApi,
+  pluginId: string,
+  page = 1,
+  pageSize = 20,
+): Promise<HistoryPage> {
+  const safePage = Number.isInteger(page) ? Math.max(page, 1) : 1
+  const safePageSize = Number.isInteger(pageSize) ? Math.min(Math.max(pageSize, 1), 100) : 20
+  return api.get<HistoryPage>(pluginPath(pluginId, 'history'), {
+    params: { page: safePage, page_size: safePageSize },
+  })
 }
 
 /** 请求停止当前扫描；服务端结束后台任务后才会返回 stopped 状态。 */

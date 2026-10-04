@@ -72,12 +72,43 @@ export interface ScanStatus {
   state: string
   status: string
   running: boolean
+  run_id?: string | null
   current_mapping?: string | null
   total_mappings: number
   counters: ScanCounters
   mappings: ScanMappingStatus[]
   started_at?: string | null
   finished_at?: string | null
+}
+
+export interface HistoryMapping {
+  identity: string
+  instance_id: string
+  instance_name: string
+  mapping_index: number
+  source_dir: string
+  output_dir: string
+  state: string
+  error?: string | null
+  counters: ScanCounters
+}
+
+export interface HistoryItem {
+  id: string
+  identity: string
+  state: string
+  started_at: string
+  finished_at?: string | null
+  error?: string | null
+  counters: ScanCounters
+  mappings: HistoryMapping[]
+}
+
+export interface HistoryPage {
+  total: number
+  page: number
+  page_size: number
+  items: HistoryItem[]
 }
 
 export interface ScanTriggerResponse {

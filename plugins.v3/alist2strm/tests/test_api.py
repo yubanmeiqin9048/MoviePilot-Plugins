@@ -51,6 +51,7 @@ def test_all_management_routes_use_bearer_and_explicit_superuser_dependency() ->
         ("/scan", ("POST",)),
         ("/scan/mapping", ("POST",)),
         ("/scan/status", ("GET",)),
+        ("/history", ("GET",)),
         ("/scan/stop", ("POST",)),
     }
     assert all(item["auth"] == "bear" for item in routes)

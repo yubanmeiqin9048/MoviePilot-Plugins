@@ -49,6 +49,39 @@ def test_page_runs_saved_all_or_one_mapping_and_stops_status_polling_on_close() 
     assert "emit('save')" not in source
 
 
+def test_page_history_tab_uses_injected_api_and_projects_paginated_mapping_summaries() -> None:
+    """历史页签保持注入 API，并覆盖状态、六类计数、展开和分页状态。"""
+
+    page = (PLUGIN_ROOT / "frontend" / "src" / "components" / "Page.vue").read_text(encoding="utf-8")
+    api = (PLUGIN_ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
+    types = (PLUGIN_ROOT / "frontend" / "src" / "types.ts").read_text(encoding="utf-8")
+
+    assert "readHistory(props.api" in page
+    assert '<VTab value="history">历史</VTab>' in page
+    assert "VExpansionPanels" in page and "historyExpanded" in page
+    assert "VPagination" in page and "historyPageNumber" in page
+    assert "historyLoading" in page and "historyError" in page
+    assert "暂无扫描历史" in page
+    assert "失败请按运行时间、实例和映射查阅宿主日志" in page
+    for counter in ("generated", "downloaded", "updated", "skipped", "deleted", "failed"):
+        assert counter in page and counter in types
+    assert "params: { page: safePage, page_size: safePageSize }" in api
+    assert "HistoryMapping" in types and "HistoryPage" in types
+
+
+def test_history_frontend_contract_preserves_run_polling_and_cleanup() -> None:
+    """新增历史页签不移除既有运行轮询、停止和关闭清理契约。"""
+
+    source = (PLUGIN_ROOT / "frontend" / "src" / "components" / "Page.vue").read_text(encoding="utf-8")
+
+    assert "setInterval" in source and "}, 2000)" in source
+    assert "onUnmounted(()" in source
+    assert "stopPolling()" in source
+    assert "clearInterval" in source
+    assert "stopScan(props.api" in source
+    assert "configurationEditorState.dirty" in source
+
+
 def test_built_federation_assets_are_delivered_and_reference_both_exposes() -> None:
     """构建后的 remoteEntry 与 Config/Page 产物必须同时存在。"""
 

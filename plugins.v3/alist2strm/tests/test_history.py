@@ -1,0 +1,348 @@
+"""扫描历史存储、恢复和管理 API 的公共 seam 测试。"""
+
+from __future__ import annotations
+
+import inspect
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from app.api.dependencies.auth import get_current_active_superuser_async
+from app.plugins.alist2strm import Alist2Strm  # ty: ignore[unresolved-import]
+from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
+    ConfigurationValidationError,
+    DirectoryMapping,
+    OpenListInstance,
+    PluginConfiguration,
+)
+from app.plugins.alist2strm.history import HistoryStore  # ty: ignore[unresolved-import]
+from app.plugins.alist2strm.scan import ScanCoordinator, ScanTarget  # ty: ignore[unresolved-import]
+
+
+def _status(
+    run_id: str,
+    started_at: str,
+    *,
+    state: str = "success",
+    generated: int = 1,
+    error: str | None = None,
+) -> dict[str, object]:
+    """构造不含触发元数据的扫描状态快照。"""
+
+    mapping: dict[str, object] = {
+        "instance_id": "instance-1",
+        "instance_name": "主实例",
+        "mapping_index": 1,
+        "source_dir": "/library",
+        "output_dir": "/strm",
+        "state": state,
+        "counters": {
+            "generated": generated,
+            "downloaded": 2,
+            "updated": 3,
+            "skipped": 4,
+            "deleted": 5,
+            "failed": 6,
+        },
+    }
+    if error is not None:
+        mapping["error"] = error
+    return {
+        "run_id": run_id,
+        "started_at": started_at,
+        "finished_at": started_at if state in {"success", "failed", "stopped"} else None,
+        "state": state,
+        "counters": mapping["counters"],
+        "mappings": [mapping],
+    }
+
+
+def _store(
+    initial: object = None,
+    *,
+    now: float = 1_704_326_400.0,
+    saved: list[object] | None = None,
+) -> tuple[HistoryStore, dict[str, object]]:
+    """构造内存 PluginData 替身。"""
+
+    state: dict[str, object] = {"value": initial}
+
+    def load() -> object:
+        """读取替身载荷。"""
+
+        return state["value"]
+
+    def save(value: object) -> None:
+        """记录替身载荷。"""
+
+        state["value"] = value
+        if saved is not None:
+            saved.append(value)
+
+    return HistoryStore(load, save, clock=lambda: now, secrets=lambda: ("credential-value",)), state
+
+
+def test_history_keeps_multiple_runs_descending_pages_summaries_and_six_counters() -> None:
+    """多次实际运行分别保存，分页和映射投影只含安全汇总。"""
+
+    store, _ = _store()
+    store.record_status(
+        _status(
+            "run-old",
+            "2024-01-01T00:00:00+00:00",
+            error="文件 /library/Movie.mkv：Authorization: credential-value",
+        )
+    )
+    store.record_status(_status("run-new", "2024-01-02T00:00:00+00:00", generated=7))
+
+    first_page = store.page(1, 1)
+    second_page = store.page(2, 1)
+
+    assert first_page["total"] == 2
+    assert first_page["page"] == 1
+    assert first_page["page_size"] == 1
+    assert first_page["items"][0]["id"] == "run-new"  # type: ignore[index]
+    assert second_page["items"][0]["id"] == "run-old"  # type: ignore[index]
+    item = second_page["items"][0]  # type: ignore[index]
+    mapping = item["mappings"][0]
+    assert mapping["identity"] == "instance-1|/library|/strm"
+    assert mapping["counters"] == {
+        "generated": 1,
+        "downloaded": 2,
+        "updated": 3,
+        "skipped": 4,
+        "deleted": 5,
+        "failed": 6,
+    }
+    assert "credential-value" not in str(item)
+    assert "Movie.mkv" not in str(item)
+    assert "error" not in item["mappings"][0] or "credential-value" not in item["mappings"][0]["error"]  # type: ignore[index]
+    assert "trigger" not in item and "cleanup_reason" not in item and "files" not in item
+
+
+def test_history_normalizes_malformed_data_and_marks_restart_interrupted() -> None:
+    """空或损坏旧数据安全忽略，重启恢复保留计数、映射和错误。"""
+
+    store, state = _store(
+        {
+            "version": 1,
+            "items": [
+                None,
+                {"state": "running"},
+                {
+                    **_status("run-active", "2024-01-01T00:00:00+00:00", state="running", generated=8),
+                    "mappings": [
+                        {
+                            "instance_id": "instance-1",
+                            "instance_name": "主实例",
+                            "mapping_index": 1,
+                            "source_dir": "/library",
+                            "output_dir": "/strm",
+                            "state": "running",
+                            "error": "先前错误",
+                            "counters": {"generated": 8, "failed": 2},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    recovered = store.recover(90)
+
+    assert len(recovered) == 1
+    assert recovered[0]["state"] == "interrupted"
+    assert recovered[0]["counters"]["generated"] == 8  # type: ignore[index]
+    assert recovered[0]["mappings"][0]["state"] == "interrupted"  # type: ignore[index]
+    assert recovered[0]["mappings"][0]["error"] == "先前错误"  # type: ignore[index]
+    stored = cast(Mapping[str, Any], state["value"])
+    stored_items = cast(list[Mapping[str, object]], stored["items"])
+    assert stored_items[0]["state"] == "interrupted"
+
+
+def test_retention_prunes_expired_records_without_schedule() -> None:
+    """保留策略通过独立存储入口生效，不读取定时开关。"""
+
+    store, _ = _store(now=1_704_153_600.0)  # 2024-01-02 UTC
+    store.record_status(_status("expired", "2023-12-30T00:00:00+00:00"))
+    store.record_status(_status("kept", "2024-01-01T12:00:00+00:00"))
+
+    page = store.page(1, 20, retention_days=1)
+
+    assert page["total"] == 1
+    assert page["items"][0]["id"] == "kept"  # type: ignore[index]
+
+
+def test_history_persistence_failure_is_non_fatal() -> None:
+    """PluginData 写入失败不会让历史入口抛出或改变调用方生命周期。"""
+
+    def fail_save(_value: object) -> None:
+        """模拟宿主 PluginData 故障。"""
+
+        raise OSError("synthetic persistence failure")
+
+    store = HistoryStore(lambda: None, fail_save)
+
+    assert store.record_status(_status("run", "2024-01-01T00:00:00+00:00")) is True
+    assert store.page()["total"] == 0
+
+
+def _configuration(output_dir: str = "/strm") -> PluginConfiguration:
+    """构造无需网络凭据的离线扫描配置。"""
+
+    return PluginConfiguration(
+        instances=[
+            OpenListInstance(
+                id="instance-1",
+                name="主实例",
+                scan_url="https://openlist.example.invalid",
+                mappings=[DirectoryMapping(source_dir="/library", output_dir=output_dir)],
+            )
+        ]
+    )
+
+
+def test_repeated_coordinator_runs_keep_distinct_history_records(tmp_path: Path) -> None:
+    """协调器每次接受新任务都写入新记录并最终收敛到终态。"""
+
+    configuration = _configuration(str(tmp_path / "strm"))
+    jobs: list[Any] = []
+    store, _ = _store()
+    coordinator = ScanCoordinator(
+        lambda: configuration,  # type: ignore[arg-type]
+        dispatch=lambda task: jobs.append(task) or True,
+        client_factory=lambda _url, _token: object(),
+        media_suffix_provider=lambda: (".mkv",),
+        history_callback=store.record_status,
+        history_discard=store.discard,
+    )
+
+    assert coordinator.trigger().accepted is True
+    jobs.pop()()
+    first = coordinator.status().as_dict()
+    assert first["state"] == "failed"
+    assert coordinator.trigger().accepted is True
+    jobs.pop()()
+    second = coordinator.status().as_dict()
+    assert second["state"] == "failed"
+
+    page = store.page()
+    assert page["total"] == 2
+    assert page["items"][0]["id"] != page["items"][1]["id"]  # type: ignore[index]
+    assert page["items"][0]["counters"]["failed"] == 1  # type: ignore[index]
+
+
+def test_duplicate_or_invalid_trigger_does_not_create_actual_history_run(tmp_path: Path) -> None:
+    """重复或无效触发不新增运行记录，已接受任务仍只占一项。"""
+
+    configuration = _configuration(str(tmp_path / "strm"))
+    jobs: list[Any] = []
+    store, _ = _store()
+    coordinator = ScanCoordinator(
+        lambda: configuration,  # type: ignore[arg-type]
+        dispatch=lambda task: jobs.append(task) or True,
+        client_factory=lambda _url, _token: object(),
+        media_suffix_provider=lambda: (".mkv",),
+        history_callback=store.record_status,
+        history_discard=store.discard,
+    )
+
+    assert coordinator.trigger(ScanTarget("missing", mapping_index=1)).accepted is False
+    assert store.page()["total"] == 0
+    assert coordinator.trigger().accepted is True
+    assert coordinator.trigger().accepted is False
+    assert store.page()["total"] == 1
+    jobs.pop()()
+    assert store.page()["total"] == 1
+
+
+def test_plugin_init_recovers_history_without_auto_scanning() -> None:
+    """插件初始化标记旧任务中断，但不提交新的扫描任务。"""
+
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm"
+    plugin.scan_invocations = 0
+    plugin._history_clock = lambda: 1_704_326_400.0
+    plugin._scan_dispatch = lambda _task: pytest.fail("初始化不应提交扫描")
+    persisted: dict[str, object] = {
+        plugin.SECRET_DATA_KEY: {},
+        plugin.HISTORY_DATA_KEY: {
+            "version": 1,
+            "items": [_status("previous", "2024-01-01T00:00:00+00:00", state="running", generated=4)],
+        },
+    }
+    plugin.get_config = lambda _plugin_id=None: None
+    plugin.get_data = lambda key=None, plugin_id=None: persisted.get(key)
+    plugin.save_data = lambda key, value, plugin_id=None: persisted.__setitem__(key, value)
+
+    plugin.init_plugin(
+        {
+            "instances": [],
+            "schedule_enabled": False,
+        }
+    )
+
+    page = plugin.get_history_page()
+    assert page["total"] == 1
+    assert page["items"][0]["state"] == "interrupted"  # type: ignore[index]
+    assert page["items"][0]["counters"]["generated"] == 4  # type: ignore[index]
+    assert plugin.scan_invocations == 0
+
+
+def _plugin_with_store(store: HistoryStore) -> Alist2Strm:
+    """构造注入历史存储的插件 seam 对象。"""
+
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm"
+    plugin._configuration = _configuration()
+    plugin._configuration_valid = True
+    plugin._secret_tokens = {}
+    plugin._history_store = store
+    return plugin
+
+
+def test_history_api_has_superuser_auth_and_safe_projection() -> None:
+    """历史 API 要求 Bearer 与显式超级管理员依赖，响应不含 Token。"""
+
+    store, _ = _store()
+    store.record_status(_status("run", "2024-01-01T00:00:00+00:00", error="credential-value"))
+    plugin = _plugin_with_store(store)
+
+    route = next(item for item in plugin.get_api() if item["path"] == "/history")
+    endpoint = route["endpoint"]
+    dependency = inspect.signature(endpoint).parameters["_"].default.dependency
+    response = plugin.read_history(page=1, page_size=20, _=object())
+
+    assert route["auth"] == "bear"
+    assert dependency is get_current_active_superuser_async
+    assert response["total"] == 1
+    assert "credential-value" not in str(response)
+    assert "trigger" not in str(response)
+
+
+def test_invalid_retention_keeps_old_configuration_and_does_not_persist() -> None:
+    """正整数校验失败时保留旧状态且不进入配置持久化。"""
+
+    plugin = _plugin_with_store(_store()[0])
+    writes: list[object] = []
+    plugin.update_config = lambda *_args, **_kwargs: writes.append("config") or True
+    plugin.save_data = lambda *_args, **_kwargs: writes.append("data")
+    payload = {
+        "instances": [
+            {
+                "id": "instance-1",
+                "name": "主实例",
+                "scan_url": "https://openlist.example.invalid",
+                "mappings": [{"source_dir": "/library", "output_dir": "/strm"}],
+            }
+        ],
+        "history_retention_days": 0,
+    }
+
+    with pytest.raises(ConfigurationValidationError):
+        plugin.save_configuration(payload)
+
+    assert plugin._configuration.history_retention_days == 90
+    assert writes == []

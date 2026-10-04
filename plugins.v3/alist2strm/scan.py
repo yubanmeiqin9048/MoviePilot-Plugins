@@ -7,6 +7,7 @@ import stat
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -711,6 +712,7 @@ class ScanStatus:
     mappings: list[MappingScanStatus] = field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
+    run_id: str | None = None
 
     @property
     def status(self) -> str:
@@ -731,6 +733,7 @@ class ScanStatus:
             "total_mappings": len(self.mappings),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "run_id": self.run_id,
         }
 
     def __getitem__(self, key: str) -> object:
@@ -779,6 +782,7 @@ class _ScanRun:
     mappings: list[_MappingRun]
     video_suffixes: frozenset[str]
     started_at: float
+    run_id: str
     cleanup_disqualified: bool = False
     state: str = "running"
     current_mapping: str | None = None
@@ -804,6 +808,8 @@ class ScanCoordinator:
         sleep: Callable[[float], None] | None = None,
         retry_backoff: Callable[[int], float] | None = None,
         max_retries: int = MAX_RETRIES,
+        history_callback: Callable[[ScanStatus], None] | None = None,
+        history_discard: Callable[[str], None] | None = None,
     ) -> None:
         """绑定已保存配置、后台提交器和可替换 OpenList、退避与资源边界。"""
 
@@ -822,6 +828,8 @@ class ScanCoordinator:
         self._sleep = sleep if sleep is not None else time.sleep
         self._retry_backoff = retry_backoff if retry_backoff is not None else _retry_delay
         self._max_retries = max(int(max_retries), 0)
+        self._history_callback = history_callback
+        self._history_discard = history_discard
         self._lock = threading.Lock()
         self._run: _ScanRun | None = None
         self._active_readers: list[Any] = []
@@ -873,13 +881,17 @@ class ScanCoordinator:
             if isinstance(run_or_error, ScanTriggerResult):
                 return run_or_error
             self._run = run_or_error
+        # 先保存运行中的初始快照，重启发生在后台回调开始前也能识别中断。
+        self._notify_history(run_or_error)
         try:
             accepted = self._dispatch(self.execute)
         except Exception:  # noqa: BLE001 - 调度边界失败不把后台细节返回前端
             accepted = False
         if not accepted:
             with self._lock:
-                self._run = None
+                if self._run is run_or_error:
+                    self._run = None
+            self._discard_history(run_or_error.run_id)
             return ScanTriggerResult(False, "后台任务调度不可用，扫描未启动")
         return ScanTriggerResult(True, "扫描已在后台启动")
 
@@ -915,11 +927,66 @@ class ScanCoordinator:
                 ],
                 started_at=_timestamp(run.started_at),
                 finished_at=_timestamp(run.finished_at),
+                run_id=run.run_id,
+            )
+
+    def _notify_history(self, run: _ScanRun) -> None:
+        """把运行安全快照交给插件历史持久化边界。"""
+
+        callback = self._history_callback
+        if callback is None:
+            return
+        try:
+            callback(self._status_for_run(run))
+        except Exception:  # noqa: BLE001 - 历史故障不得改变扫描结果
+            logger.warning("Alist2Strm 扫描历史回调失败，当前扫描仍继续")
+
+    def _discard_history(self, run_id: str) -> None:
+        """删除调度拒绝的初始记录，不影响调度错误返回。"""
+
+        callback = self._history_discard
+        if callback is None:
+            return
+        try:
+            callback(run_id)
+        except Exception:  # noqa: BLE001 - 清理失败不能掩盖调度结果
+            logger.warning("Alist2Strm 被拒绝扫描的历史记录清理失败")
+
+    def _status_for_run(self, run: _ScanRun) -> ScanStatus:
+        """返回指定运行的独立状态快照，避免历史回调读取后续运行。"""
+
+        with self._lock:
+            counters = ScanCounters()
+            for mapping in run.mappings:
+                counters.add(mapping.status.counters)
+            return ScanStatus(
+                run_id=run.run_id,
+                state=run.state,
+                running=run.state in {"running", "stopping"},
+                current_mapping=run.current_mapping,
+                counters=counters,
+                mappings=[
+                    MappingScanStatus(
+                        instance_id=item.status.instance_id,
+                        instance_name=item.status.instance_name,
+                        mapping_index=item.status.mapping_index,
+                        source_dir=item.status.source_dir,
+                        output_dir=item.status.output_dir,
+                        state=item.status.state,
+                        counters=item.status.counters.copy(),
+                        error=item.status.error,
+                        cleanup_eligible=item.status.cleanup_eligible,
+                    )
+                    for item in run.mappings
+                ],
+                started_at=_timestamp(run.started_at),
+                finished_at=_timestamp(run.finished_at),
             )
 
     def stop(self) -> ScanTriggerResult:
         """请求停止当前任务；当前原子 I/O 结束后不再开始下一项。"""
 
+        notify = False
         with self._lock:
             run = self._run
             if run is None or run.state not in {"running", "stopping"}:
@@ -932,7 +999,11 @@ class ScanCoordinator:
                 run.state = "stopped"
                 run.current_mapping = None
                 run.finished_at = self._clock()
-            return ScanTriggerResult(True, "扫描正在停止")
+                notify = True
+            result = ScanTriggerResult(True, "扫描正在停止")
+        if notify:
+            self._notify_history(run)
+        return result
 
     def shutdown(self) -> None:
         """请求停止并在没有活动任务时释放已注入的客户端资源。"""
@@ -993,6 +1064,7 @@ class ScanCoordinator:
                     run.state = "success"
                 run.current_mapping = None
                 run.finished_at = self._clock()
+            self._notify_history(run)
 
     def _is_stop_requested(self, run: _ScanRun | None) -> bool:
         """读取任务停止标志，供客户端和扫描循环共享。"""
@@ -1097,6 +1169,7 @@ class ScanCoordinator:
             mappings=mappings,
             video_suffixes=video_suffixes,
             started_at=self._clock(),
+            run_id=uuid.uuid4().hex,
             cleanup_disqualified=cleanup_disqualified,
         )
 
@@ -1206,6 +1279,7 @@ class ScanCoordinator:
                 finally:
                     with self._lock:
                         run.current_mapping = None
+                    self._notify_history(run)
         finally:
             with self._lock:
                 self._active_readers = []

@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import Body, Depends, HTTPException
+from fastapi import Body, Depends, HTTPException, Query
 
 from app.api.dependencies.auth import get_current_active_superuser_async
 from app.sdk.logging import logger
@@ -19,6 +19,14 @@ from .config import (
     build_configuration,
     public_configuration,
     secret_tokens,
+)
+from .history import (
+    DEFAULT_HISTORY_PAGE_SIZE,
+    MAX_HISTORY_PAGE_SIZE,
+    HistoryStore,
+)
+from .history import (
+    HISTORY_DATA_KEY as SCAN_HISTORY_DATA_KEY,
 )
 from .scan import ScanCoordinator, ScanTarget
 
@@ -41,6 +49,7 @@ class Alist2Strm(_PluginBase):
     auth_level = 2
 
     SECRET_DATA_KEY = "configuration_secrets_v1"
+    HISTORY_DATA_KEY = SCAN_HISTORY_DATA_KEY
     PersistenceError = ConfigurationPersistenceError
 
     def __init__(self) -> None:
@@ -54,6 +63,7 @@ class Alist2Strm(_PluginBase):
         self._stopped = False
         # 当前票据仅通过宿主一次性任务执行手动扫描；保存和启动不会调用它。
         self._scan_coordinator: ScanCoordinator | None = None
+        self._history_store: HistoryStore | None = None
         self.scan_invocations = 0
 
     def _plugin_id(self) -> str:
@@ -85,6 +95,67 @@ class Alist2Strm(_PluginBase):
             return None
         return value if isinstance(value, Mapping) else None
 
+    def _get_history_store(self) -> HistoryStore:
+        """惰性取得 PluginData 历史边界，允许测试注入内存替身。"""
+
+        store = getattr(self, "_history_store", None)
+        if isinstance(store, HistoryStore):
+            return store
+        loader = getattr(self, "get_data", None)
+        saver = getattr(self, "save_data", None)
+
+        def load() -> object:
+            """读取当前插件的历史载荷。"""
+
+            if not callable(loader):
+                return None
+            return loader(self.HISTORY_DATA_KEY, plugin_id=self._plugin_id())
+
+        def save(value: object) -> None:
+            """保存当前插件的历史载荷。"""
+
+            if not callable(saver):
+                raise OSError("宿主 PluginData 保存能力不可用")
+            saver(self.HISTORY_DATA_KEY, value, plugin_id=self._plugin_id())
+
+        clock = getattr(self, "_history_clock", getattr(self, "_scan_clock", time.time))
+        if not callable(clock):
+            clock = time.time
+        store = HistoryStore(
+            load,
+            save,
+            clock=clock,
+            secrets=lambda: tuple(getattr(self, "_secret_tokens", {}).values()),
+        )
+        self._history_store = store
+        return store
+
+    def _recover_history(self, retention_days: int) -> None:
+        """初始化时恢复旧记录并尽力执行保留策略。"""
+
+        try:
+            self._get_history_store().recover(retention_days)
+        except Exception:  # noqa: BLE001 - 历史故障不阻止配置恢复
+            logger.warning("Alist2Strm 扫描历史恢复失败，插件仍可继续运行")
+
+    def _prune_history(self, retention_days: int) -> None:
+        """成功保存配置后独立清理到期历史，不依赖定时开关。"""
+
+        try:
+            self._get_history_store().prune(retention_days)
+        except Exception:  # noqa: BLE001 - 清理故障不回滚已成功配置
+            logger.warning("Alist2Strm 扫描历史保留策略清理失败")
+
+    def _record_scan_history(self, status: object) -> None:
+        """接收协调器状态快照并写入安全历史。"""
+
+        self._get_history_store().record_status(status)
+
+    def _discard_scan_history(self, run_id: str) -> None:
+        """移除调度拒绝的扫描初始记录。"""
+
+        self._get_history_store().discard(run_id)
+
     def init_plugin(self, config: Mapping[str, object] | None = None) -> None:
         """加载并校验宿主配置，不启动扫描或私有调度器。"""
 
@@ -98,11 +169,13 @@ class Alist2Strm(_PluginBase):
             self._secret_tokens = existing_tokens
             self._configuration_valid = False
             logger.error(f"Alist2Strm 配置无效，插件未进入运行视图：{error}")
+            self._recover_history(90)
             return
         self._configuration = candidate
         self._secret_tokens = secret_tokens(candidate)
         self._configuration_valid = True
         self._stopped = False
+        self._recover_history(candidate.history_retention_days)
 
     def get_state(self) -> bool:
         """返回当前配置是否有效且可进入后续运行视图。"""
@@ -223,6 +296,7 @@ class Alist2Strm(_PluginBase):
         self._configuration = candidate
         self._secret_tokens = new_tokens
         self._configuration_valid = True
+        self._prune_history(candidate.history_retention_days)
         self._refresh_scheduler_registration()
         return {
             "success": True,
@@ -308,6 +382,8 @@ class Alist2Strm(_PluginBase):
                 sleep=getattr(self, "_scan_sleep", None),
                 retry_backoff=getattr(self, "_scan_retry_backoff", None),
                 max_retries=getattr(self, "_scan_max_retries", 2),
+                history_callback=self._record_scan_history,
+                history_discard=self._discard_scan_history,
             )
             self._scan_coordinator = coordinator
         return coordinator
@@ -383,6 +459,33 @@ class Alist2Strm(_PluginBase):
 
         return self.get_scan_status()
 
+    def get_history_page(self, page: int = 1, page_size: int = DEFAULT_HISTORY_PAGE_SIZE) -> dict[str, object]:
+        """返回安全、倒序分页的扫描历史，并在访问时执行保留清理。"""
+
+        configuration = getattr(self, "_configuration", None)
+        retention_days = getattr(configuration, "history_retention_days", 90)
+        return self._get_history_store().page(page, page_size, retention_days=retention_days)
+
+    def read_history(
+        self,
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=DEFAULT_HISTORY_PAGE_SIZE, ge=1, le=MAX_HISTORY_PAGE_SIZE),
+        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
+    ) -> dict[str, object]:
+        """分页读取管理员扫描历史，不下发触发、清理或逐文件信息。"""
+
+        return self.get_history_page(page, page_size)
+
+    def history(
+        self,
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=DEFAULT_HISTORY_PAGE_SIZE, ge=1, le=MAX_HISTORY_PAGE_SIZE),
+        _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
+    ) -> dict[str, object]:
+        """兼容调用方名称的历史分页入口。"""
+
+        return self.get_history_page(page, page_size)
+
     def stop_scan(
         self,
         _: Any = Depends(get_current_active_superuser_async),  # noqa: B008 - FastAPI 权限注入
@@ -451,6 +554,13 @@ class Alist2Strm(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "读取扫描状态",
+            },
+            {
+                "path": "/history",
+                "endpoint": self.read_history,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "分页读取扫描历史",
             },
             {
                 "path": "/scan/stop",
