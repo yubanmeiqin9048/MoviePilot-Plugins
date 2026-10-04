@@ -1,3 +1,8 @@
+[project]
+name = "moviepilot-plugin-alist2strm"
+dynamic = ["version"]
+requires-python = ">=3.14"
+
 [tool.ty.environment]
 python-version = "3.14"
 python-platform = "linux"

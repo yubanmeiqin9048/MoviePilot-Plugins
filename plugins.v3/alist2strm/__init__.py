@@ -37,12 +37,12 @@ class ConfigurationPersistenceError(RuntimeError):
 
 
 class Alist2Strm(_PluginBase):
-    """保存 OpenList 实例、目录映射和后续扫描所需的插件配置。"""
+    """保存 OpenList/Alist 实例、目录映射和后续扫描所需的插件配置。"""
 
     plugin_name = "Alist2Strm"
-    plugin_desc = "为多个 OpenList 实例生成并维护本地 STRM。"
+    plugin_desc = "为多个 OpenList/Alist 实例生成并维护本地 STRM。"
     plugin_icon = "mdi-play-box-multiple-outline"
-    plugin_version = "0.1.0"
+    plugin_version = "2.0"
     plugin_author = "MoviePilot"
     plugin_label = "媒体"
     plugin_config_prefix = "alist2strm_"
