@@ -126,7 +126,7 @@ def _is_path_overlap(first: str, second: str) -> bool:
     try:
         resolved_first = Path(first).resolve(strict=False)
         resolved_second = Path(second).resolve(strict=False)
-    except OSError, RuntimeError:
+    except (OSError, RuntimeError):  # fmt: skip
         # 无法确认输出边界时拒绝保存，避免把清理范围交给不确定的路径。
         return True
     return (
@@ -347,12 +347,6 @@ class PluginConfiguration(BaseModel):
         return self
 
 
-# 后续扫描票据使用这些语义别名，避免重新定义配置字段。
-MappingConfig = DirectoryMapping
-InstanceConfig = OpenListInstance
-Alist2StrmConfig = PluginConfiguration
-
-
 class ConfigurationValidationError(ValueError):
     """保存前配置校验失败。"""
 
@@ -517,7 +511,7 @@ def host_default_extensions() -> list[str]:
         from app.sdk.config import settings
 
         values = [*getattr(settings, "RMT_MEDIAEXT", ()), *getattr(settings, "RMT_SUBEXT", ())]
-    except ImportError, AttributeError:
+    except (ImportError, AttributeError):  # fmt: skip
         values = [".mp4", ".mkv", ".ts", ".srt", ".ass", ".ssa", ".sup"]
     result: list[str] = []
     for value in values:
@@ -585,11 +579,8 @@ __all__ = [
     "OUTPUT_DIRECTORY_WARNING",
     "ROOT_WARNING",
     "SIGN_WARNING",
-    "Alist2StrmConfig",
     "ConfigurationValidationError",
     "DirectoryMapping",
-    "InstanceConfig",
-    "MappingConfig",
     "OpenListInstance",
     "PluginConfiguration",
     "build_configuration",

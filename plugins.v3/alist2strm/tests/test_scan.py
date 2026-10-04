@@ -948,6 +948,43 @@ def test_existing_attachment_target_is_skipped_without_download(tmp_path: Path) 
     assert coordinator.status()["counters"]["skipped"] == 1
 
 
+def test_same_origin_redirect_drops_authorization() -> None:
+    """下载重定向到同源地址后也不携带管理员认证头。"""
+
+    class RedirectTransport:
+        """返回同源重定向的下载替身。"""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        def get_stream(self, url: str, headers: dict[str, str]) -> DownloadResponse:
+            """首次返回同源重定向，第二次返回正文。"""
+
+            self.calls.append((url, dict(headers)))
+            if len(self.calls) == 1:
+                return DownloadResponse(
+                    status_code=307,
+                    headers={"Location": "/redirected/file"},
+                    url=url,
+                )
+            return DownloadResponse(status_code=200, body=(b"file",), url=url)
+
+        def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+            """该测试不使用目录 API。"""
+
+            return HttpResponse(500)
+
+    transport = RedirectTransport()
+    client = OpenListClient("https://scan.example.invalid", "test-token", transport=transport)
+
+    with client.open_download("/library/file.nfo") as chunks:
+        assert b"".join(chunks) == b"file"
+
+    assert transport.calls[0][1] == {"Authorization": "test-token"}
+    assert transport.calls[1][1] == {}
+    assert transport.calls[1][0] == "https://scan.example.invalid/redirected/file"
+
+
 def test_cross_origin_redirect_drops_authorization_and_url_credentials() -> None:
     """下载重定向到代理源时不携带管理员认证头或 URL 用户信息。"""
 

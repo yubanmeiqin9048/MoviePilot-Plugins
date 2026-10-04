@@ -149,7 +149,7 @@ class LocalFileSystem:
 
         try:
             os.stat(root)
-        except FileNotFoundError, NotADirectoryError:
+        except (FileNotFoundError, NotADirectoryError):  # fmt: skip
             return
 
         pending = [root]
@@ -464,7 +464,7 @@ class OpenListClient:
                 if not location:
                     raise OpenListError("OpenList 下载重定向缺少目标", retryable=False)
                 next_url = _strip_url_credentials(urljoin(url, location))
-                headers = self._headers() if _same_origin(url, next_url) else {}
+                headers = {}
                 url = next_url
                 continue
             if 200 <= response.status_code < 300:
@@ -562,25 +562,6 @@ def _strip_url_credentials(url: str) -> str:
     except ValueError:
         port = ""
     return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, parsed.query, parsed.fragment))
-
-
-def _same_origin(first: str, second: str) -> bool:
-    """判断两个下载地址是否属于同一协议、主机和端口。"""
-
-    first_parts = urlsplit(first)
-    second_parts = urlsplit(second)
-    if not first_parts.scheme or not first_parts.netloc or not second_parts.scheme or not second_parts.netloc:
-        return False
-    try:
-        first_port = first_parts.port or (443 if first_parts.scheme.casefold() == "https" else 80)
-        second_port = second_parts.port or (443 if second_parts.scheme.casefold() == "https" else 80)
-    except ValueError:
-        return False
-    return (
-        first_parts.scheme.casefold() == second_parts.scheme.casefold()
-        and (first_parts.hostname or "").casefold() == (second_parts.hostname or "").casefold()
-        and first_port == second_port
-    )
 
 
 def is_video_name(name: str, suffixes: frozenset[str]) -> bool:
@@ -1179,7 +1160,7 @@ class ScanCoordinator:
         for root in roots:
             try:
                 resolved.append(root.resolve(strict=False))
-            except OSError, RuntimeError:
+            except (OSError, RuntimeError):  # fmt: skip
                 return True
         for index, first in enumerate(resolved):
             for second in resolved[index + 1 :]:
@@ -1455,7 +1436,7 @@ class ScanCoordinator:
         mapping.expected_outputs.add(target)
         try:
             mapping.expected_output_identities.add(target.resolve(strict=False))
-        except OSError, RuntimeError:
+        except (OSError, RuntimeError):  # fmt: skip
             mapping.expected_output_resolution_failed = True
 
     def _cleanup_mapping(self, mapping: _MappingRun, run: _ScanRun) -> None:
@@ -1487,7 +1468,7 @@ class ScanCoordinator:
                 continue
             try:
                 target_identity = target.resolve(strict=False)
-            except OSError, RuntimeError:
+            except (OSError, RuntimeError):  # fmt: skip
                 continue
             if target in mapping.expected_outputs or target_identity in mapping.expected_output_identities:
                 continue
@@ -1541,7 +1522,7 @@ class ScanCoordinator:
             relative = target.relative_to(root)
             resolved_root = root.resolve(strict=False)
             resolved_target = target.resolve(strict=False)
-        except OSError, RuntimeError, ValueError:
+        except (OSError, RuntimeError, ValueError):  # fmt: skip
             return False
         if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
             return False
