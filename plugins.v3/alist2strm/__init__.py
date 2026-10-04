@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -23,11 +24,10 @@ from .config import (
 from .history import (
     DEFAULT_HISTORY_PAGE_SIZE,
     MAX_HISTORY_PAGE_SIZE,
+    NON_TERMINAL_STATES,
     HistoryStore,
 )
-from .history import (
-    HISTORY_DATA_KEY as SCAN_HISTORY_DATA_KEY,
-)
+from .history import HISTORY_DATA_KEY as SCAN_HISTORY_DATA_KEY
 from .scan import ScanCoordinator, ScanTarget
 
 
@@ -66,6 +66,8 @@ class Alist2Strm(_PluginBase):
         self._scan_coordinator: ScanCoordinator | None = None
         self._history_store: HistoryStore | None = None
         self._history_recovery_done = False
+        self._history_live_run_ids: set[str] = set()
+        self._history_live_lock = threading.RLock()
         self.scan_invocations = 0
 
     def _plugin_id(self) -> str:
@@ -132,13 +134,18 @@ class Alist2Strm(_PluginBase):
         self._history_store = store
         return store
 
-    def _recover_history(self, retention_days: int) -> None:
-        """初始化时恢复旧记录并尽力执行保留策略。"""
+    def _recover_history(self, retention_days: int) -> bool:
+        """初始化时恢复旧记录；读取或写回失败时允许后续初始化重试。"""
 
         try:
-            self._get_history_store().recover(retention_days)
+            result = self._get_history_store().recover(
+                retention_days,
+                exclude_run_ids=self._history_live_snapshot(),
+            )
         except Exception:  # noqa: BLE001 - 历史故障不阻止配置恢复
             logger.warning("Alist2Strm 扫描历史恢复失败，插件仍可继续运行")
+            return False
+        return result is not None
 
     def _prune_history(self, retention_days: int) -> None:
         """成功保存配置后独立清理到期历史，不依赖定时开关。"""
@@ -151,20 +158,60 @@ class Alist2Strm(_PluginBase):
     def _record_scan_history(self, status: object) -> None:
         """接收协调器状态快照并写入安全历史。"""
 
+        run_id = self._history_status_value(status, "run_id")
+        state = self._history_status_value(status, "state")
+        if isinstance(run_id, str) and run_id:
+            self._update_live_history(run_id, state in NON_TERMINAL_STATES)
         self._get_history_store().record_status(status)
+
+    def _history_live_snapshot(self) -> tuple[str, ...]:
+        """返回当前进程接受的运行 ID，供恢复排除同进程活动任务。"""
+
+        lock = getattr(self, "_history_live_lock", None)
+        if lock is None:
+            return tuple(getattr(self, "_history_live_run_ids", set()))
+        with lock:
+            return tuple(self._history_live_run_ids)
+
+    def _update_live_history(self, run_id: str, live: bool) -> None:
+        """维护同一插件实例的活动历史 ID 集合。"""
+
+        if not hasattr(self, "_history_live_run_ids"):
+            self._history_live_run_ids = set()
+        lock = getattr(self, "_history_live_lock", None)
+        if lock is None:
+            if live:
+                self._history_live_run_ids.add(run_id)
+            else:
+                self._history_live_run_ids.discard(run_id)
+            return
+        with lock:
+            if live:
+                self._history_live_run_ids.add(run_id)
+            else:
+                self._history_live_run_ids.discard(run_id)
+
+    @staticmethod
+    def _history_status_value(status: object, key: str) -> object:
+        """读取状态对象或安全字典的公共字段。"""
+
+        if isinstance(status, Mapping):
+            return status.get(key)
+        return getattr(status, key, None)
 
     def _recover_or_prune_history(self, retention_days: int) -> None:
         """仅在插件实例首次初始化执行重启恢复，后续重应用只清理保留记录。"""
 
         if not getattr(self, "_history_recovery_done", False):
-            self._recover_history(retention_days)
-            self._history_recovery_done = True
+            if self._recover_history(retention_days):
+                self._history_recovery_done = True
         else:
             self._prune_history(retention_days)
 
     def _discard_scan_history(self, run_id: str) -> None:
         """移除调度拒绝的扫描初始记录。"""
 
+        self._update_live_history(run_id, False)
         self._get_history_store().discard(run_id)
 
     def init_plugin(self, config: Mapping[str, object] | None = None) -> None:

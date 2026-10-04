@@ -207,7 +207,7 @@ def test_history_loader_failure_never_persists_empty_replacement() -> None:
 
     assert store.record_status(_status("run", "2024-01-01T00:00:00+00:00")) is False
     assert store.discard("run") is False
-    assert store.recover(90) == []
+    assert store.recover(90) is None
     assert store.prune(90) == []
     assert store.page()["total"] == 0
     assert writes == []
@@ -283,6 +283,184 @@ def test_repeated_coordinator_runs_keep_distinct_history_records(tmp_path: Path)
     assert page["items"][0]["id"] != page["items"][1]["id"]  # type: ignore[index]
     assert page["items"][0]["mappings"][0]["started_at"]  # type: ignore[index]
     assert page["items"][0]["mappings"][0]["finished_at"]  # type: ignore[index]
+
+
+def test_in_progress_mapping_snapshot_recovers_with_open_finish_time() -> None:
+    """网络边界前已持久化的映射进度可在新存储实例中恢复为中断。"""
+
+    configuration = PluginConfiguration(
+        instances=[
+            OpenListInstance(
+                id="instance-1",
+                name="主实例",
+                scan_url="https://openlist.example.invalid",
+                api_token="configured",
+                mappings=[DirectoryMapping(source_dir="/library", output_dir="/strm")],
+            )
+        ]
+    )
+    jobs: list[Any] = []
+    snapshots: list[dict[str, object]] = []
+    store, _ = _store(now=1_704_326_400.0)
+
+    def client_factory(_url: str, _token: str) -> object:
+        """在客户端创建前观察已写入的运行快照。"""
+
+        snapshots.append(store.page())
+        raise OSError("offline client failure")
+
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=lambda task: jobs.append(task) or True,
+        client_factory=client_factory,
+        clock=lambda: 1_704_326_400.0,
+        history_callback=store.record_status,
+        history_discard=store.discard,
+    )
+
+    assert coordinator.trigger().accepted is True
+    jobs.pop()()
+    assert snapshots
+    persisted = {"version": 1, "items": snapshots[0]["items"]}
+    snapshot_items = cast(list[dict[str, Any]], snapshots[0]["items"])
+    snapshot_mapping = cast(dict[str, Any], snapshot_items[0]["mappings"][0])
+    assert snapshot_mapping["state"] == "running"
+    assert snapshot_mapping["started_at"] is not None
+    assert snapshot_mapping["finished_at"] is None
+
+    fresh_store = HistoryStore(lambda: persisted, lambda _value: None, clock=lambda: 1_704_326_400.0)
+    recovered = fresh_store.recover(90)
+    assert recovered is not None
+    recovered_mapping = recovered[0]["mappings"][0]
+    assert recovered[0]["state"] == "interrupted"
+    assert recovered_mapping["state"] == "interrupted"
+    assert recovered_mapping["started_at"] is not None
+    assert recovered_mapping["finished_at"] is None
+
+
+def test_recovery_retries_after_loader_failure_and_interrupts_orphan() -> None:
+    """读取故障后的后续初始化重试恢复并只中断旧孤儿记录。"""
+
+    allow_load = False
+    persisted: dict[str, object] = {
+        "version": 1,
+        "items": [_status("orphan", "2024-01-01T00:00:00+00:00", state="running")],
+    }
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm"
+    plugin._history_recovery_done = False
+    plugin._history_clock = lambda: 1_704_326_400.0
+    plugin.get_config = lambda _plugin_id=None: None
+
+    def get_data(key=None, plugin_id=None) -> object:
+        """模拟可恢复的 PluginData 读取故障。"""
+
+        if key == plugin.HISTORY_DATA_KEY and not allow_load:
+            raise OSError("history unavailable")
+        return {} if key == plugin.SECRET_DATA_KEY else persisted
+
+    plugin.get_data = get_data
+    plugin.save_data = lambda key, value, plugin_id=None: (
+        persisted.update(value) if key == plugin.HISTORY_DATA_KEY else None
+    )
+    plugin.init_plugin({"instances": [], "schedule_enabled": False})
+    assert plugin._history_recovery_done is False
+    allow_load = True
+    plugin.init_plugin({"instances": [], "schedule_enabled": False})
+    assert plugin._history_recovery_done is True
+    assert plugin.get_history_page()["items"][0]["state"] == "interrupted"  # type: ignore[index]
+
+
+def test_recovery_retries_after_save_failure() -> None:
+    """恢复写回失败时不宣告完成，下一次初始化可再次持久化。"""
+
+    allow_save = False
+    persisted: dict[str, object] = {
+        "version": 1,
+        "items": [_status("orphan", "2024-01-01T00:00:00+00:00", state="running")],
+    }
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm"
+    plugin._history_recovery_done = False
+    plugin._history_clock = lambda: 1_704_326_400.0
+    plugin.get_config = lambda _plugin_id=None: None
+    plugin.get_data = lambda key=None, plugin_id=None: {} if key == plugin.SECRET_DATA_KEY else persisted
+
+    def save_data(key, value, plugin_id=None) -> None:
+        """模拟恢复写回先失败后成功。"""
+
+        if key == plugin.HISTORY_DATA_KEY:
+            if not allow_save:
+                raise OSError("history save unavailable")
+            persisted.clear()
+            persisted.update(value)
+
+    plugin.save_data = save_data
+    plugin.init_plugin({"instances": [], "schedule_enabled": False})
+    assert plugin._history_recovery_done is False
+    allow_save = True
+    plugin.init_plugin({"instances": [], "schedule_enabled": False})
+    assert plugin._history_recovery_done is True
+    assert plugin.get_history_page()["items"][0]["state"] == "interrupted"  # type: ignore[index]
+
+
+def test_recovery_retry_excludes_same_runtime_live_run() -> None:
+    """真实接受的当前运行在恢复重试时保留，旧孤儿被中断。"""
+
+    allow_load = False
+    jobs: list[Any] = []
+    configuration = {
+        "instances": [
+            {
+                "id": "instance-1",
+                "name": "主实例",
+                "scan_url": "https://openlist.example.invalid",
+                "api_token": "configured",
+                "mappings": [{"source_dir": "/library", "output_dir": "/strm"}],
+            }
+        ],
+        "schedule_enabled": False,
+    }
+    persisted: dict[str, object] = {
+        "version": 1,
+        "items": [_status("orphan", "2024-01-01T00:00:00+00:00", state="running")],
+    }
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm"
+    plugin._history_recovery_done = False
+    plugin._history_clock = lambda: 1_704_326_400.0
+    plugin._scan_clock = lambda: 1_704_326_400.0
+    plugin._scan_dispatch = lambda task: jobs.append(task) or True
+    plugin.get_config = lambda _plugin_id=None: None
+
+    def get_data(key=None, plugin_id=None) -> object:
+        """让历史读取在第二次初始化恢复。"""
+
+        if key == plugin.HISTORY_DATA_KEY and not allow_load:
+            raise OSError("history unavailable")
+        return {} if key == plugin.SECRET_DATA_KEY else persisted
+
+    plugin.get_data = get_data
+    plugin.save_data = lambda key, value, plugin_id=None: (
+        persisted.update(value) if key == plugin.HISTORY_DATA_KEY else None
+    )
+    plugin.init_plugin(configuration)
+    assert plugin._history_recovery_done is False
+    accepted = plugin.trigger_scan()
+    assert accepted["accepted"] is True
+    run_id = plugin.get_scan_status()["run_id"]
+    assert isinstance(run_id, str)
+    assert jobs
+    persisted["items"] = [
+        _status("orphan", "2024-01-01T00:00:00+00:00", state="running"),
+        _status(run_id, "2024-01-02T00:00:00+00:00", state="running"),
+    ]
+    allow_load = True
+    plugin.init_plugin(configuration)
+
+    items = {item["id"]: item for item in plugin.get_history_page()["items"]}  # type: ignore[index]
+    assert items["orphan"]["state"] == "interrupted"
+    assert items[run_id]["state"] == "running"
 
 
 def test_never_started_mappings_keep_null_timestamps_when_stopped() -> None:

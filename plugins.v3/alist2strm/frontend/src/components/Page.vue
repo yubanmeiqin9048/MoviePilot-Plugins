@@ -7,12 +7,10 @@ import type {
   ConfigModel,
   DirectoryMapping,
   HistoryItem,
-  HistoryMapping,
   HistoryPage,
   OpenListInstance,
   PluginApi,
   ScanCounters,
-  ScanMappingStatus,
   ScanStatus,
   ScanTarget,
 } from '@/types'
@@ -141,10 +139,6 @@ function hasHistoryError(item: HistoryItem): boolean {
   return Boolean(item.error || item.state === 'failed' || item.state === 'partial_failure' || item.state === 'interrupted' || item.mappings.some((mapping) => mapping.error))
 }
 
-function historyMappingStatus(mapping: HistoryMapping): string {
-  return stateLabel(mapping.state)
-}
-
 function historyKey(item: HistoryItem): string {
   return item.id || item.identity
 }
@@ -171,10 +165,6 @@ function emptyConfig(): ConfigModel {
     schedule_cron: '0 3 * * *',
     history_retention_days: 90,
   }
-}
-
-function mappingStatus(mapping: ScanMappingStatus): string {
-  return stateLabel(mapping.state)
 }
 
 function stopPolling(): void {
@@ -361,7 +351,7 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
                 <tr v-for="mapping in status.mappings" :key="`${mapping.instance_id}-${mapping.mapping_index}`">
                   <td>{{ mapping.instance_name }}：{{ mapping.source_dir }}</td>
                   <td>
-                    {{ mappingStatus(mapping) }}
+                    {{ stateLabel(mapping.state) }}
                     <div v-if="mapping.error" class="text-error text-caption">{{ mapping.error }}</div>
                   </td>
                   <td class="text-center">{{ mapping.counters.generated }}</td>
@@ -463,7 +453,7 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
                       <td>{{ formatTimestamp(mapping.started_at) }}</td>
                       <td>{{ formatTimestamp(mapping.finished_at) }}</td>
                       <td>
-                        {{ historyMappingStatus(mapping) }}
+                        {{ stateLabel(mapping.state) }}
                         <div v-if="mapping.error" class="text-error text-caption">{{ mapping.error }}</div>
                       </td>
                       <td v-for="row in counterRowsFor(mapping.counters)" :key="`${mapping.identity}-${row.key}`" class="text-center">

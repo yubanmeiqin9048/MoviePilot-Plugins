@@ -161,7 +161,7 @@ def _plugin(payload: dict[str, object] | None = None) -> Alist2Strm:
     return plugin
 
 
-def test_enabled_configuration_registers_one_host_cron_service() -> None:
+def test_enabled_configuration_registers_shared_and_history_cron_services() -> None:
     """启用且有效的共用计划注册扫描服务，并始终注册历史清理服务。"""
 
     plugin = _plugin(_payload(enabled=True, cron="*/15 * * * *"))
@@ -177,6 +177,7 @@ def test_enabled_configuration_registers_one_host_cron_service() -> None:
     retention = services[1]
     assert retention["id"] == "history-retention"
     assert isinstance(retention["trigger"], CronTrigger)
+    assert str(retention["trigger"]) == str(CronTrigger.from_crontab("0 4 * * *"))
     assert retention["func"].__self__ is plugin
 
 
@@ -210,13 +211,14 @@ def test_disabled_configuration_keeps_daily_history_retention_service() -> None:
     service = services[0]
     assert service["id"] == "history-retention"
     service["func"]()
+    assert state["value"] == {"version": 1, "items": []}
 
     assert plugin.get_history_page()["total"] == 0
     assert plugin.scan_invocations == 0
 
 
-def test_disabled_or_invalid_configuration_registers_no_service() -> None:
-    """关闭计划或插件配置无效时不得向宿主注册服务。"""
+def test_disabled_or_invalid_configuration_registers_history_only_or_no_service() -> None:
+    """关闭扫描计划仍保留历史服务；无效配置不声明任何服务。"""
 
     disabled_services = _plugin(_payload(enabled=False)).get_service()
     assert len(disabled_services) == 1

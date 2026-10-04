@@ -1049,21 +1049,20 @@ class ScanCoordinator:
                 else:
                     run.state = "success"
                 for mapping in run.mappings:
-                    if (
-                        mapping.status.started_at
-                        and mapping.status.finished_at is None
-                        and mapping.status.state
-                        in {
-                            "success",
-                            "failed",
-                            "stopped",
-                            "interrupted",
-                        }
-                    ):
-                        mapping.status.finished_at = _timestamp(self._clock())
+                    self._finish_mapping_timestamp(mapping)
                 run.current_mapping = None
                 run.finished_at = self._clock()
             self._notify_history(run)
+
+    def _finish_mapping_timestamp(self, mapping: _MappingRun) -> None:
+        """只为已开始且进入终态的映射补写一次结束时间。"""
+
+        if (
+            mapping.status.started_at
+            and mapping.status.finished_at is None
+            and mapping.status.state in {"success", "failed", "stopped", "interrupted"}
+        ):
+            mapping.status.finished_at = _timestamp(self._clock())
 
     def _is_stop_requested(self, run: _ScanRun | None) -> bool:
         """读取任务停止标志，供客户端和扫描循环共享。"""
@@ -1225,6 +1224,7 @@ class ScanCoordinator:
                     mapping.status.started_at = _timestamp(self._clock())
                     mapping.status.finished_at = None
                     run.current_mapping = mapping.label
+                self._notify_history(run)
                 try:
                     if mapping.instance_id in failed_instances:
                         self._mark_mapping_failed(mapping, "实例认证或权限失败，已跳过该实例剩余映射")
@@ -1279,13 +1279,7 @@ class ScanCoordinator:
                     self._log_mapping_failure(mapping)
                 finally:
                     with self._lock:
-                        if mapping.status.started_at and mapping.status.state in {
-                            "success",
-                            "failed",
-                            "stopped",
-                            "interrupted",
-                        }:
-                            mapping.status.finished_at = _timestamp(self._clock())
+                        self._finish_mapping_timestamp(mapping)
                         run.current_mapping = None
                     self._notify_history(run)
         finally:

@@ -49,17 +49,18 @@ class HistoryStore:
         self._secrets = secrets if secrets is not None else lambda: ()
         self._lock = threading.RLock()
 
-    def recover(self, retention_days: int) -> list[HistoryRecord]:
+    def recover(self, retention_days: int, *, exclude_run_ids: Sequence[str] = ()) -> list[HistoryRecord] | None:
         """在插件初始化时标记旧进程遗留任务并清理过期记录。"""
 
+        excluded = {str(run_id) for run_id in exclude_run_ids}
         with self._lock:
             items, changed, loaded = self._read_items()
             if not loaded:
-                return []
+                return None
             now = self._clock()
             now_text = _timestamp(now)
             for item in items:
-                if item["state"] not in NON_TERMINAL_STATES:
+                if item.get("id") in excluded or item["state"] not in NON_TERMINAL_STATES:
                     continue
                 item["state"] = "interrupted"
                 item["finished_at"] = now_text
@@ -69,12 +70,10 @@ class HistoryStore:
                     for mapping in mappings:
                         if isinstance(mapping, Mapping) and mapping.get("state") in NON_TERMINAL_STATES:
                             mapping["state"] = "interrupted"
-                            if mapping.get("started_at") and not mapping.get("finished_at"):
-                                mapping["finished_at"] = now_text
             items, pruned = _prune(items, retention_days, now)
             changed = changed or pruned
-            if changed:
-                self._persist(items)
+            if changed and not self._persist(items):
+                return None
             return deepcopy(items)
 
     def prune(self, retention_days: int) -> list[HistoryRecord]:
