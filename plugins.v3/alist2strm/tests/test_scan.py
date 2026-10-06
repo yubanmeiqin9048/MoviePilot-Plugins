@@ -30,10 +30,11 @@ from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
 class _Transport:
     """按目录树分页返回受控 OpenList 响应，并记录认证边界。"""
 
-    def __init__(self, trees: dict[str, dict[str, list[dict[str, Any]]]]) -> None:
-        """保存多个实例的目录树。"""
+    def __init__(self, trees: dict[str, dict[str, list[dict[str, Any]]]], *, null_empty_content: bool = False) -> None:
+        """保存多个实例的目录树，并可让空目录返回 OpenList 的 null content。"""
 
         self.trees = trees
+        self.null_empty_content = null_empty_content
         self.calls: list[dict[str, Any]] = []
         self.stream_factory: Any = None
 
@@ -52,11 +53,12 @@ class _Transport:
         page = int(payload["page"])
         per_page = int(payload["per_page"])
         start = (page - 1) * per_page
+        content: object = None if self.null_empty_content and not entries else entries[start : start + per_page]
         return HttpResponse(
             200,
             {
                 "code": 200,
-                "data": {"content": entries[start : start + per_page], "total": len(entries)},
+                "data": {"content": content, "total": len(entries)},
             },
         )
 
@@ -555,6 +557,45 @@ def test_scan_uses_empty_directories_as_success_and_isolates_bad_mapping(tmp_pat
     assert not (tmp_path / "a" / "stale.strm").exists()
     assert (tmp_path / "b" / "stale.strm").is_file()
     assert not (tmp_path / "empty").exists()
+
+
+def test_scan_treats_null_empty_directory_content_as_success(tmp_path: Path) -> None:
+    """OpenList 空目录返回 null content 时扫描成功且不累计失败。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "null-empty",
+                    "name": "空目录实例",
+                    "scan_url": "https://scan-null-empty.example.invalid",
+                    "playback_url": "https://play-null-empty.example.invalid",
+                    "api_token": "token-null-empty",
+                    "mappings": [{"source_dir": "/media/empty", "output_dir": str(tmp_path / "null-empty")}],
+                }
+            ]
+        }
+    )
+    transport = _Transport(
+        {"https://scan-null-empty.example.invalid": {"/media/empty": []}},
+        null_empty_content=True,
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+
+    assert coordinator.trigger().accepted is True
+    queue.run()
+
+    status = coordinator.status()
+    assert status["state"] == "success"
+    assert status["counters"]["failed"] == 0  # type: ignore[index]
+    assert status["mappings"][0]["state"] == "success"  # type: ignore[index]
+    assert not (tmp_path / "null-empty").exists()
 
 
 def test_unchanged_playback_rescan_keeps_existing_target_skipped(tmp_path: Path) -> None:
@@ -1098,6 +1139,34 @@ def test_list_retry_exhaustion_and_non_retryable_responses() -> None:
         client.list_dir("/library")
     assert error.value.attempts_exhausted is True
     assert transport.attempts == 3
+
+
+def test_list_treats_null_content_as_empty_directory() -> None:
+    """OpenList 空目录把 content 序列化为 null 时按空列表处理且不重试。"""
+
+    class NullContentTransport:
+        """返回 OpenList 空目录的 null content 响应。"""
+
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+            """记录请求次数并返回空目录响应。"""
+
+            self.attempts += 1
+            return HttpResponse(200, {"code": 200, "data": {"content": None, "total": 0}})
+
+    transport = NullContentTransport()
+    client = OpenListClient(
+        "https://null.example.invalid",
+        "test-token",
+        transport=transport,
+        sleep=lambda _delay: None,
+        retry_backoff=lambda _attempt: 0,
+    )
+
+    assert client.list_dir("/library") == []
+    assert transport.attempts == 1
 
 
 def test_download_retry_exhaustion_isolated_from_good_attachment(tmp_path: Path) -> None:

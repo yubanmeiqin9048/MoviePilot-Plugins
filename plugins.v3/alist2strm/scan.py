@@ -403,7 +403,7 @@ class OpenListClient:
         raise AssertionError("OpenList 重试循环未返回")
 
     def list_dir(self, remote_path: str) -> list[RemoteEntry]:
-        """完整读取一个全站绝对目录，不限制页数并支持空目录。"""
+        """完整读取一个全站绝对目录，不限制页数并把空目录的缺省 content 视为空列表。"""
 
         if not remote_path.startswith("/"):
             raise OpenListError("源目录必须是全站绝对路径", retryable=False)
@@ -421,6 +421,9 @@ class OpenListClient:
                 }
             )
             content = data.get("content")
+            if content is None:
+                # OpenList 对底层返回的 nil 切片序列化为 null，空目录因此没有 content 数组。
+                content = []
             total = data.get("total")
             if not isinstance(content, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
                 raise OpenListError("OpenList 目录响应格式无效", retryable=False)
