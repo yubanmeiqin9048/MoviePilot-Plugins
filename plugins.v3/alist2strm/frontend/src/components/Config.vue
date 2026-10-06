@@ -12,6 +12,8 @@ const DEFAULT_NOTICES: Notices = {
   output_directory: '完整扫描成功后，会清理该目录中不再需要的受管文件，包括手工放入的文件；请使用专用输出目录。',
 }
 
+const LIST_DELIMITERS = [',', '，', ';', '；']
+
 type HostToast = {
   success(message: string): unknown
   error(message: string): unknown
@@ -37,11 +39,23 @@ const baseline = ref('')
 const saveError = ref('')
 const saving = ref(false)
 
+/** 当前视图：某个实例或通用设置。 */
+const view = ref<'instance' | 'general'>('instance')
+const activeIndex = ref(0)
+const revealToken = ref(false)
+const pendingDelete = ref<number | null>(null)
+
 const pluginId = computed(() => props.pluginId.trim() || props.initialConfig?.plugin_id?.trim() || '')
 const dirty = computed(() => serialize(toPayload(draft.value)) !== baseline.value)
 const notices = computed(() => ({ ...DEFAULT_NOTICES, ...(draft.value.notices || {}) }))
 const outputConflicts = computed(() => findOutputConflicts(draft.value.instances))
-const canSave = computed(() => !saving.value && !outputConflicts.value.length)
+const canSave = computed(() => !saving.value && dirty.value && !outputConflicts.value.size)
+const activeInstance = computed(() => draft.value.instances[activeIndex.value] ?? null)
+const mappingTotal = computed(() => draft.value.instances.reduce((sum, item) => sum + item.mappings.length, 0))
+const confirmOpen = computed({
+  get: () => pendingDelete.value !== null,
+  set: value => { if (!value) pendingDelete.value = null },
+})
 
 watch(() => props.initialConfig, value => {
   const next = normalizeConfig(value)
@@ -49,13 +63,16 @@ watch(() => props.initialConfig, value => {
   baseline.value = serialize(toPayload(next))
   saveError.value = ''
   configurationEditorState.dirty = false
+  clampActive()
 }, { immediate: true, deep: true })
 
 watch(draft, () => {
   configurationEditorState.dirty = dirty.value
 }, { deep: true })
 
-onMounted(() => emit('layout', { maxWidth: '78rem' }))
+watch([view, activeIndex], () => { revealToken.value = false })
+
+onMounted(() => emit('layout', { maxWidth: '68rem' }))
 
 function emptyModel(): ConfigModel {
   return {
@@ -113,8 +130,10 @@ function normalizeMapping(value: unknown): DirectoryMapping {
 }
 
 function normalizeLines(value: unknown): string[] {
-  if (typeof value === 'string') return value.split(/[,\n]/).map(item => item.trim()).filter(Boolean)
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').map(item => item.trim()).filter(Boolean) : []
+  const items = typeof value === 'string'
+    ? value.split(/[,\n]/)
+    : Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  return [...new Set(items.map(item => item.trim()).filter(Boolean))]
 }
 
 function clone<T>(value: T): T {
@@ -142,6 +161,39 @@ function toPayload(value: ConfigModel): ConfigModel {
   return payload
 }
 
+/** 为映射对象分配稳定的渲染 key，删除中间项时不复用输入框状态。 */
+const renderKeys = new WeakMap<object, string>()
+let renderSeq = 0
+function keyOf(item: object): string {
+  let key = renderKeys.get(item)
+  if (!key) {
+    key = `m${++renderSeq}`
+    renderKeys.set(item, key)
+  }
+  return key
+}
+
+function clampActive(): void {
+  const count = draft.value.instances.length
+  activeIndex.value = count ? Math.min(Math.max(activeIndex.value, 0), count - 1) : 0
+}
+
+function instanceLabel(instance: OpenListInstance, index: number): string {
+  return instance.name.trim() || `实例 ${index + 1}`
+}
+
+function instanceHasIssue(instance: OpenListInstance, index: number): boolean {
+  if (!instance.scan_url.trim()) return true
+  if (!instance.api_token?.trim() && !instance.api_token_configured) return true
+  return instance.mappings.some((mapping, mappingIndex) =>
+    !mapping.source_dir.trim() || !mapping.output_dir.trim() || outputConflicts.value.has(conflictKey(index, mappingIndex)))
+}
+
+function selectInstance(index: number): void {
+  view.value = 'instance'
+  activeIndex.value = index
+}
+
 function addInstance(): void {
   draft.value.instances.push({
     id: `instance-${Date.now()}`,
@@ -151,10 +203,14 @@ function addInstance(): void {
     playback_url: '',
     mappings: [],
   })
+  selectInstance(draft.value.instances.length - 1)
 }
 
-function removeInstance(index: number): void {
-  draft.value.instances.splice(index, 1)
+function confirmRemoveInstance(): void {
+  if (pendingDelete.value === null) return
+  draft.value.instances.splice(pendingDelete.value, 1)
+  pendingDelete.value = null
+  clampActive()
 }
 
 function addMapping(instance: OpenListInstance): void {
@@ -173,20 +229,12 @@ function removeMapping(instance: OpenListInstance, index: number): void {
   instance.mappings.splice(index, 1)
 }
 
-function extensionsText(mapping: DirectoryMapping): string {
-  return mapping.extensions.join(', ')
+function setList(mapping: DirectoryMapping, field: 'extensions' | 'exclude_keywords', value: unknown): void {
+  mapping[field] = normalizeLines(value)
 }
 
-function updateExtensions(mapping: DirectoryMapping, value: string): void {
-  mapping.extensions = normalizeLines(value)
-}
-
-function keywordsText(mapping: DirectoryMapping): string {
-  return mapping.exclude_keywords.join('\n')
-}
-
-function updateKeywords(mapping: DirectoryMapping, value: string): void {
-  mapping.exclude_keywords = normalizeLines(value)
+function required(value: string): true | string {
+  return !!value?.trim() || '必填'
 }
 
 function comparablePath(value: string): string {
@@ -200,15 +248,28 @@ function overlaps(first: string, second: string): boolean {
   return left === right || right.startsWith(`${left}/`) || left.startsWith(`${right}/`)
 }
 
-function findOutputConflicts(instances: OpenListInstance[]): string[] {
-  const entries: Array<{ instance: string; index: number; output: string }> = []
-  instances.forEach(instance => instance.mappings.forEach((mapping, index) => {
-    if (mapping.output_dir.trim()) entries.push({ instance: instance.name || `实例 ${instances.indexOf(instance) + 1}`, index: index + 1, output: mapping.output_dir })
+function conflictKey(instanceIndex: number, mappingIndex: number): string {
+  return `${instanceIndex}:${mappingIndex}`
+}
+
+/** 返回“实例:映射”到冲突说明的映射表，用于字段级报错。 */
+function findOutputConflicts(instances: OpenListInstance[]): Map<string, string[]> {
+  const entries: Array<{ key: string; label: string; output: string }> = []
+  instances.forEach((instance, instanceIndex) => instance.mappings.forEach((mapping, mappingIndex) => {
+    if (mapping.output_dir.trim()) {
+      entries.push({
+        key: conflictKey(instanceIndex, mappingIndex),
+        label: `${instanceLabel(instance, instanceIndex)} #${mappingIndex + 1}`,
+        output: mapping.output_dir,
+      })
+    }
   }))
-  const conflicts: string[] = []
+  const conflicts = new Map<string, string[]>()
+  const push = (key: string, message: string) => conflicts.set(key, [...(conflicts.get(key) || []), message])
   entries.forEach((first, firstIndex) => entries.slice(firstIndex + 1).forEach(second => {
     if (overlaps(first.output, second.output)) {
-      conflicts.push(`实例“${first.instance}”映射 ${first.index}（${first.output}）与实例“${second.instance}”映射 ${second.index}（${second.output}）输出目录重叠。`)
+      push(first.key, `与 ${second.label} 的输出目录重叠`)
+      push(second.key, `与 ${first.label} 的输出目录重叠`)
     }
   }))
   return conflicts
@@ -216,8 +277,8 @@ function findOutputConflicts(instances: OpenListInstance[]): string[] {
 
 async function save(): Promise<void> {
   saveError.value = ''
-  if (!canSave.value) {
-    saveError.value = outputConflicts.value[0] || '请先修正配置。'
+  if (outputConflicts.value.size) {
+    saveError.value = '存在重叠的输出目录，请先修正。'
     return
   }
   if (!pluginId.value) {
@@ -232,6 +293,7 @@ async function save(): Promise<void> {
     draft.value = returned
     baseline.value = serialize(toPayload(returned))
     configurationEditorState.dirty = false
+    clampActive()
     toast?.success(response.message || '配置已保存。')
   } catch (error) {
     // 不改动 draft/baseline；管理员可以直接修正或重试。
@@ -244,63 +306,672 @@ async function save(): Promise<void> {
 </script>
 
 <template>
-  <VCard class="alist2strm-config" flat>
-    <VCardTitle class="d-flex align-center justify-space-between">
-      <span>Alist2Strm 配置</span>
-      <VChip v-if="dirty" color="warning" size="small" variant="tonal">有未保存更改</VChip>
-    </VCardTitle>
-    <VCardText>
-      <VAlert class="mb-3" type="info" variant="tonal">{{ notices.admin_token }}</VAlert>
-      <VAlert class="mb-3" type="warning" variant="tonal">{{ notices.root }}</VAlert>
-      <VAlert class="mb-3" type="warning" variant="tonal">{{ notices.sign }}</VAlert>
+  <div class="a2s-config">
+    <!-- 顶栏 -->
+    <header class="a2s-head">
+      <div class="a2s-head-text">
+        <div class="a2s-head-title">Alist2Strm 设置</div>
+        <div class="a2s-head-sub">{{ draft.instances.length }} 个实例 · {{ mappingTotal }} 条映射</div>
+      </div>
+      <VChip v-if="dirty" size="small" color="warning" variant="tonal" label>未保存</VChip>
+      <VBtn icon="mdi-close" size="small" variant="text" aria-label="关闭" @click="emit('close')" />
+    </header>
+    <VDivider />
 
-      <VExpansionPanels multiple>
-        <VExpansionPanel v-for="(instance, instanceIndex) in draft.instances" :key="instance.id || instanceIndex">
-          <VExpansionPanelTitle>实例 {{ instanceIndex + 1 }}{{ instance.name ? `：${instance.name}` : '' }}</VExpansionPanelTitle>
-          <VExpansionPanelText>
-            <VTextField v-model="instance.name" label="实例名称" class="mb-2" />
-            <VTextField v-model="instance.scan_url" label="扫描地址" hint="OpenList 服务的完整 HTTP(S) 地址" persistent-hint class="mb-2" />
-            <VTextField v-model="instance.api_token" type="password" autocomplete="new-password" label="管理员 API Token" :placeholder="instance.api_token_configured ? '已配置，留空表示保持不变' : ''" class="mb-2" />
-            <VTextField v-model="instance.playback_url" label="播放地址（可选）" hint="留空时使用扫描地址" persistent-hint class="mb-4" />
+    <div class="a2s-body">
+      <!-- 分区导航：宽屏为侧栏，窄屏为横向滚动条 -->
+      <nav class="a2s-nav" aria-label="设置分区">
+        <div class="a2s-nav-label">OpenList 实例</div>
+        <button
+          v-for="(instance, index) in draft.instances"
+          :key="instance.id"
+          type="button"
+          class="a2s-nav-item"
+          :class="{ 'a2s-nav-item--active': view === 'instance' && activeIndex === index }"
+          :aria-current="view === 'instance' && activeIndex === index ? 'page' : undefined"
+          @click="selectInstance(index)"
+        >
+          <VIcon size="18" icon="mdi-server-network-outline" class="a2s-nav-icon" />
+          <span class="a2s-nav-name">{{ instanceLabel(instance, index) }}</span>
+          <VIcon
+            v-if="instanceHasIssue(instance, index)"
+            size="16"
+            icon="mdi-alert-circle"
+            color="warning"
+            aria-label="配置不完整"
+          />
+          <span v-else class="a2s-nav-count">{{ instance.mappings.length }}</span>
+        </button>
+        <button type="button" class="a2s-nav-item a2s-nav-item--add" @click="addInstance">
+          <VIcon size="18" icon="mdi-plus" class="a2s-nav-icon" />
+          <span class="a2s-nav-name">添加实例</span>
+        </button>
 
-            <div class="d-flex align-center justify-space-between mb-2">
-              <h3 class="text-subtitle-1">目录映射</h3>
-              <VBtn size="small" variant="tonal" prepend-icon="mdi-plus" @click="addMapping(instance)">添加映射</VBtn>
-            </div>
-            <VAlert class="mb-3" type="info" variant="tonal">{{ notices.output_directory }}</VAlert>
-            <VCard v-for="(mapping, mappingIndex) in instance.mappings" :key="`${instance.id}-${mappingIndex}`" variant="outlined" class="pa-3 mb-3">
-              <div class="d-flex align-center justify-space-between mb-2">
-                <span class="text-subtitle-2">映射 {{ mappingIndex + 1 }}</span>
-                <VBtn icon="mdi-delete-outline" size="small" variant="text" aria-label="删除映射" @click="removeMapping(instance, mappingIndex)" />
+        <div class="a2s-nav-label a2s-nav-label--gap">通用</div>
+        <button
+          type="button"
+          class="a2s-nav-item"
+          :class="{ 'a2s-nav-item--active': view === 'general' }"
+          :aria-current="view === 'general' ? 'page' : undefined"
+          @click="view = 'general'"
+        >
+          <VIcon size="18" icon="mdi-clock-outline" class="a2s-nav-icon" />
+          <span class="a2s-nav-name">定时与历史</span>
+          <VIcon v-if="draft.schedule_enabled" size="10" icon="mdi-circle" color="success" aria-label="定时已启用" />
+        </button>
+      </nav>
+
+      <main class="a2s-main">
+        <!-- 实例编辑 -->
+        <template v-if="view === 'instance'">
+          <div v-if="!activeInstance" class="a2s-empty">
+            <VIcon size="48" icon="mdi-server-plus-outline" color="medium-emphasis" />
+            <div class="a2s-empty-title">还没有 OpenList 实例</div>
+            <div class="a2s-empty-text">添加一个实例，再为它配置目录映射。</div>
+            <VBtn color="primary" variant="flat" prepend-icon="mdi-plus" @click="addInstance">添加实例</VBtn>
+          </div>
+
+          <template v-else>
+            <section class="a2s-section">
+              <div class="a2s-section-head">
+                <div>
+                  <h3 class="a2s-section-title">连接</h3>
+                  <p class="a2s-section-desc">扫描通过管理员 API 访问，播放链接可使用独立的外部地址。</p>
+                </div>
+                <VBtn
+                  variant="text"
+                  color="error"
+                  size="small"
+                  prepend-icon="mdi-delete-outline"
+                  @click="pendingDelete = activeIndex"
+                >删除实例</VBtn>
               </div>
-              <VTextField v-model="mapping.source_dir" label="源目录（绝对路径）" class="mb-2" />
-              <VTextField v-model="mapping.output_dir" label="输出目录（绝对路径）" class="mb-2" />
-              <VSelect v-model="mapping.whitelist_mode" :items="[{ title: '跟随宿主媒体与字幕后缀', value: 'follow_host' }, { title: '自定义后缀白名单', value: 'custom' }]" label="后缀白名单模式" class="mb-2" />
-              <VTextField v-if="mapping.whitelist_mode === 'custom'" :model-value="extensionsText(mapping)" label="后缀白名单" hint="多个后缀用逗号或换行分隔" persistent-hint class="mb-2" @update:model-value="updateExtensions(mapping, String($event))" />
-              <div v-else class="text-caption mb-2">当前生效后缀：{{ mapping.effective_extensions?.join(', ') || '保存后读取宿主设置' }}</div>
-              <VTextarea :model-value="keywordsText(mapping)" label="排除关键字" hint="每行一个，按名称包含关系匹配且不区分大小写" persistent-hint rows="2" @update:model-value="updateKeywords(mapping, String($event))" />
-            </VCard>
-            <div v-if="!instance.mappings.length" class="text-caption mb-3">尚未添加目录映射。</div>
-            <VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeInstance(instanceIndex)">删除实例</VBtn>
-          </VExpansionPanelText>
-        </VExpansionPanel>
-      </VExpansionPanels>
-      <VBtn class="mt-3" variant="tonal" prepend-icon="mdi-plus" @click="addInstance">添加 OpenList 实例</VBtn>
 
-      <VAlert v-for="conflict in outputConflicts" :key="conflict" class="mt-3" type="error" variant="tonal">{{ conflict }}</VAlert>
+              <div class="a2s-grid">
+                <VTextField
+                  v-model="activeInstance.name"
+                  label="名称"
+                  :placeholder="`实例 ${activeIndex + 1}`"
+                  hide-details="auto"
+                />
+                <VTextField
+                  v-model="activeInstance.scan_url"
+                  label="扫描地址"
+                  placeholder="http://openlist:5244"
+                  :rules="[required]"
+                  hide-details="auto"
+                />
+                <VTextField
+                  v-model="activeInstance.api_token"
+                  class="a2s-span-2"
+                  label="管理员 API Token"
+                  :type="revealToken ? 'text' : 'password'"
+                  autocomplete="new-password"
+                  :placeholder="activeInstance.api_token_configured ? '已配置，留空保持不变' : '粘贴管理员 Token'"
+                  :append-inner-icon="revealToken ? 'mdi-eye-off-outline' : 'mdi-eye-outline'"
+                  hide-details="auto"
+                  @click:append-inner="revealToken = !revealToken"
+                >
+                  <template v-if="activeInstance.api_token_configured && !activeInstance.api_token" #prepend-inner>
+                    <VIcon size="18" icon="mdi-check-circle" color="success" />
+                  </template>
+                </VTextField>
+                <VTextField
+                  v-model="activeInstance.playback_url"
+                  class="a2s-span-2"
+                  label="播放地址"
+                  placeholder="留空时使用扫描地址"
+                  hint="写入 STRM 的地址前缀，供媒体服务器访问"
+                  persistent-hint
+                  hide-details="auto"
+                />
+              </div>
 
-      <VDivider class="my-5" />
-      <h3 class="text-subtitle-1 mb-2">全局设置</h3>
-      <VSwitch v-model="draft.schedule_enabled" label="启用共用定时计划" color="primary" />
-      <VTextField v-model="draft.schedule_cron" label="Cron（5 个字段）" :disabled="!draft.schedule_enabled" class="mb-2" />
-      <VTextField v-model.number="draft.history_retention_days" type="number" min="1" step="1" label="历史保留天数" />
+              <div class="a2s-requirements">
+                <div class="a2s-requirements-title">
+                  <VIcon size="16" icon="mdi-information-outline" />
+                  OpenList 侧要求
+                </div>
+                <ul>
+                  <li>{{ notices.admin_token }}</li>
+                  <li>{{ notices.root }}</li>
+                  <li>{{ notices.sign }}</li>
+                </ul>
+              </div>
+            </section>
 
-      <VAlert v-if="saveError" class="mt-4" type="error" variant="tonal">{{ saveError }}</VAlert>
-    </VCardText>
-    <VCardActions>
-      <VSpacer />
-      <VBtn variant="text" @click="emit('close')">关闭</VBtn>
-      <VBtn color="primary" :loading="saving" :disabled="!canSave" prepend-icon="mdi-content-save" @click="save">保存</VBtn>
-    </VCardActions>
-  </VCard>
+            <section class="a2s-section">
+              <div class="a2s-section-head">
+                <div>
+                  <h3 class="a2s-section-title">
+                    目录映射
+                    <span class="a2s-section-count">{{ activeInstance.mappings.length }}</span>
+                  </h3>
+                  <p class="a2s-section-desc a2s-section-desc--warn">
+                    <VIcon size="14" icon="mdi-alert-outline" color="warning" />
+                    {{ notices.output_directory }}
+                  </p>
+                </div>
+                <VBtn
+                  variant="tonal"
+                  color="primary"
+                  size="small"
+                  prepend-icon="mdi-plus"
+                  @click="addMapping(activeInstance)"
+                >添加映射</VBtn>
+              </div>
+
+              <button
+                v-if="!activeInstance.mappings.length"
+                type="button"
+                class="a2s-mapping-placeholder"
+                @click="addMapping(activeInstance)"
+              >
+                <VIcon icon="mdi-folder-plus-outline" />
+                添加第一条映射：OpenList 目录 → 本地 STRM 目录
+              </button>
+
+              <div
+                v-for="(mapping, mappingIndex) in activeInstance.mappings"
+                :key="keyOf(mapping)"
+                class="a2s-mapping"
+                :class="{ 'a2s-mapping--error': outputConflicts.has(conflictKey(activeIndex, mappingIndex)) }"
+              >
+                <div class="a2s-mapping-head">
+                  <span class="a2s-mapping-index">{{ mappingIndex + 1 }}</span>
+                  <span class="a2s-mapping-title">{{ mapping.source_dir.trim() || '新映射' }}</span>
+                  <VBtn
+                    icon="mdi-close"
+                    size="x-small"
+                    variant="text"
+                    aria-label="删除映射"
+                    @click="removeMapping(activeInstance, mappingIndex)"
+                  />
+                </div>
+
+                <div class="a2s-mapping-paths">
+                  <VTextField
+                    v-model="mapping.source_dir"
+                    label="OpenList 源目录"
+                    placeholder="/media/movies"
+                    prepend-inner-icon="mdi-cloud-outline"
+                    :rules="[required]"
+                    hide-details="auto"
+                  />
+                  <VIcon class="a2s-mapping-arrow" icon="mdi-arrow-right" aria-hidden="true" />
+                  <VTextField
+                    v-model="mapping.output_dir"
+                    label="本地输出目录"
+                    placeholder="/strm/movies"
+                    prepend-inner-icon="mdi-folder-outline"
+                    :rules="[required]"
+                    :error-messages="outputConflicts.get(conflictKey(activeIndex, mappingIndex)) || []"
+                    hide-details="auto"
+                  />
+                </div>
+
+                <div class="a2s-mapping-filters">
+                  <div class="a2s-filter">
+                    <div class="a2s-filter-head">
+                      <span class="a2s-filter-label">文件后缀</span>
+                      <VBtnToggle
+                        v-model="mapping.whitelist_mode"
+                        mandatory
+                        density="compact"
+                        variant="outlined"
+                        divided
+                        color="primary"
+                        class="a2s-toggle"
+                      >
+                        <VBtn value="follow_host" size="small">跟随宿主</VBtn>
+                        <VBtn value="custom" size="small">自定义</VBtn>
+                      </VBtnToggle>
+                    </div>
+                    <VCombobox
+                      v-if="mapping.whitelist_mode === 'custom'"
+                      :model-value="mapping.extensions"
+                      :items="[]"
+                      :delimiters="LIST_DELIMITERS"
+                      multiple
+                      chips
+                      closable-chips
+                      hide-no-data
+                      density="compact"
+                      placeholder="输入后缀后回车，如 .mkv"
+                      hide-details
+                      @update:model-value="setList(mapping, 'extensions', $event)"
+                    />
+                    <div v-else class="a2s-filter-hint">
+                      {{ mapping.effective_extensions?.length
+                        ? mapping.effective_extensions.join('  ')
+                        : '使用 MoviePilot 的媒体与字幕后缀，保存后显示生效列表' }}
+                    </div>
+                  </div>
+
+                  <div class="a2s-filter">
+                    <div class="a2s-filter-head">
+                      <span class="a2s-filter-label">排除关键字</span>
+                      <span class="a2s-filter-note">名称包含即跳过，不区分大小写</span>
+                    </div>
+                    <VCombobox
+                      :model-value="mapping.exclude_keywords"
+                      :items="[]"
+                      :delimiters="LIST_DELIMITERS"
+                      multiple
+                      chips
+                      closable-chips
+                      hide-no-data
+                      density="compact"
+                      placeholder="输入关键字后回车"
+                      hide-details
+                      @update:model-value="setList(mapping, 'exclude_keywords', $event)"
+                    />
+                  </div>
+                </div>
+              </div>
+            </section>
+          </template>
+        </template>
+
+        <!-- 通用设置 -->
+        <template v-else>
+          <section class="a2s-section">
+            <div class="a2s-section-head">
+              <div>
+                <h3 class="a2s-section-title">定时扫描</h3>
+                <p class="a2s-section-desc">按 Cron 计划依次扫描全部实例的全部映射。</p>
+              </div>
+              <VSwitch
+                v-model="draft.schedule_enabled"
+                color="primary"
+                inset
+                hide-details
+                density="compact"
+                aria-label="启用定时扫描"
+                class="a2s-switch"
+              />
+            </div>
+            <div class="a2s-grid">
+              <VTextField
+                v-model="draft.schedule_cron"
+                label="Cron 表达式"
+                :disabled="!draft.schedule_enabled"
+                hint="分 时 日 月 周，例如 0 3 * * * 表示每天 03:00"
+                persistent-hint
+                class="a2s-mono"
+              />
+            </div>
+          </section>
+
+          <section class="a2s-section">
+            <div class="a2s-section-head">
+              <div>
+                <h3 class="a2s-section-title">扫描历史</h3>
+                <p class="a2s-section-desc">超过保留期的运行记录会被自动清理。</p>
+              </div>
+            </div>
+            <div class="a2s-grid">
+              <VTextField
+                v-model.number="draft.history_retention_days"
+                label="保留天数"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
+                hide-details="auto"
+              />
+            </div>
+          </section>
+        </template>
+      </main>
+    </div>
+
+    <!-- 底栏 -->
+    <VDivider />
+    <footer class="a2s-foot">
+      <div class="a2s-foot-status" role="status">
+        <template v-if="saveError">
+          <VIcon size="18" icon="mdi-alert-circle-outline" color="error" />
+          <span class="text-error">{{ saveError }}</span>
+        </template>
+        <template v-else-if="outputConflicts.size">
+          <VIcon size="18" icon="mdi-alert-circle-outline" color="error" />
+          <span class="text-error">{{ outputConflicts.size }} 条映射的输出目录重叠</span>
+        </template>
+        <span v-else-if="dirty" class="text-medium-emphasis">修改尚未保存</span>
+      </div>
+      <div class="a2s-foot-actions">
+        <VBtn variant="text" @click="emit('close')">关闭</VBtn>
+        <VBtn
+          color="primary"
+          variant="flat"
+          prepend-icon="mdi-content-save-outline"
+          :loading="saving"
+          :disabled="!canSave"
+          @click="save"
+        >保存</VBtn>
+      </div>
+    </footer>
+
+    <VDialog v-model="confirmOpen" max-width="24rem">
+      <VCard>
+        <VCardTitle class="text-subtitle-1 pt-4">删除实例？</VCardTitle>
+        <VCardText class="text-body-2">
+          “{{ pendingDelete !== null && draft.instances[pendingDelete]
+            ? instanceLabel(draft.instances[pendingDelete], pendingDelete)
+            : '' }}”及其全部映射将被移除，保存后生效。
+        </VCardText>
+        <VCardActions>
+          <VSpacer />
+          <VBtn variant="text" @click="pendingDelete = null">取消</VBtn>
+          <VBtn color="error" variant="flat" @click="confirmRemoveInstance">删除</VBtn>
+        </VCardActions>
+      </VCard>
+    </VDialog>
+  </div>
 </template>
+
+<style scoped>
+.a2s-config {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  height: min(85dvh, 52rem);
+  background: rgb(var(--v-theme-surface));
+}
+
+/* 宿主在小屏下全屏显示弹窗 */
+@media (max-width: 959.98px) {
+  .a2s-config { height: 100dvh; }
+}
+
+/* ── 顶栏 / 底栏 ── */
+.a2s-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 0.75rem 0.75rem 1.25rem;
+  flex-shrink: 0;
+}
+.a2s-head-text { flex: 1; min-width: 0; }
+.a2s-head-title { font-size: 1.0625rem; font-weight: 600; line-height: 1.4; }
+.a2s-head-sub { font-size: 0.75rem; color: rgba(var(--v-theme-on-surface), 0.6); }
+
+.a2s-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  padding: 0.625rem 1rem 0.625rem 1.25rem;
+  padding-bottom: calc(0.625rem + env(safe-area-inset-bottom, 0px));
+  flex-shrink: 0;
+}
+.a2s-foot-status {
+  flex: 1 1 12rem;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.8125rem;
+}
+.a2s-foot-actions { display: flex; gap: 0.5rem; margin-inline-start: auto; }
+
+/* ── 主体布局 ── */
+.a2s-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr);
+}
+
+.a2s-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0.75rem 0.5rem;
+  overflow-y: auto;
+  border-inline-end: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  background: rgba(var(--v-theme-on-surface), 0.02);
+}
+.a2s-nav-label {
+  padding: 0.25rem 0.75rem 0.375rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: rgba(var(--v-theme-on-surface), 0.5);
+}
+.a2s-nav-label--gap { margin-top: 0.875rem; }
+.a2s-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  width: 100%;
+  min-height: 2.5rem;
+  padding: 0 0.75rem;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  text-align: start;
+  color: rgba(var(--v-theme-on-surface), 0.85);
+  transition: background-color 0.15s;
+}
+.a2s-nav-item:hover { background: rgba(var(--v-theme-on-surface), 0.06); }
+.a2s-nav-item:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: -2px; }
+.a2s-nav-item--active,
+.a2s-nav-item--active:hover {
+  background: rgba(var(--v-theme-primary), 0.12);
+  color: rgb(var(--v-theme-primary));
+  font-weight: 600;
+}
+.a2s-nav-item--add { color: rgba(var(--v-theme-on-surface), 0.6); }
+.a2s-nav-icon { flex-shrink: 0; opacity: 0.8; }
+.a2s-nav-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.a2s-nav-count {
+  min-width: 1.25rem;
+  padding: 0 0.375rem;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  line-height: 1.25rem;
+  text-align: center;
+  background: rgba(var(--v-theme-on-surface), 0.08);
+}
+
+.a2s-main {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+/* ── 分区 ── */
+.a2s-section { display: flex; flex-direction: column; gap: 1rem; }
+.a2s-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.a2s-section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.a2s-section-count {
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: rgba(var(--v-theme-on-surface), 0.08);
+}
+.a2s-section-desc {
+  margin: 0.125rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: rgba(var(--v-theme-on-surface), 0.6);
+}
+.a2s-section-desc--warn .v-icon { vertical-align: -2px; margin-inline-end: 0.125rem; }
+
+.a2s-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+.a2s-span-2 { grid-column: 1 / -1; }
+.a2s-mono :deep(input) { font-family: ui-monospace, 'SF Mono', Consolas, monospace; }
+.a2s-switch { flex: 0 0 auto; }
+
+.a2s-requirements {
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  background: rgba(var(--v-theme-info), 0.08);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+.a2s-requirements-title {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-weight: 600;
+  color: rgb(var(--v-theme-info));
+  margin-bottom: 0.25rem;
+}
+.a2s-requirements ul { margin: 0; padding-inline-start: 1.25rem; color: rgba(var(--v-theme-on-surface), 0.75); }
+
+/* ── 映射 ── */
+.a2s-mapping {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 0.875rem 1rem 1rem;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 10px;
+}
+.a2s-mapping--error { border-color: rgba(var(--v-theme-error), 0.6); }
+.a2s-mapping-head { display: flex; align-items: center; gap: 0.625rem; margin-inline-end: -0.375rem; }
+.a2s-mapping-index {
+  display: inline-grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: rgba(var(--v-theme-primary), 0.12);
+  color: rgb(var(--v-theme-primary));
+  flex-shrink: 0;
+}
+.a2s-mapping-title {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(var(--v-theme-on-surface), 0.75);
+}
+.a2s-mapping-paths {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.5rem;
+}
+.a2s-mapping-arrow { margin-top: 1rem; color: rgba(var(--v-theme-on-surface), 0.4); }
+.a2s-mapping-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+.a2s-filter { display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+.a2s-filter-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
+  min-height: 2rem;
+}
+.a2s-filter-label { font-size: 0.8125rem; font-weight: 600; }
+.a2s-filter-note { font-size: 0.75rem; color: rgba(var(--v-theme-on-surface), 0.55); }
+.a2s-filter-hint {
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  word-spacing: 0.25rem;
+  color: rgba(var(--v-theme-on-surface), 0.65);
+  background: rgba(var(--v-theme-on-surface), 0.04);
+  overflow-wrap: anywhere;
+}
+.a2s-toggle { height: 1.875rem !important; }
+
+.a2s-mapping-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1.5rem 1rem;
+  border: 1px dashed rgba(var(--v-border-color), 0.4);
+  border-radius: 10px;
+  font-size: 0.8125rem;
+  color: rgba(var(--v-theme-on-surface), 0.6);
+  transition: background-color 0.15s, color 0.15s;
+}
+.a2s-mapping-placeholder:hover { background: rgba(var(--v-theme-primary), 0.05); color: rgb(var(--v-theme-primary)); }
+
+/* ── 空状态 ── */
+.a2s-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 3rem 1rem;
+  text-align: center;
+}
+.a2s-empty-title { font-size: 1rem; font-weight: 600; margin-top: 0.5rem; }
+.a2s-empty-text { font-size: 0.8125rem; color: rgba(var(--v-theme-on-surface), 0.6); margin-bottom: 0.75rem; }
+
+/* ── 中等宽度：映射内部改为单列 ── */
+@container (max-width: 860px) {
+  .a2s-mapping-filters { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ── 窄宽度：导航变为顶部横向滚动条 ── */
+@container (max-width: 680px) {
+  .a2s-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .a2s-nav {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.5rem 0.75rem;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-inline-end: 0;
+    border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+    scrollbar-width: none;
+  }
+  .a2s-nav-label { display: none; }
+  .a2s-nav-item {
+    width: auto;
+    flex: 0 0 auto;
+    min-height: 2.25rem;
+    max-width: 12rem;
+    border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+    border-radius: 999px;
+  }
+  .a2s-nav-item--active { border-color: transparent; }
+  .a2s-nav-item--add { order: 1; }
+  .a2s-main { padding: 1rem 1rem 1.5rem; gap: 1.5rem; }
+  .a2s-grid { grid-template-columns: minmax(0, 1fr); }
+  .a2s-mapping { padding: 0.75rem; }
+  .a2s-mapping-paths { grid-template-columns: minmax(0, 1fr); gap: 0.25rem; }
+  .a2s-mapping-arrow { margin: 0 auto; transform: rotate(90deg); }
+  .a2s-section-head { flex-wrap: wrap; }
+}
+</style>

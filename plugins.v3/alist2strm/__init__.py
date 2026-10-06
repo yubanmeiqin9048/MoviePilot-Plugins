@@ -41,10 +41,10 @@ class Alist2Strm(_PluginBase):
 
     plugin_name = "Alist2Strm"
     plugin_desc = "为多个 OpenList/Alist 实例生成并维护本地 STRM。"
-    plugin_icon = "mdi-play-box-multiple-outline"
+    plugin_icon = "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/Alist.png"
     plugin_version = "2.0"
-    plugin_author = "MoviePilot"
-    plugin_label = "媒体"
+    plugin_author = "yubanmeiqin9048"
+    plugin_label = "网盘"
     plugin_config_prefix = "alist2strm_"
     plugin_order = 999
     auth_level = 2

@@ -25,5 +25,17 @@
       "v1.0.1": "修复 Vue 联邦构建产物未进入发布仓库",
       "v1.0": "初版"
     }
+  },
+  "Alist2Strm": {
+    "name": "Alist2Strm",
+    "description": "为多个 OpenList/Alist 实例生成并维护本地 STRM。",
+    "labels": "网盘",
+    "version": "2.0",
+    "author": "yubanmeiqin9048",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v2.0": "初步适配v3"
+    }
   }
 }
