@@ -34,6 +34,7 @@
     "author": "yubanmeiqin9048",
     "level": 1,
     "system_version": ">=3.0.0",
+    "release": true,
     "history": {
       "v2.0": "初步适配v3"
     }

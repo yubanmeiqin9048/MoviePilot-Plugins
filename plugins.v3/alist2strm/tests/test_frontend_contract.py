@@ -24,7 +24,7 @@ def test_config_uses_injected_api_and_keeps_failed_draft_without_host_save_event
     assert "saveConfiguration(props.api" in source
     assert "emit('save')" not in source
     assert "saveError.value = getErrorMessage" in source
-    assert 'type="password"' in source
+    assert ":type=\"revealToken ? 'text' : 'password'\"" in source
     assert "MoviePilotAPI" not in source
     assert "完整扫描成功后，会清理该目录中不再需要的受管文件，包括手工放入的文件；请使用专用输出目录。" in source
 
