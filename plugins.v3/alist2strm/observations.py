@@ -182,15 +182,37 @@ class DirectoryObservationStore:
             directories = self._mappings.setdefault(identity, {})
             child_paths = tuple(dict.fromkeys(children))
             previous = directories.get(path, DirectoryObservation())
-            for removed in set(previous.children) - set(child_paths):
+            previous_children = set(previous.children)
+            if previous.successful_at is None:
+                # 局部记录缺失时仍可能留有孤立后代，重建本层也须撤销已消失分支。
+                prefix = f"{path.rstrip('/')}/"
+                previous_children.update(
+                    f"{prefix}{descendant[len(prefix) :].split('/', 1)[0]}"
+                    for descendant in directories
+                    if descendant != path and descendant.startswith(prefix)
+                )
+            for removed in previous_children - set(child_paths):
                 for descendant in tuple(directories):
                     if descendant == removed or descendant.startswith(f"{removed}/"):
                         del directories[descendant]
             directories[path] = DirectoryObservation(direct_files, child_paths, successful_at, True, recheck_at)
             self._persist()
 
+    def advance_recheck(self, identity: MappingIdentity, path: str, recheck_at: float) -> None:
+        """建立或提前本层期限；后代变冷不能推迟已经取得的复查机会。"""
+
+        with self._lock:
+            if not self._ensure_loaded():
+                return
+            directories = self._mappings.get(identity, {})
+            previous = directories.get(path)
+            if previous is None or (previous.recheck_at is not None and previous.recheck_at <= recheck_at):
+                return
+            directories[path] = replace(previous, recheck_at=recheck_at)
+            self._persist()
+
     def complete_cleanup(self, identity: MappingIdentity, paths: Iterable[str]) -> None:
-        """仅在映射完整处理和清理成功后解除已检查目录的未完成标记。"""
+        """仅在对应范围处理和清理成功后解除已检查目录的未完成标记。"""
 
         with self._lock:
             if not self._ensure_loaded():

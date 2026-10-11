@@ -2875,13 +2875,13 @@ def test_scan_observations_replace_maximum_and_remove_disappeared_branch(tmp_pat
     queue.run()
     assert store.subtree(identity, "/library").modified_at == 1_709_251_200.0
     tree["/library/Branch"].pop()
-    now[0] += 100
+    now[0] += 30 * 86400
     assert coordinator.trigger().accepted
     queue.run()
     assert store.subtree(identity, "/library").modified_at == 1_704_067_200.0
     assert not (tmp_path / "Branch" / "latest.strm").exists()
     tree["/library"] = []
-    now[0] += 100
+    now[0] += 90 * 86400
     assert coordinator.trigger().accepted
     queue.run()
     assert store.subtree(identity, "/library").kind == "empty"
@@ -2924,7 +2924,7 @@ def test_failed_directory_keeps_last_observation_and_successful_siblings(tmp_pat
         return HttpResponse(200, {"code": 200, "data": {"content": [], "total": 2}}) if response.status_code == 403 else response
 
     transport.post_json = failed_post
-    now[0] += 100
+    now[0] += 90 * 86400
     assert coordinator.trigger().accepted
     queue.run()
     assert coordinator.status()["state"] == "failed"
@@ -3006,7 +3006,7 @@ def test_stop_preserves_started_and_unstarted_directory_observations(tmp_path: P
         return response
 
     transport.post_json = stop_post
-    now[0] += 100
+    now[0] += 7 * 86400
     assert coordinator.trigger().accepted
     queue.run()
     assert coordinator.status()["state"] == "stopped"
@@ -3259,8 +3259,8 @@ def test_pruning_old_task_snapshot_does_not_clear_new_configuration_requirement(
     assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
 
 
-def test_pruning_mappings_with_descendants_stay_complete_and_discover_new_branches(tmp_path: Path) -> None:
-    """到期发现新分支后完整处理；保存有后代的映射每次仍完整扫描。"""
+def test_pruning_new_branch_builds_all_layers_then_preserves_independent_deadlines(tmp_path: Path) -> None:
+    """到期父层发现新分支并完整建档，之后各层未到期均不请求。"""
 
     tasks = _PruningTasks(tmp_path)
     tasks.tree["/library"] = []
@@ -3276,8 +3276,7 @@ def test_pruning_mappings_with_descendants_stay_complete_and_discover_new_branch
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
-    assert tasks.transport.pages("/library") == [1]
-    assert tasks.transport.pages("/library/Season") == [1]
+    assert tasks.transport.calls == []
 
 
 @pytest.mark.parametrize("missing", ["all", "root", "configuration"])
@@ -3880,3 +3879,544 @@ def test_force_complete_stopped_before_execution_preserves_normal_deadline(tmp_p
     tasks.run()
     assert tasks.transport.calls == []
     assert tasks.persisted == before
+
+
+def test_pruning_parent_and_child_recheck_and_cleanup_independently(tmp_path: Path) -> None:
+    """父到期只清本层，随后子到期直接访问子层并保护未检查父层。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    modified = datetime.fromtimestamp(start - 40 * 86400, tz=UTC).isoformat()
+    tasks.tree["/library"].append({"name": "Season", "is_dir": True})
+    tasks.tree["/library/Season"] = [{"name": "Episode.mkv", "is_dir": False, "modified": modified}]
+    original_post = tasks.transport.post_json
+
+    def slow_child(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """首次子层完成比父层晚一天，使两个截止期可独立观察。"""
+
+        response = original_post(url, payload, headers)
+        if payload["path"] == "/library/Season":
+            tasks.now[0] += 86400
+        return response
+
+    tasks.transport.post_json = slow_child
+    tasks.run()
+    tasks.transport.post_json = original_post
+    root_stale = tmp_path / "root-stale.strm"
+    child_stale = tmp_path / "Season" / "child-stale.strm"
+    root_stale.write_text("root", encoding="utf-8")
+    child_stale.write_text("child", encoding="utf-8")
+    tasks.now[0] = start + 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == []
+    assert not root_stale.exists()
+    assert child_stale.exists()
+
+    root_stale.write_text("unobserved root", encoding="utf-8")
+    tasks.now[0] = start + 8 * 86400 - 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/Season") == [1]
+    assert root_stale.exists()
+    assert not child_stale.exists()
+    assert (tmp_path / "Season" / "Episode.strm").exists()
+
+
+def test_pruning_skipped_directory_alias_protects_resolved_products(tmp_path: Path) -> None:
+    """父层已查时，未查子层的内部目录别名仍保护实际产物。"""
+
+    tasks = _PruningTasks(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "alias").symlink_to(real, target_is_directory=True)
+    tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()
+    tasks.tree["/library"].append({"name": "alias", "is_dir": True})
+    tasks.tree["/library/alias"] = [{"name": "Movie.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/alias") == []
+    assert (real / "Movie.strm").is_file()
+
+
+@pytest.mark.parametrize(("age_days", "ancestor_due_days"), [(1, 7), (40, 7), (100, 30)])
+def test_pruning_descendant_changes_advance_ancestor_without_refreshing_success_time(
+    tmp_path: Path, age_days: int, ancestor_due_days: int
+) -> None:
+    """子层新观测提前祖先期限；已跳过祖先留待下一任务，不能重设成功时钟。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    tasks.tree["/library"].append({"name": "Season", "is_dir": True})
+    tasks.tree["/library/Season"] = []
+    tasks.run()
+    tasks.now[0] = start + 7 * 86400
+    tasks.tree["/library/Season"] = [
+        {
+            "name": "note.txt",
+            "is_dir": False,
+            "modified": datetime.fromtimestamp(tasks.now[0] - age_days * 86400, tz=UTC).isoformat(),
+        }
+    ]
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/Season") == [1]
+    tasks.restart()
+    tasks.transport.calls.clear()
+    if ancestor_due_days > 7:
+        tasks.now[0] = start + ancestor_due_days * 86400 - 1
+        tasks.run()
+        assert tasks.transport.calls == []
+        tasks.now[0] += 1
+    else:
+        tasks.now[0] += 1
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == ([1] if age_days == 1 else [])
+
+
+def test_pruning_cooling_descendant_does_not_postpone_ancestor_deadline(tmp_path: Path) -> None:
+    """父层成功时仍汇总未查后代，后代最大值下降不能后移父层已定期限。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    tasks.tree["/library"].append({"name": "Season", "is_dir": True})
+    tasks.tree["/library/Season"] = [
+        {"name": "old.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"},
+        {
+            "name": "latest.mkv",
+            "is_dir": False,
+            "modified": datetime.fromtimestamp(start - 40 * 86400, tz=UTC).isoformat(),
+        },
+    ]
+    tasks.run()
+    tasks.tree["/library/Season"].pop()
+    tasks.tree["/library/Season"].append({"name": "old.srt", "is_dir": False, "modified": "2023-01-01T00:00:00Z"})
+    tasks.now[0] = start + 7 * 86400
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == [1]
+    assert not (tmp_path / "Season" / "latest.strm").exists()
+    assert (tmp_path / "Season" / "old.srt").is_file()
+    tasks.now[0] = start + 14 * 86400 - 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == []
+
+
+@pytest.mark.parametrize("change", ["removed", "renamed"])
+def test_pruning_due_ancestor_confirms_branch_changes_before_accessing_due_child(tmp_path: Path, change: str) -> None:
+    """祖先优先撤销消失/改名分支状态，不请求旧分支，也不清理仍存在兄弟。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    tasks.tree["/library"] = [{"name": "Gone", "is_dir": True}, {"name": "Sibling", "is_dir": True}]
+    modified = datetime.fromtimestamp(start - 40 * 86400, tz=UTC).isoformat()
+    tasks.tree["/library/Gone"] = [{"name": "Film.mkv", "is_dir": False, "modified": modified}]
+    tasks.tree["/library/Sibling"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    tasks.tree["/library"] = [{"name": "Sibling", "is_dir": True}]
+    del tasks.tree["/library/Gone"]
+    if change == "renamed":
+        tasks.tree["/library"].append({"name": "Renamed", "is_dir": True})
+        tasks.tree["/library/Renamed"] = [{"name": "Film.mkv", "is_dir": False, "modified": modified}]
+    sibling_orphan = tmp_path / "Sibling" / "unobserved.strm"
+    sibling_orphan.write_text("protect skipped sibling", encoding="utf-8")
+    tasks.now[0] += 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Gone") == []
+    assert tasks.transport.pages("/library/Sibling") == []
+    assert not (tmp_path / "Gone" / "Film.strm").exists()
+    assert (tmp_path / "Sibling" / "Kept.strm").exists()
+    assert sibling_orphan.exists()
+    assert tasks.transport.pages("/library/Renamed") == ([1] if change == "renamed" else [])
+    # 父层保留旧历史的七天期限；消失旧分支记录不能在未来任务复活。
+    tasks.now[0] += 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library/Gone") == []
+    assert tasks.transport.pages("/library/Sibling") == []
+    assert sibling_orphan.exists()
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_pruning_local_state_damage_rebuilds_only_affected_branch(tmp_path: Path, damage: str) -> None:
+    """局部坏层完整重建允许的后代，仍有效的兄弟分支继续独立剪枝。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"] = [{"name": "Broken", "is_dir": True}, {"name": "Valid", "is_dir": True}]
+    tasks.tree["/library/Broken"] = [{"name": "Deep", "is_dir": True}]
+    tasks.tree["/library/Broken/Deep"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.tree["/library/Valid"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    payload = tasks.persisted["value"]
+    assert isinstance(payload, dict)
+    directories = payload["mappings"][0]["directories"]
+    if damage == "missing":
+        del directories["/library/Broken"]
+    else:
+        directories["/library/Broken"]["children"] = ["/library/Valid"]
+    rebuilt = tmp_path / "Broken" / "Deep" / "Film.strm"
+    rebuilt.unlink()
+    skipped = tmp_path / "Valid" / "Kept.strm"
+    skipped.unlink()
+    protected = tmp_path / "Valid" / "orphan.strm"
+    protected.write_text("unobserved", encoding="utf-8")
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Broken") == [1]
+    assert tasks.transport.pages("/library/Broken/Deep") == [1]
+    assert tasks.transport.pages("/library/Valid") == []
+    assert rebuilt.exists()
+    assert not skipped.exists()
+    assert protected.exists()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+@pytest.mark.parametrize("modified", [None, "broken", "2099-01-01T00:00:00Z"])
+def test_pruning_invalid_deep_observation_keeps_ancestors_checkable(tmp_path: Path, modified: str | None) -> None:
+    """无效/未来的非白名单深层文件使相关祖先暂不剪枝，目录时间不替代文件。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"] = [{"name": "Branch", "is_dir": True, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.tree["/library/Branch"] = [{"name": "Deep", "is_dir": True}]
+    tasks.tree["/library/Branch/Deep"] = [{"name": "note.txt", "is_dir": False, "modified": modified}]
+    tasks.run()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert [call["payload"]["path"] for call in tasks.transport.calls] == [
+        "/library",
+        "/library/Branch",
+        "/library/Branch/Deep",
+    ]
+
+
+def test_pruning_three_levels_revisit_deep_empty_directory_under_skipped_ancestors(tmp_path: Path) -> None:
+    """深层空目录七天到期时不依赖两个冷祖先，也不清理未查范围。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].append({"name": "Branch", "is_dir": True})
+    tasks.tree["/library/Branch"] = [
+        {"name": "Old.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"},
+        {"name": "Empty", "is_dir": True},
+    ]
+    tasks.tree["/library/Branch/Empty"] = []
+    tasks.run()
+    orphan = tmp_path / "Branch" / "Empty" / "orphan.strm"
+    orphan.parent.mkdir()
+    orphan.write_text("clean checked layer", encoding="utf-8")
+    protected = tmp_path / "Branch" / "orphan.strm"
+    protected.write_text("preserve unobserved layer", encoding="utf-8")
+    tasks.now[0] += 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert [call["payload"]["path"] for call in tasks.transport.calls] == ["/library/Branch/Empty"]
+    assert not orphan.exists()
+    assert protected.exists()
+
+
+@pytest.mark.parametrize("failure", ["listing", "write", "download", "stop"])
+def test_pruning_partial_multilayer_failure_preserves_mapping_and_rechecks_started_layers(
+    tmp_path: Path, failure: str
+) -> None:
+    """子层失败/停止保护整映射，重启只重查已开始层并清理对应范围。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].extend([{"name": "Bad", "is_dir": True}, {"name": "Good", "is_dir": True}])
+    tasks.tree["/library/Bad"] = []
+    tasks.tree["/library/Good"] = []
+    tasks.run()
+    root_orphan = tmp_path / "orphan.strm"
+    root_orphan.write_text("unobserved root", encoding="utf-8")
+    good_orphan = tmp_path / "Good" / "orphan.strm"
+    good_orphan.parent.mkdir()
+    good_orphan.write_text("mapping failure protects completed sibling", encoding="utf-8")
+    tasks.tree["/library/Bad"] = [
+        {
+            "name": "new.srt" if failure == "download" else "new.mkv",
+            "is_dir": False,
+            "modified": "2023-01-01T00:00:00Z",
+        }
+    ]
+    original_post = tasks.transport.post_json
+    original_stream = tasks.transport.stream_factory
+
+    def failing_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """直接访问子层失败不能被解释为祖先确认删除。"""
+
+        response = original_post(url, payload, headers)
+        if payload["path"] == "/library/Bad":
+            if failure == "listing":
+                return HttpResponse(200, {"code": 200, "data": {"content": [], "total": 1}})
+            if failure == "stop":
+                tasks.coordinator.stop()
+        return response
+
+    class BrokenWrite(LocalFileSystem):
+        """仅在失败任务的生成边界阻断子层产物。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """模拟目录内文件处理失败。"""
+
+            if failure == "write":
+                raise OSError("cannot write")
+            return super().write_text_atomic(target, content)
+
+    tasks.transport.post_json = failing_post
+    if failure == "download":
+        tasks.transport.stream_factory = lambda _url, _headers: DownloadResponse(status_code=403, body=())
+    tasks.now[0] += 7 * 86400
+    tasks.restart(BrokenWrite())
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == ("stopped" if failure == "stop" else "failed")
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/Good") == [1]
+    assert tasks.transport.pages("/library/Bad") == [1]
+    assert root_orphan.exists()
+    assert good_orphan.exists()
+    tasks.transport.post_json = original_post
+    tasks.transport.stream_factory = original_stream
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/Good") == [1]
+    assert tasks.transport.pages("/library/Bad") == [1]
+    assert root_orphan.exists()
+    assert not good_orphan.exists()
+    assert (tmp_path / "Bad" / ("new.srt" if failure == "download" else "new.strm")).exists()
+
+
+@pytest.mark.parametrize("failure", ["unlink", "stop", "enumerate"])
+def test_pruning_removed_branch_cleanup_retry_remains_with_parent(tmp_path: Path, failure: str) -> None:
+    """已移除分支状态后，清理失败/停止仍由确认消失的父层复查并重试。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    tasks.tree["/library"].extend([{"name": "Gone", "is_dir": True}, {"name": "Sibling", "is_dir": True}])
+    modified = datetime.fromtimestamp(start - 40 * 86400, tz=UTC).isoformat()
+    tasks.tree["/library/Gone"] = [
+        {"name": "First.mkv", "is_dir": False, "modified": modified},
+        {"name": "Second.mkv", "is_dir": False, "modified": modified},
+    ]
+    tasks.tree["/library/Sibling"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    protected = tmp_path / "Sibling" / "orphan.strm"
+    protected.write_text("skipped sibling", encoding="utf-8")
+    tasks.tree["/library"] = [entry for entry in tasks.tree["/library"] if entry["name"] != "Gone"]
+    del tasks.tree["/library/Gone"]
+
+    class BrokenCleanup(LocalFileSystem):
+        """在清理边界模拟三种未完成方式。"""
+
+        def unlink(self, target: Path) -> None:
+            """删除失败或删除原子操作完成后停止。"""
+
+            if failure == "unlink":
+                raise OSError("cannot remove")
+            super().unlink(target)
+            if failure == "stop":
+                tasks.coordinator.stop()
+
+        def iter_files(self, root: Path) -> list[Path]:
+            """枚举失败时已成功层也不能解除必查。"""
+
+            if failure == "enumerate":
+                raise OSError("cannot enumerate")
+            return list(super().iter_files(root))
+
+    tasks.now[0] += 7 * 86400
+    tasks.restart(BrokenCleanup())
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == ("stopped" if failure == "stop" else "partial_failure")
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Gone") == []
+    assert tasks.transport.pages("/library/Sibling") == []
+    assert list((tmp_path / "Gone").glob("*.strm"))
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Gone") == []
+    assert tasks.transport.pages("/library/Sibling") == []
+    assert not list((tmp_path / "Gone").glob("*.strm"))
+    assert protected.exists()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+@pytest.mark.parametrize("seconds_until_due", range(1, 7))
+def test_pruning_deadline_crossed_during_selection_does_not_fail_task(tmp_path: Path, seconds_until_due: int) -> None:
+    """资格判断期间时钟自然越过期限，也能打开客户端并正常复查。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    tasks.now[0] += 90 * 86400 - seconds_until_due
+    tasks.transport.calls.clear()
+
+    def ticking_clock() -> float:
+        """每个任务时钟边界推进一秒，无实际等待。"""
+
+        tasks.now[0] += 1
+        return tasks.now[0]
+
+    tasks.coordinator = ScanCoordinator(
+        lambda: build_configuration(tasks.configuration),
+        dispatch=tasks.queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=tasks.transport),
+        media_suffix_provider=lambda: (".mkv",),
+        clock=ticking_clock,
+        observation_store=DirectoryObservationStore(
+            lambda: tasks.persisted.get("value"), lambda value: tasks.persisted.__setitem__("value", deepcopy(value))
+        ),
+    )
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.coordinator.status()["counters"]["failed"] == 0
+    assert (tmp_path / "Film.strm").exists()
+
+
+def test_pruning_failed_ancestor_listing_does_not_hide_known_due_child(tmp_path: Path) -> None:
+    """祖先读取失败不能证明分支消失；已知到期子层仍处理但整映射禁清理。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].extend([{"name": "Due", "is_dir": True}, {"name": "Cold", "is_dir": True}])
+    modified = datetime.fromtimestamp(tasks.now[0] - 40 * 86400, tz=UTC).isoformat()
+    tasks.tree["/library/Due"] = [{"name": "Film.mkv", "is_dir": False, "modified": modified}]
+    tasks.tree["/library/Cold"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    product = tmp_path / "Due" / "Film.strm"
+    product.unlink()
+    orphan = tmp_path / "Due" / "orphan.strm"
+    orphan.write_text("keep on ancestor failure", encoding="utf-8")
+    original_post = tasks.transport.post_json
+
+    def failed_root(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """仅让父层返回分页不完整，保留可单独访问的子层。"""
+
+        if payload["path"] == "/library":
+            return HttpResponse(200, {"code": 200, "data": {"content": [], "total": 1}})
+        return original_post(url, payload, headers)
+
+    tasks.transport.post_json = failed_root
+    tasks.now[0] += 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "partial_failure"
+    assert tasks.transport.pages("/library/Due") == [1]
+    assert tasks.transport.pages("/library/Cold") == []
+    assert product.exists()
+    assert orphan.exists()
+    tasks.transport.post_json = original_post
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library/Due") == [1]
+    assert tasks.transport.pages("/library/Cold") == []
+    assert not orphan.exists()
+
+
+def test_pruning_checked_directory_alias_cleans_its_scope_below_skipped_parent(tmp_path: Path) -> None:
+    """通过目录别名检查子层后，祖先保护不能吞掉子层实际覆盖范围。"""
+
+    tasks = _PruningTasks(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "alias").symlink_to(real, target_is_directory=True)
+    tasks.tree["/library"].append({"name": "alias", "is_dir": True})
+    tasks.tree["/library/alias"] = []
+    tasks.run()
+    stale = real / "orphan.strm"
+    stale.write_text("covered by alias", encoding="utf-8")
+    root_stale = tmp_path / "orphan.strm"
+    root_stale.write_text("unchecked root", encoding="utf-8")
+    tasks.tree["/library/alias"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.now[0] += 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/alias") == [1]
+    assert not stale.exists()
+    assert root_stale.exists()
+    assert (real / "Film.strm").exists()
+
+
+def test_pruning_rebuilt_layer_discards_disappeared_orphan_state_before_branch_returns(tmp_path: Path) -> None:
+    """中间层记录损坏后确认消失的后代，重现时必须当作新分支建立记录。"""
+
+    tasks = _PruningTasks(tmp_path)
+    old_file = {"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}
+    tasks.tree["/library"].append({"name": "Branch", "is_dir": True})
+    tasks.tree["/library/Branch"] = [{"name": "Deep", "is_dir": True}]
+    tasks.tree["/library/Branch/Deep"] = [old_file]
+    tasks.run()
+    payload = tasks.persisted["value"]
+    assert isinstance(payload, dict)
+    del payload["mappings"][0]["directories"]["/library/Branch"]
+    tasks.tree["/library/Branch"] = [
+        {"name": "Recent.mkv", "is_dir": False, "modified": datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()}
+    ]
+    tasks.restart()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert not (tmp_path / "Branch" / "Deep" / "Film.strm").exists()
+    tasks.tree["/library/Branch"].append({"name": "Deep", "is_dir": True})
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library/Branch/Deep") == [1]
+    assert (tmp_path / "Branch" / "Deep" / "Film.strm").exists()

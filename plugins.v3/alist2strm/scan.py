@@ -1237,7 +1237,7 @@ class ScanCoordinator:
 
     @staticmethod
     def _pruning_interval(summary: FileTimeSummary, now: float) -> float | None:
-        """按子树最新文件时间返回单层映射复查间隔；异常状态不剪枝。"""
+        """按子树最新文件时间返回目录复查间隔；异常状态不剪枝。"""
 
         if summary.kind == "empty":
             return 7 * 24 * 60 * 60
@@ -1252,19 +1252,17 @@ class ScanCoordinator:
             return 30 * 24 * 60 * 60
         return 90 * 24 * 60 * 60
 
-    def _can_prune_mapping(self, mapping: _MappingRun) -> bool:
-        """判断无后代的完整单层映射是否尚未到本轮复查期限。"""
+    def _can_prune_directory(self, mapping: _MappingRun, path: str) -> bool:
+        """独立判断本层是否尚未到期，后代状态只影响档位而不刷新成功时间。"""
 
         store = self._observation_store
         if store is None or mapping.configuration_required:
             return False
-        observation = store.directory(mapping.identity, mapping.source_dir)
-        if observation.needs_check or observation.children or observation.successful_at is None:
+        observation = store.directory(mapping.identity, path)
+        if observation.needs_check or observation.successful_at is None:
             return False
         now = self._clock()
-        summary = store.subtree(mapping.identity, mapping.source_dir)
-        # 档位以成功结束时的年龄固定；等待变冷不能后移已经建立的期限。
-        interval = self._pruning_interval(summary, observation.successful_at)
+        interval = self._pruning_interval(store.subtree(mapping.identity, path), now)
         return (
             observation.successful_at <= now
             and interval is not None
@@ -1273,6 +1271,35 @@ class ScanCoordinator:
             and observation.recheck_at <= observation.successful_at + interval
             and now < observation.recheck_at
         )
+
+    def _mapping_reader(self, mapping: _MappingRun, readers: dict[str, Any]) -> Any:
+        """本层实际取得检查资格后才打开客户端，避免资格判断跨过期限时丢失连接。"""
+
+        reader = readers.get(mapping.instance_id)
+        if reader is None:
+            if not mapping.token:
+                raise OpenListError("实例未配置管理员 API Token", retryable=False, auth_failure=True)
+            reader = self._client_factory(mapping.scan_url, mapping.token)
+            readers[mapping.instance_id] = reader
+            with self._lock:
+                self._active_readers = list(readers.values())
+        return reader
+
+    def _advance_ancestor_rechecks(self, mapping: _MappingRun, path: str) -> None:
+        """增量汇总新观测，按各祖先自己的成功时间建立或提前期限。"""
+
+        store = self._observation_store
+        if store is None:
+            return
+        current = PurePosixPath(path)
+        while True:
+            observation = store.directory(mapping.identity, str(current))
+            interval = self._pruning_interval(store.subtree(mapping.identity, str(current)), self._clock())
+            if observation.successful_at is not None and interval is not None:
+                store.advance_recheck(mapping.identity, str(current), observation.successful_at + interval)
+            if str(current) == mapping.source_dir or current == current.parent:
+                break
+            current = current.parent
 
     @staticmethod
     def _has_overlapping_output_roots(roots: Iterable[Path]) -> bool:
@@ -1333,9 +1360,7 @@ class ScanCoordinator:
                     if mapping.instance_id in failed_instances:
                         self._mark_mapping_failed(mapping, "实例认证或权限失败，已跳过该实例剩余映射")
                         continue
-                    if not run.force_complete and self._can_prune_mapping(mapping):
-                        mapping.unscanned_directories.add(mapping.source_dir)
-                    elif self._observation_store is not None:
+                    if self._observation_store is not None and (mapping.configuration_required or run.force_complete):
                         self._observation_store.begin_mapping(
                             mapping.identity,
                             mapping.configuration_fingerprint,
@@ -1343,19 +1368,9 @@ class ScanCoordinator:
                             mapping.playback_changed,
                         )
                     self._observe_stop(run)
-                    reader = readers.get(mapping.instance_id)
-                    if reader is None and not mapping.unscanned_directories:
-                        if not mapping.token:
-                            raise OpenListError(
-                                "实例未配置管理员 API Token",
-                                retryable=False,
-                                auth_failure=True,
-                            )
-                        reader = self._client_factory(mapping.scan_url, mapping.token)
-                        readers[mapping.instance_id] = reader
-                        with self._lock:
-                            self._active_readers = list(readers.values())
-                    self._scan_mapping(reader, mapping, run.video_suffixes)
+                    self._scan_mapping(
+                        lambda mapping=mapping: self._mapping_reader(mapping, readers), mapping, run.video_suffixes
+                    )
                     self._observe_stop(run)
                     if mapping.status.counters.failed:
                         mapping.status.state = "failed"
@@ -1494,22 +1509,41 @@ class ScanCoordinator:
             f"{self._safe_error(mapping, mapping.status.error or '映射扫描失败')}"
         )
 
-    def _scan_mapping(self, reader: Any, mapping: _MappingRun, video_suffixes: frozenset[str]) -> None:
+    def _scan_mapping(
+        self, reader_provider: Callable[[], Any], mapping: _MappingRun, video_suffixes: frozenset[str]
+    ) -> None:
         """按任务快照递归筛选并生成视频 STRM 或下载其他白名单文件。"""
 
-        if mapping.unscanned_directories:
-            return
-        pending = [mapping.source_dir]
+        pending = [(mapping.source_dir, False)]
+        visited: set[str] = set()
         while pending:
-            self._observe_stop(self._run_for_mapping(mapping))
-            current = pending.pop()
-            if self._observation_store is not None:
-                self._observation_store.begin_check(mapping.identity, current)
+            run = self._run_for_mapping(mapping)
+            self._observe_stop(run)
+            current, rebuild = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            store = self._observation_store
+            previous = store.directory(mapping.identity, current) if store is not None else None
+            rebuild = rebuild or previous is None or previous.successful_at is None
+            if (
+                previous is not None
+                and not run.force_complete
+                and not rebuild
+                and self._can_prune_directory(mapping, current)
+            ):
+                mapping.unscanned_directories.add(current)
+                pending.extend((child, False) for child in previous.children)
+                continue
+            if store is not None:
+                store.begin_check(mapping.identity, current)
             failed_before = mapping.status.counters.failed
             direct_files = FileTimeSummary("empty")
             children: list[str] = []
             try:
-                entries = self._list_directory(reader, current, self._run_for_mapping(mapping))
+                self._observe_stop(run)
+                reader = reader_provider()
+                entries = self._list_directory(reader, current, run)
             except ScanStopped:
                 raise
             except OpenListError as error:
@@ -1517,10 +1551,14 @@ class ScanCoordinator:
                     raise
                 mapping.status.counters.failed += 1
                 self._record_mapping_error(mapping, f"目录 {current}：{error.message}")
+                if previous is not None:
+                    pending.extend((child, rebuild) for child in previous.children)
                 continue
             except Exception as error:  # noqa: BLE001 - 单个目录失败不阻断兄弟目录
                 mapping.status.counters.failed += 1
                 self._record_mapping_error(mapping, f"目录 {current}：目录读取失败（{error}）")
+                if previous is not None:
+                    pending.extend((child, rebuild) for child in previous.children)
                 continue
             for raw_entry in entries:
                 run = self._run_for_mapping(mapping)
@@ -1536,7 +1574,7 @@ class ScanCoordinator:
                     remote_path = _join_remote_path(current, entry.name)
                     if entry.is_dir:
                         children.append(remote_path)
-                        pending.append(remote_path)
+                        pending.append((remote_path, rebuild))
                         continue
                     direct_files = direct_files.include(entry.modified_at)
                     suffix = PurePosixPath(entry.name).suffix.casefold()
@@ -1582,17 +1620,17 @@ class ScanCoordinator:
                     mapping.status.counters.failed += 1
                     self._record_mapping_error(mapping, f"文件处理失败：{error}")
             self._observe_stop(self._run_for_mapping(mapping))
+            if mapping.status.counters.failed != failed_before and previous is not None:
+                pending.extend((child, rebuild) for child in previous.children if child not in children)
             if mapping.status.counters.failed == failed_before and self._observation_store is not None:
-                successful_at = self._clock()
-                interval = self._pruning_interval(direct_files, successful_at)
                 self._observation_store.record_success(
                     mapping.identity,
                     current,
                     direct_files,
                     children,
-                    successful_at,
-                    successful_at + interval if interval is not None else None,
+                    self._clock(),
                 )
+                self._advance_ancestor_rechecks(mapping, current)
                 mapping.checked_directories.add(current)
 
     def _remember_expected_output(self, mapping: _MappingRun, target: Path) -> None:
@@ -1623,12 +1661,24 @@ class ScanCoordinator:
             )
             return
 
-        if mapping.unscanned_directories:
+        if mapping.unscanned_directories and not mapping.checked_directories:
+            return
+
+        resolved_coverage: dict[Path, str] = {}
+        try:
+            for directory in sorted(
+                mapping.checked_directories | mapping.unscanned_directories,
+                key=lambda path: path in mapping.unscanned_directories,
+            ):
+                relative = PurePosixPath(directory).relative_to(mapping.source_dir)
+                resolved_coverage[mapping.output_dir.joinpath(*relative.parts).resolve(strict=False)] = directory
+        except (OSError, RuntimeError, ValueError):  # fmt: skip
+            mapping.status.cleanup_eligible = False
             return
 
         managed_suffixes = self._managed_output_suffixes(mapping.allowed_suffixes, run.video_suffixes)
         self._observe_stop(run)
-        candidates: list[Path] = []
+        candidates: list[tuple[Path, str | None]] = []
         for raw_target in self._filesystem.iter_files(mapping.output_dir):
             self._observe_stop(run)
             target = Path(raw_target)
@@ -1640,12 +1690,25 @@ class ScanCoordinator:
                 continue
             if target in mapping.expected_outputs or target_identity in mapping.expected_output_identities:
                 continue
-            if target.suffix.casefold() not in managed_suffixes:
+            # 词法与解析范围取更深远端层；同层冲突保守保留未检查范围。
+            owner = max(
+                (
+                    directory
+                    for directory in (
+                        self._cleanup_owner(mapping, target),
+                        self._resolved_cleanup_owner(target_identity.parent, resolved_coverage),
+                    )
+                    if directory is not None
+                ),
+                key=lambda directory: (len(PurePosixPath(directory).parts), directory in mapping.unscanned_directories),
+                default=None,
+            )
+            if target.suffix.casefold() not in managed_suffixes or owner in mapping.unscanned_directories:
                 continue
-            candidates.append(target)
+            candidates.append((target, owner))
 
         unfinished: set[str] = set()
-        for target in candidates:
+        for target, owner in candidates:
             self._observe_stop(run)
             try:
                 self._filesystem.unlink(target)
@@ -1653,7 +1716,6 @@ class ScanCoordinator:
                 raise
             except Exception as error:  # noqa: BLE001 - 单项删除失败不得阻断其他产物
                 mapping.status.counters.failed += 1
-                owner = self._cleanup_owner(mapping, target)
                 unfinished.update({owner} if owner is not None else mapping.checked_directories)
                 self._log_cleanup_failure(mapping, target, error)
                 self._record_mapping_error(mapping, f"清理文件 {target}：删除失败（{error}）")
@@ -1664,15 +1726,26 @@ class ScanCoordinator:
             self._observation_store.complete_cleanup(mapping.identity, mapping.checked_directories - unfinished)
 
     @staticmethod
+    def _resolved_cleanup_owner(directory: Path, coverage: Mapping[Path, str]) -> str | None:
+        """解析目录别名后仍以最近覆盖层保护产物或承担清理责任。"""
+
+        while True:
+            if directory in coverage:
+                return coverage[directory]
+            if directory == directory.parent:
+                return None
+            directory = directory.parent
+
+    @staticmethod
     def _cleanup_owner(mapping: _MappingRun, target: Path) -> str | None:
-        """将删除责任归最近已检查祖先；已消失或排除分支由确认其消失的父层负责。"""
+        """寻找最近覆盖层；已消失或排除分支归确认其消失的父层负责。"""
 
         try:
             relative = target.parent.relative_to(mapping.output_dir)
         except ValueError:
             return None
         current = PurePosixPath(mapping.source_dir).joinpath(*relative.parts)
-        while str(current) not in mapping.checked_directories:
+        while str(current) not in mapping.checked_directories and str(current) not in mapping.unscanned_directories:
             if current == current.parent:
                 return None
             current = current.parent
