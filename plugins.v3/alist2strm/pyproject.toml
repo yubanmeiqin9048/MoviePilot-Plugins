@@ -7,9 +7,25 @@ requires-python = ">=3.14"
 python-version = "3.14"
 python-platform = "linux"
 
+[tool.ty.src]
+exclude = [
+    ".docs",
+    ".pytest_cache",
+    "**/__pycache__",
+    "frontend",
+    "tests",
+]
+
 [tool.ruff]
 line-length = 120
 target-version = "py314"
+extend-exclude = [
+    ".docs",
+    ".pytest_cache",
+    "**/__pycache__",
+    "frontend",
+    "tests",
+]
 
 [tool.ruff.lint]
 extend-select = ["B", "W", "PERF", "UP", "I", "SIM"]

@@ -225,5 +225,4 @@ node_modules/
 .vite/
 
 # Temporary ban
-AGENTS.md
 .scratch/
