@@ -4420,3 +4420,345 @@ def test_pruning_rebuilt_layer_discards_disappeared_orphan_state_before_branch_r
     assert tasks.coordinator.status()["state"] == "success"
     assert tasks.transport.pages("/library/Branch/Deep") == [1]
     assert (tmp_path / "Branch" / "Deep" / "Film.strm").exists()
+
+
+def test_force_complete_cleanup_failure_rechecks_only_failed_owner_after_restart(tmp_path: Path) -> None:
+    """强制任务清理失败只保留受影响层必查，完成层保持各自复查计划。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].extend([{"name": "Broken", "is_dir": True}, {"name": "Valid", "is_dir": True}])
+    for branch in ("Broken", "Valid"):
+        tasks.tree[f"/library/{branch}"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    broken_orphan = tmp_path / "Broken" / "orphan.strm"
+    valid_orphan = tmp_path / "Valid" / "orphan.strm"
+    broken_orphan.write_text("retry failed owner", encoding="utf-8")
+    valid_orphan.write_text("clean successful owner", encoding="utf-8")
+
+    class BrokenCleanup(LocalFileSystem):
+        """只让一个目录的过期产物删除失败。"""
+
+        def unlink(self, target: Path) -> None:
+            """保留失败项，允许其他已查层完成清理。"""
+
+            if target == broken_orphan:
+                raise OSError("controlled owner cleanup failure")
+            super().unlink(target)
+
+    tasks.now[0] += 1
+    tasks.restart(BrokenCleanup())
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    tasks.queue.run()
+    assert tasks.coordinator.status()["state"] == "partial_failure"
+    assert broken_orphan.exists()
+    assert not valid_orphan.exists()
+
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/Broken") == [1]
+    assert tasks.transport.pages("/library/Valid") == []
+    assert not broken_orphan.exists()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+@pytest.mark.parametrize("interruption", ["processing_stop", "crash", "permission"])
+def test_force_complete_interrupted_multilayer_task_preserves_unstarted_plan(tmp_path: Path, interruption: str) -> None:
+    """强制任务中断保护整映射，已开始层重试而未开始层仍按原期限复查。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    tasks.tree["/library"].extend([{"name": branch, "is_dir": True} for branch in ("Pending", "Broken", "Done")])
+    for branch in ("Pending", "Broken", "Done"):
+        tasks.tree[f"/library/{branch}"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.run()
+    orphans = [
+        tmp_path / "orphan.strm",
+        *(tmp_path / branch / "orphan.strm" for branch in ("Pending", "Broken", "Done")),
+    ]
+    for orphan in orphans:
+        orphan.write_text("mapping interruption protects outputs", encoding="utf-8")
+    tasks.tree["/library/Broken"].append({"name": "New.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"})
+    original_post = tasks.transport.post_json
+
+    def failing_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """在目录读取边界模拟权限失败，禁止访问剩余子层。"""
+
+        response = original_post(url, payload, headers)
+        if interruption == "permission" and payload["path"] == "/library/Broken":
+            return HttpResponse(403, {"code": 403, "data": None})
+        return response
+
+    class InterruptingWrite(LocalFileSystem):
+        """仅在强制新增产物的原子操作后停止或模拟进程退出。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """已经写入的产物不能使尚未清理的层提前解除必查。"""
+
+            created = super().write_text_atomic(target, content)
+            if target.name == "New.strm":
+                if interruption == "processing_stop":
+                    assert tasks.coordinator.stop().accepted
+                elif interruption == "crash":
+                    raise SystemExit("controlled forced interruption")
+            return created
+
+    tasks.transport.post_json = failing_post
+    tasks.now[0] += 1
+    tasks.restart(InterruptingWrite())
+    tasks.transport.calls.clear()
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    if interruption == "crash":
+        with pytest.raises(SystemExit, match="controlled forced interruption"):
+            tasks.queue.run()
+    else:
+        tasks.queue.run()
+        assert tasks.coordinator.status()["state"] == (
+            "stopped" if interruption == "processing_stop" else "partial_failure"
+        )
+    assert tasks.transport.pages("/library") == [1, 2]
+    assert tasks.transport.pages("/library/Done") == [1]
+    assert tasks.transport.pages("/library/Broken") == [1]
+    assert tasks.transport.pages("/library/Pending") == []
+    assert all(orphan.exists() for orphan in orphans)
+
+    tasks.transport.post_json = original_post
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1, 2]
+    assert tasks.transport.pages("/library/Done") == [1]
+    assert tasks.transport.pages("/library/Broken") == [1]
+    assert tasks.transport.pages("/library/Pending") == []
+    assert (tmp_path / "Broken" / "New.strm").exists()
+    assert orphans[1].exists()
+    assert all(not orphan.exists() for orphan in (orphans[0], orphans[2], orphans[3]))
+
+    tasks.now[0] = start + 90 * 86400 - 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+    tasks.now[0] += 1
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert [call["payload"]["path"] for call in tasks.transport.calls] == ["/library/Pending"]
+    assert not orphans[1].exists()
+
+
+def test_pruning_integrated_paged_request_cost_for_first_normal_due_and_force(tmp_path: Path) -> None:
+    """同一分页树的首次、未到期、局部到期及强制任务只请求应查层。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    old = "2023-01-01T00:00:00Z"
+    warm = datetime.fromtimestamp(start - 40 * 86400, tz=UTC).isoformat()
+    tasks.tree["/library"].extend([{"name": "Cold", "is_dir": True}, {"name": "Warm", "is_dir": True}])
+    tasks.tree["/library/Cold"] = [
+        {"name": "First.mkv", "is_dir": False, "modified": old},
+        {"name": "Second.mkv", "is_dir": False, "modified": old},
+        {"name": "Deep", "is_dir": True},
+    ]
+    tasks.tree["/library/Cold/Deep"] = [
+        {"name": f"Film{index}.mkv", "is_dir": False, "modified": old} for index in range(5)
+    ]
+    tasks.tree["/library/Warm"] = [
+        {"name": f"Film{index}.mkv", "is_dir": False, "modified": warm} for index in range(3)
+    ]
+    full_pages = {
+        "/library": [1, 2],
+        "/library/Warm": [1, 2],
+        "/library/Cold": [1, 2],
+        "/library/Cold/Deep": [1, 2, 3],
+    }
+    request_counts: list[int] = []
+
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.coordinator.status()["counters"]["generated"] == 11  # type: ignore[index]
+    assert {path: tasks.transport.pages(path) for path in full_pages} == full_pages
+    request_counts.append(len(tasks.transport.calls))
+    original_outputs = {path: path.read_text(encoding="utf-8") for path in tmp_path.rglob("*.strm")}
+    assert len(original_outputs) == 11
+
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    request_counts.append(len(tasks.transport.calls))
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.calls == []
+
+    tasks.now[0] = start + 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert {path: tasks.transport.pages(path) for path in full_pages} == {
+        "/library": [1, 2],
+        "/library/Warm": [1, 2],
+        "/library/Cold": [],
+        "/library/Cold/Deep": [],
+    }
+    request_counts.append(len(tasks.transport.calls))
+
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    tasks.queue.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.coordinator.status()["counters"]["skipped"] == 11  # type: ignore[index]
+    assert {path: tasks.transport.pages(path) for path in full_pages} == full_pages
+    request_counts.append(len(tasks.transport.calls))
+    assert request_counts == [9, 0, 4, 9]
+    assert {path: path.read_text(encoding="utf-8") for path in tmp_path.rglob("*.strm")} == original_outputs
+
+
+def test_pruning_integrated_branch_changes_force_snapshot_stop_and_recovery(tmp_path: Path) -> None:
+    """连续任务覆盖深层到期、补旧附件、删改名、强制快照及配置更新停止重启。"""
+
+    tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
+    old = "2023-01-01T00:00:00Z"
+    warm = datetime.fromtimestamp(start - 40 * 86400, tz=UTC).isoformat()
+    tasks.tree["/library"].extend([{"name": "Cold", "is_dir": True}, {"name": "Warm", "is_dir": True}])
+    tasks.tree["/library/Cold"] = [
+        {"name": "Keep.mkv", "is_dir": False, "modified": old},
+        {"name": "Delete.mkv", "is_dir": False, "modified": old},
+        {"name": "Deep", "is_dir": True},
+    ]
+    tasks.tree["/library/Cold/Deep"] = []
+    tasks.tree["/library/Warm"] = [{"name": "Warm.mkv", "is_dir": False, "modified": warm}]
+    tasks.run()
+    tasks.tree["/library/Cold"].append({"name": "Old.srt", "is_dir": False, "modified": old})
+    tasks.tree["/library/Cold/Deep"] = [{"name": "Deep.mkv", "is_dir": False, "modified": old}]
+    cold_orphan = tmp_path / "Cold" / "orphan.strm"
+    deep_orphan = tmp_path / "Cold" / "Deep" / "orphan.strm"
+    deep_orphan.parent.mkdir()
+    cold_orphan.write_text("unobserved parent", encoding="utf-8")
+    deep_orphan.write_text("checked descendant", encoding="utf-8")
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+    assert not (tmp_path / "Cold" / "Old.srt").exists()
+    assert not (tmp_path / "Cold" / "Deep" / "Deep.strm").exists()
+
+    tasks.now[0] = start + 7 * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library") == [1, 2]
+    assert tasks.transport.pages("/library/Warm") == [1]
+    assert tasks.transport.pages("/library/Cold") == []
+    assert tasks.transport.pages("/library/Cold/Deep") == [1]
+    assert (tmp_path / "Cold" / "Deep" / "Deep.strm").exists()
+    assert cold_orphan.exists()
+    assert not deep_orphan.exists()
+    assert not (tmp_path / "Cold" / "Old.srt").exists()
+
+    tasks.now[0] += 1
+    tasks.transport.calls.clear()
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    tasks.queue.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert tasks.transport.pages("/library/Cold") == [1, 2]
+    assert (tmp_path / "Cold" / "Old.srt").read_bytes() == (
+        b"download:https://pruning.example.invalid/d/library/Cold/Old.srt"
+    )
+    assert not cold_orphan.exists()
+    tasks.tree["/library/Cold"][0]["name"] = "Renamed.mkv"
+    tasks.tree["/library/Cold"] = [entry for entry in tasks.tree["/library/Cold"] if entry["name"] != "Delete.mkv"]
+    tasks.now[0] += 1
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+    assert (tmp_path / "Cold" / "Keep.strm").exists()
+    assert (tmp_path / "Cold" / "Delete.strm").exists()
+    assert not (tmp_path / "Cold" / "Renamed.strm").exists()
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    tasks.queue.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert (tmp_path / "Cold" / "Renamed.strm").exists()
+    assert not (tmp_path / "Cold" / "Keep.strm").exists()
+    assert not (tmp_path / "Cold" / "Delete.strm").exists()
+
+    original_post = tasks.transport.post_json
+
+    def save_during_listing(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """旧任务已经开始后发布新配置，任务仍使用捕获的播放地址。"""
+
+        response = original_post(url, payload, headers)
+        if payload["path"] == "/library" and payload["page"] == 1:
+            tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+        return response
+
+    tasks.transport.post_json = save_during_listing
+    tasks.now[0] += 1
+    tasks.transport.calls.clear()
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    tasks.queue.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert all(
+        path.read_text(encoding="utf-8").startswith("https://play-old.example.invalid/")
+        for path in tmp_path.rglob("*.strm")
+    )
+    tasks.transport.post_json = original_post
+    retry_orphans = [tmp_path / "orphan.strm", tmp_path / "Cold" / "orphan.strm", deep_orphan]
+    for orphan in retry_orphans:
+        orphan.write_text("protect stopped mapping", encoding="utf-8")
+
+    class StopPlaybackUpdate(LocalFileSystem):
+        """新配置普通任务在首项更新完成后停止。"""
+
+        def replace_text_atomic(self, target: Path, content: str) -> None:
+            """部分播放更新不得解除持久化的完整复查要求。"""
+
+            super().replace_text_atomic(target, content)
+            assert tasks.coordinator.stop().accepted
+
+    tasks.restart(StopPlaybackUpdate())
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "stopped"
+    assert tasks.transport.pages("/library") == [1, 2]
+    assert tasks.transport.pages("/library/Cold") == []
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8").startswith("https://play-new.example.invalid/")
+    assert (
+        (tmp_path / "Cold" / "Renamed.strm").read_text(encoding="utf-8").startswith("https://play-old.example.invalid/")
+    )
+    assert all(orphan.exists() for orphan in retry_orphans)
+
+    tasks.now[0] += 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "success"
+    assert {path: tasks.transport.pages(path) for path in tasks.tree} == {
+        "/library": [1, 2],
+        "/library/Cold": [1, 2],
+        "/library/Cold/Deep": [1],
+        "/library/Warm": [1],
+    }
+    assert all(not orphan.exists() for orphan in retry_orphans)
+    assert all(
+        path.read_text(encoding="utf-8").startswith("https://play-new.example.invalid/")
+        for path in tmp_path.rglob("*.strm")
+    )
+    assert len(list(tmp_path.rglob("*.strm"))) == 4
+    assert (tmp_path / "Cold" / "Old.srt").exists()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []

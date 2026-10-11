@@ -1360,7 +1360,7 @@ class ScanCoordinator:
                     if mapping.instance_id in failed_instances:
                         self._mark_mapping_failed(mapping, "实例认证或权限失败，已跳过该实例剩余映射")
                         continue
-                    if self._observation_store is not None and (mapping.configuration_required or run.force_complete):
+                    if self._observation_store is not None and mapping.configuration_required:
                         self._observation_store.begin_mapping(
                             mapping.identity,
                             mapping.configuration_fingerprint,
