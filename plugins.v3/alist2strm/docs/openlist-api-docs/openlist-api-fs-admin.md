@@ -1,6 +1,6 @@
 # OpenList API：FS 与 Admin 接口整理
 
-> 研究范围：`https://fox.oplist.org/` 当前公开的 OpenList API 文档中 **File System** 和 **Admin** 两组接口。接口页面的路径、方法、请求/响应示例是官网文档确认的信息；路由归属、鉴权中间件和部分官网未展开的查询参数，用 OpenList 官方仓库源码交叉核对。
+> 研究范围：`https://fox.oplist.org/` 当前公开的 OpenList API 文档中 **File System** 和 **Admin** 两组接口，并补充下载与代理路由。接口页面的路径、方法、请求/响应示例是官网文档确认的信息；路由归属、鉴权中间件和部分官网未展开的查询参数，用 OpenList 官方仓库源码交叉核对。
 >
 > 统一响应外壳（官网示例）：`{"code": 200, "message": "success", "data": ...}`。下文的“最小示例”只保留完成调用所需的关键字段，不代表完整 schema。示例中的 `TOKEN`、路径和 ID 均为占位值。
 
@@ -44,6 +44,7 @@ Admin API 也接受部署配置的管理员 API token；它同样放在 `Authori
 - [官方仓库 `server/middlewares/auth.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/middlewares/auth.go)：`Authorization` 的处理、JWT/管理员 token、guest 和 Admin 权限判断。
 - [官方仓库 `server/handles/fsread.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/fsread.go)、[`fsmanage.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/fsmanage.go)、[`fsup.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/fsup.go)、[`multipart.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/multipart.go)：FS 参数、请求头、权限和响应实现。
 - [官方仓库 `server/handles/user.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/user.go)、[`storage.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/storage.go)、[`driver.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/driver.go)、[`setting.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/setting.go)、[`meta.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/meta.go)、[`sshkey.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/sshkey.go)、[`index.go`](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/index.go)：Admin 查询参数及处理逻辑。
+- 下文补充的下载与路径约定以官方提交 [`893457cd50d954b4a1a81727273b073193b1997d`](https://github.com/OpenListTeam/OpenList/commit/893457cd50d954b4a1a81727273b073193b1997d) 为准，未访问实际 OpenList 实例。
 
 ### 鉴权说明
 
@@ -52,7 +53,7 @@ Admin API 也接受部署配置的管理员 API token；它同样放在 `Authori
 - Admin 路由挂在 `AuthAdmin` 下：需要登录用户且必须是管理员；非管理员返回 `403`。
 - FS 的读接口（`list`、`get`、`archive/meta`、`archive/list`）挂在 `Auth(true)` 下；源码允许无 token 以 guest 身份进入，但访问仍受路径、元数据密码和权限控制。实际部署若要求显式鉴权，按官网示例发送 `Authorization`。
 - FS 的写入、搜索、目录树、文件操作、上传、离线下载和解压接口挂在 `Auth(false)` 下；空 token 可进入 guest 身份，但 guest 的禁用状态和具体写权限仍会影响结果。因此下表将官网要求记为“JWT Bearer”，并在必要处补充源码行为。
-- 官方源码同时支持配置的管理员 API token；它与登录得到的 JWT 都通过 `Authorization` 头传递。这里没有把 token 的具体值或生成方式写入示例。
+- 官方源码同时支持配置的管理员 API token；它与登录得到的 JWT 都通过 `Authorization` 头传递。管理员 API token 映射到 `op.GetAdmin()` 返回的管理员用户，FS 请求仍使用该用户的路径语义。来源：[`auth.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/server/middlewares/auth.go#L17-L30)。
 
 ## 1. File System（FS）
 
@@ -65,6 +66,8 @@ Admin API 也接受部署配置的管理员 API token；它同样放在 `Authori
 | [搜索文件和目录](https://fox.oplist.org/364155734e0) | `POST /api/fs/search` | JWT Bearer；源码使用搜索索引并走普通 FS 鉴权 | JSON：`parent`、`keywords`、`scope`、`page`、`per_page`；源码还接受 `password` | `data.content` 搜索结果，`data.total` | `curl -H 'Authorization: TOKEN' -H 'Content-Type: application/json' -d '{"parent":"/","keywords":"movie","scope":0,"page":1,"per_page":30}' https://fox.oplist.org/api/fs/search` |
 | [获取目录树](https://fox.oplist.org/364155735e0) | `POST /api/fs/dirs` | JWT Bearer | JSON：`path`、`password`、`force_root`；`force_root=true` 需要 Admin（源码确认） | `data` 为目录数组，官网示例字段为 `name`、`path`；源码还返回 `modified` | `curl -H 'Authorization: TOKEN' -H 'Content-Type: application/json' -d '{"path":"/","force_root":false}' https://fox.oplist.org/api/fs/dirs` |
 | [获取其他文件操作](https://fox.oplist.org/364155736e0) | `POST /api/fs/other` | JWT Bearer | JSON：`path`、`method`；源码还带 `password` | `data` 由底层 driver 的 other 操作决定；官网示例为 `null` | `curl -H 'Authorization: TOKEN' -H 'Content-Type: application/json' -d '{"path":"/movie.mkv","method":"string"}' https://fox.oplist.org/api/fs/other` |
+
+`fs/list`、`fs/get` 先通过当前用户的 `JoinPath` 将请求路径与 `base_path` 合并，再执行路径访问检查；目录密码可能要求传入 `password`。管理员 API token 也遵循此规则，因此直接使用 OpenList 全站绝对路径时，管理员的 `base_path` 应为 `/`。新建管理员默认如此，已有实例需核对。来源：[`user.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/internal/model/user.go#L231-L233)、[`JoinBasePath`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/pkg/utils/path.go#L81-L88)、[`fsread.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/server/handles/fsread.go#L283-L298)、[管理员初始化](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/internal/bootstrap/data/user.go#L22-L49)。
 
 ### 1.2 普通上传与离线下载
 
@@ -104,6 +107,18 @@ Admin API 也接受部署配置的管理员 API token；它同样放在 `Authori
 | [复制文件或目录](https://fox.oplist.org/364155743e0) | `POST /api/fs/copy` | JWT Bearer | JSON：`src_dir`、`dst_dir`、`names[]`；可选 `overwrite`、`skip_existing`、`merge` | 成功可能立即完成，也可能返回复制任务信息（源码确认）；官网最小示例为 `data=null` | `curl -H 'Authorization: TOKEN' -H 'Content-Type: application/json' -d '{"src_dir":"/source","dst_dir":"/destination","names":["a.txt"]}' https://fox.oplist.org/api/fs/copy` |
 | [删除文件或目录](https://fox.oplist.org/364155744e0) | `POST /api/fs/remove` | JWT Bearer | JSON：`dir`、`names[]` | 成功 `data=null` | `curl -H 'Authorization: TOKEN' -H 'Content-Type: application/json' -d '{"dir":"/folder","names":["a.txt"]}' https://fox.oplist.org/api/fs/remove` |
 | [删除空目录](https://fox.oplist.org/364155745e0) | `POST /api/fs/remove_empty_directory` | JWT Bearer | JSON：`src_dir` | 成功 `data=null` | `curl -H 'Authorization: TOKEN' -H 'Content-Type: application/json' -d '{"src_dir":"/folder"}' https://fox.oplist.org/api/fs/remove_empty_directory` |
+
+### 1.5 下载与代理
+
+以下路由位于 `/api` 之外，使用 `PathParse` 和下载签名检查，不经过 API 用户鉴权。来源：[`router.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/server/router.go#L47-L59)。
+
+| 接口 | HTTP 方法与路径 | 关键参数 | 响应要点 | 最小示例 |
+|---|---|---|---|---|
+| 下载文件 | `GET /d/*path` | 完整文件路径；按配置要求 Query `sign` | 默认重定向到驱动下载链接；部分文件或存储配置改走本地代理 | `curl -L 'https://fox.oplist.org/d/Movies/A%20B.mkv'` |
+| 代理文件 | `GET /p/*path` | 完整文件路径；签名规则同 `/d` | 代理下载 | `curl -L 'https://fox.oplist.org/p/Movies/A%20B.mkv'` |
+
+- URL 使用 OpenList 服务地址 + `/d`（或 `/p`）+ 编码后的全站绝对路径；按 `EncodePath(path, true)` 对各路径段执行 `url.PathEscape`，保留分隔符 `/`。`/d` 无视频扩展名白名单，字幕等非目录附件可使用相同路由。来源：[`path.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/pkg/utils/path.go#L58-L79)、[`down.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/server/handles/down.go#L20-L43)。
+- 下载不检查 API 用户的 `base_path`，也不会因携带管理员 API token 而跳过签名。全局 `SignAll`、存储启用签名或适用的带密码 Meta 条件触发时，须提供有效 `sign`，否则无签名链接会被拒绝；FS 请求的 `password` 不能替代下载签名。来源：[`middlewares/down.go`](https://github.com/OpenListTeam/OpenList/blob/893457cd50d954b4a1a81727273b073193b1997d/server/middlewares/down.go#L24-L67)。
 
 ## 2. Admin
 
