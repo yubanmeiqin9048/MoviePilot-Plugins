@@ -158,6 +158,8 @@ def _plugin(payload: dict[str, object] | None = None) -> Alist2Strm:
     plugin._configuration_valid = True
     plugin._stopped = False
     plugin.scan_invocations = 0
+    plugin.get_data = lambda key=None, plugin_id=None: None
+    plugin.save_data = lambda key, value, plugin_id=None: None
     return plugin
 
 
@@ -258,7 +260,7 @@ def test_save_refreshes_host_schedule_after_both_persistence_writes() -> None:
         return True
 
     def save_data(key: str, value: object, plugin_id: str | None = None) -> None:
-        """记录凭据分区写入。"""
+        """记录身份保护与凭据分区的先后写入。"""
 
         events.append(("secret", key))
 
@@ -275,6 +277,7 @@ def test_save_refreshes_host_schedule_after_both_persistence_writes() -> None:
 
     assert result["success"] is True
     assert events == [
+        ("secret", plugin.OBSERVATIONS_DATA_KEY),
         ("config", True),
         ("secret", plugin.SECRET_DATA_KEY),
         ("refresh", ("Alist2Strm", True)),

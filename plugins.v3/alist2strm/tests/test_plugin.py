@@ -39,6 +39,8 @@ def _plugin() -> Alist2Strm:
     plugin._configuration = build_configuration(_payload())
     plugin._secret_tokens = {"instance-1": "configured"}
     plugin._configuration_valid = True
+    plugin.get_data = lambda key=None, plugin_id=None: None
+    plugin.save_data = lambda key, value, plugin_id=None: None
     return plugin
 
 
@@ -83,14 +85,14 @@ def test_failed_persistence_does_not_publish_candidate_or_partially_mutate_confi
     old_public = public_configuration(plugin._configuration)
     plugin.update_config = lambda config, plugin_id=None: False
     save_calls: list[Any] = []
-    plugin.save_data = lambda key, value, plugin_id=None: save_calls.append(value)
+    plugin.save_data = lambda key, value, plugin_id=None: save_calls.append((key, value))
 
     with pytest.raises(plugin.PersistenceError):
         plugin.save_configuration(_payload(token="candidate-not-published"))
 
     assert public_configuration(plugin._configuration) == old_public
     assert plugin._secret_tokens == {"instance-1": "configured"}
-    assert save_calls == []
+    assert [key for key, _value in save_calls] == [plugin.OBSERVATIONS_DATA_KEY]
 
 
 def test_secret_partition_failure_rolls_back_public_candidate() -> None:
@@ -108,9 +110,11 @@ def test_secret_partition_failure_rolls_back_public_candidate() -> None:
         return True
 
     def save_data(key: str, value: object, plugin_id: str | None = None) -> None:
-        """第一次写入失败，第二次接收回滚快照。"""
+        """Token 首次写入失败，第二次接收回滚快照；目录身份保护写入不受影响。"""
 
         nonlocal save_count
+        if key != plugin.SECRET_DATA_KEY:
+            return
         save_count += 1
         if save_count == 1:
             raise OSError("synthetic persistence failure")

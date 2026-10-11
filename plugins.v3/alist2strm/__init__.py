@@ -233,6 +233,7 @@ class Alist2Strm(_PluginBase):
         self._configuration_valid = True
         self._stopped = False
         self._recover_or_prune_history(candidate.history_retention_days)
+        self._reconcile_mapping_identities(candidate)
 
     def get_state(self) -> bool:
         """返回当前配置是否有效且可进入后续运行视图。"""
@@ -349,6 +350,8 @@ class Alist2Strm(_PluginBase):
             old_configuration = PluginConfiguration()
         old_tokens = dict(getattr(self, "_secret_tokens", {}) or {})
         candidate = build_configuration(payload, existing_tokens=old_tokens)
+        if not self._reconcile_mapping_identities(candidate):
+            raise ConfigurationPersistenceError("目录映射身份状态保存失败，编辑内容未改变")
 
         old_public = self._storage_payload(old_configuration)
         new_public = self._storage_payload(candidate)
@@ -440,6 +443,15 @@ class Alist2Strm(_PluginBase):
         """在插件实例绑定的一次性任务中执行已捕获的扫描回调。"""
 
         task()
+
+    def _reconcile_mapping_identities(self, configuration: PluginConfiguration) -> bool:
+        """在配置发布前持久化身份过渡，初始化失败由下一次任务构建重试。"""
+
+        return self._get_observation_store().reconcile_mappings(
+            (instance.id, mapping.source_dir, mapping.output_dir)
+            for instance in configuration.instances
+            for mapping in instance.mappings
+        )
 
     def _get_observation_store(self) -> DirectoryObservationStore:
         """惰性绑定当前插件实例的 PluginData 观测分区，不触发扫描。"""

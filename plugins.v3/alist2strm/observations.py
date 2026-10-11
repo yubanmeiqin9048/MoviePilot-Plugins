@@ -66,6 +66,8 @@ class MappingConfigurationObservation:
     needs_check: bool = True
     playback_fingerprint: str | None = None
     playback_needs_update: bool = False
+    retired: bool = False
+    revision: int = 0
 
 
 class DirectoryObservationStore:
@@ -81,6 +83,30 @@ class DirectoryObservationStore:
         self._mappings: dict[MappingIdentity, dict[str, DirectoryObservation]] = {}
         self._configurations: dict[MappingIdentity, MappingConfigurationObservation] = {}
 
+    def reconcile_mappings(self, identities: Iterable[MappingIdentity]) -> bool:
+        """持久化完整配置的身份过渡；退休后重新启用不能复用旧剪枝资格。"""
+
+        with self._lock:
+            if not self._ensure_loaded():
+                return False
+            active = set(identities)
+            previous = dict(self._configurations)
+            for identity in active | set(previous):
+                configuration = previous.get(identity)
+                retired = identity not in active
+                if configuration is None:
+                    self._configurations[identity] = MappingConfigurationObservation()
+                elif configuration.retired != retired:
+                    self._configurations[identity] = replace(
+                        configuration, retired=retired, needs_check=True, revision=configuration.revision + 1
+                    )
+            if self._configurations == previous:
+                return True
+            if not self._persist():
+                self._configurations = previous
+                return False
+            return True
+
     def mapping_configuration(self, identity: MappingIdentity) -> MappingConfigurationObservation:
         """读取映射配置依据和未完成要求；缺失状态必须重新完整处理。"""
 
@@ -90,7 +116,12 @@ class DirectoryObservationStore:
             return self._configurations.get(identity, MappingConfigurationObservation())
 
     def begin_mapping(
-        self, identity: MappingIdentity, fingerprint: str, playback_fingerprint: str, playback_changed: bool
+        self,
+        identity: MappingIdentity,
+        fingerprint: str,
+        playback_fingerprint: str,
+        playback_changed: bool,
+        revision: int,
     ) -> None:
         """在映射开始前保存配置与播放身份，未完成播放更新不能随重试或改回配置丢失。"""
 
@@ -98,6 +129,8 @@ class DirectoryObservationStore:
             if not self._ensure_loaded():
                 return
             previous = self._configurations.get(identity, MappingConfigurationObservation())
+            if previous.retired or previous.revision != revision:
+                return
             self._configurations[identity] = replace(
                 previous,
                 fingerprint=fingerprint,
@@ -107,14 +140,21 @@ class DirectoryObservationStore:
             )
             self._persist()
 
-    def complete_mapping(self, identity: MappingIdentity, fingerprint: str, playback_fingerprint: str) -> bool:
-        """仅在映射清理完成后解除相同配置依据的必查标记。"""
+    def complete_mapping(
+        self, identity: MappingIdentity, fingerprint: str, playback_fingerprint: str, revision: int
+    ) -> bool:
+        """仅在映射清理完成后解除相同配置依据和身份版本的必查标记。"""
 
         with self._lock:
             if not self._ensure_loaded():
                 return False
             previous = self._configurations.get(identity)
-            if previous is None or previous.fingerprint != fingerprint:
+            if (
+                previous is None
+                or previous.fingerprint != fingerprint
+                or previous.retired
+                or previous.revision != revision
+            ):
                 return False
             self._configurations[identity] = replace(
                 previous, needs_check=False, playback_fingerprint=playback_fingerprint, playback_needs_update=False
@@ -155,15 +195,15 @@ class DirectoryObservationStore:
                 pending.extend(observation.children)
             return result
 
-    def begin_check(self, identity: MappingIdentity, path: str) -> None:
-        """在本层 I/O 开始前持久标记未完成，保留此前成功事实。"""
+    def begin_check(self, identity: MappingIdentity, path: str) -> bool:
+        """在本层 I/O 开始前持久标记未完成；失败时保留运行态必查但不得开始 I/O。"""
 
         with self._lock:
             if not self._ensure_loaded():
-                return
+                return False
             directories = self._mappings.setdefault(identity, {})
             directories[path] = replace(directories.get(path, DirectoryObservation()), needs_check=True)
-            self._persist()
+            return self._persist()
 
     def record_success(
         self,
@@ -265,15 +305,20 @@ class DirectoryObservationStore:
                         needs_check = configuration.get("needs_check")
                         playback_fingerprint = configuration.get("playback_fingerprint")
                         playback_needs_update = configuration.get("playback_needs_update", False)
+                        retired = configuration.get("retired", False)
+                        revision = configuration.get("revision", 0)
                         if (
-                            isinstance(fingerprint, str)
-                            and fingerprint
+                            (fingerprint is None or (isinstance(fingerprint, str) and fingerprint))
                             and isinstance(needs_check, bool)
                             and (playback_fingerprint is None or isinstance(playback_fingerprint, str))
                             and isinstance(playback_needs_update, bool)
+                            and isinstance(retired, bool)
+                            and isinstance(revision, int)
+                            and not isinstance(revision, bool)
+                            and revision >= 0
                         ):
                             self._configurations[key] = MappingConfigurationObservation(
-                                fingerprint, needs_check, playback_fingerprint, playback_needs_update
+                                fingerprint, needs_check, playback_fingerprint, playback_needs_update, retired, revision
                             )
         self._loaded = True
         return True
@@ -291,6 +336,8 @@ class DirectoryObservationStore:
                         "needs_check": configuration.needs_check,
                         "playback_fingerprint": configuration.playback_fingerprint,
                         "playback_needs_update": configuration.playback_needs_update,
+                        "retired": configuration.retired,
+                        "revision": configuration.revision,
                     }
                     if (configuration := self._configurations.get(identity)) is not None
                     else None,
@@ -314,7 +361,7 @@ class DirectoryObservationStore:
         try:
             if self._save(payload) is False:
                 raise OSError("目录观测保存未成功")
-        except Exception:  # noqa: BLE001 - 观测故障不得改变完整扫描或泄露底层信息
+        except Exception:  # noqa: BLE001 - 返回失败供持久边界保护任务，不泄露底层信息
             logger.warning("Alist2Strm 目录观测保存失败，后续任务仍需重建或复查")
             return False
         return True

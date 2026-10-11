@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from app.plugins.alist2strm import Alist2Strm  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm import scan as scan_module  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
     ConfigurationValidationError,
@@ -3117,6 +3118,174 @@ class _PruningTasks:
         self.queue.run()
 
 
+def _pruning_plugin(tasks: _PruningTasks) -> Alist2Strm:
+    """用共享 PluginData 重建插件，保存、重启和扫描均不访问真实网络。"""
+
+    plugin = object.__new__(Alist2Strm)
+    plugin._plugin_instance_id = "Alist2Strm-pruning"
+    plugin._scan_dispatch = tasks.queue
+    plugin._scan_clock = lambda: tasks.now[0]
+    plugin._scan_client_factory = lambda url, token: OpenListClient(url, token, transport=tasks.transport)
+    plugin._scan_media_suffix_provider = lambda: (".mkv",)
+    plugin._schedule_update = lambda _plugin_id: None
+    plugin.get_data = lambda key, plugin_id=None: tasks.persisted.get(key)
+    plugin.save_data = lambda key, value, plugin_id=None: tasks.persisted.__setitem__(key, deepcopy(value))
+    plugin.update_config = lambda _config, plugin_id=None: True
+    plugin.init_plugin(tasks.configuration)
+    return plugin
+
+
+@pytest.mark.parametrize("scan_between_changes", [True, False])
+def test_pruning_reactivated_mapping_identity_requires_full_check_after_restart(
+    tmp_path: Path, scan_between_changes: bool
+) -> None:
+    """源目录 A→B→A 即使未扫描 B，重启后 A 也必须完整检查并清理覆盖产物。"""
+
+    tasks = _PruningTasks(tmp_path)
+    plugin = _pruning_plugin(tasks)
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    tasks.tree["/other-library"] = [
+        {"name": "Other.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}
+    ]
+    mapping = tasks.configuration["instances"][0]["mappings"][0]
+    mapping["source_dir"] = "/other-library"
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    if scan_between_changes:
+        assert plugin.trigger_scan()["accepted"]
+        tasks.queue.run()
+    else:
+        (tmp_path / "Other.strm").write_text("stale covered output", encoding="utf-8")
+    assert (tmp_path / "Other.strm").exists()
+    mapping["source_dir"] = "/library"
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    plugin = _pruning_plugin(tasks)
+    tasks.transport.calls.clear()
+
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+
+    assert tasks.transport.pages("/library") == [1]
+    assert plugin.get_scan_status()["state"] == "success"
+    assert (tmp_path / "Film.strm").exists()
+    assert not (tmp_path / "Other.strm").exists()
+    tasks.transport.calls.clear()
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.calls == []
+
+
+@pytest.mark.parametrize("previously_completed", [True, False])
+def test_pruning_old_snapshot_cannot_complete_reactivated_identity(tmp_path: Path, previously_completed: bool) -> None:
+    """身份过渡的版本隔离旧快照，首次排队和已有冷映射均不能清除新必查要求。"""
+
+    tasks = _PruningTasks(tmp_path)
+    plugin = _pruning_plugin(tasks)
+    if previously_completed:
+        assert plugin.trigger_scan()["accepted"]
+        tasks.queue.run()
+    assert plugin.trigger_scan(ScanTarget("pruning", mapping_index=1), force_complete=True)["accepted"]
+    mapping = tasks.configuration["instances"][0]["mappings"][0]
+    mapping["source_dir"] = "/other-library"
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    mapping["source_dir"] = "/library"
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    tasks.queue.run()
+    assert plugin.get_scan_status()["state"] == "success"
+    plugin = _pruning_plugin(tasks)
+    tasks.transport.calls.clear()
+
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+
+    assert tasks.transport.pages("/library") == [1]
+    assert plugin.get_scan_status()["state"] == "success"
+
+
+def test_pruning_identity_transition_persistence_failure_rejects_configuration_save(tmp_path: Path) -> None:
+    """身份退休未能持久化时不写宿主配置、不发布候选快照，恢复后仍可保存。"""
+
+    tasks = _PruningTasks(tmp_path)
+    plugin = _pruning_plugin(tasks)
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    tasks.configuration["instances"][0]["mappings"][0]["source_dir"] = "/other-library"
+    writes: list[object] = []
+    plugin.update_config = lambda value, plugin_id=None: writes.append(value) or True
+    save_data = plugin.save_data
+    plugin.save_data = lambda key, value, plugin_id=None: (
+        False if key == plugin.OBSERVATIONS_DATA_KEY else save_data(key, value, plugin_id=plugin_id)
+    )
+
+    with pytest.raises(plugin.PersistenceError, match="目录映射身份状态保存失败"):
+        plugin.save_configuration(tasks.configuration)
+
+    assert writes == []
+    assert plugin.public_configuration()["instances"][0]["mappings"][0]["source_dir"] == "/library"
+    plugin.save_data = save_data
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    assert len(writes) == 1
+
+
+@pytest.mark.parametrize("scan_mode", ["force", "early_configuration"])
+@pytest.mark.parametrize("save_failure", ["false", "exception"])
+def test_pruning_failed_durable_marker_blocks_io_then_preserves_failed_retry_after_restart(
+    tmp_path: Path, scan_mode: str, save_failure: str
+) -> None:
+    """提前或强制检查必须先保存未完成标记；保存失败不启动 I/O，后续失败重启必查。"""
+
+    tasks = _PruningTasks(tmp_path)
+    plugin = _pruning_plugin(tasks)
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    tasks.now[0] += 1
+    orphan = tmp_path / "orphan.strm"
+    orphan.write_text("protect incomplete mapping", encoding="utf-8")
+    if scan_mode == "early_configuration":
+        tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+        assert plugin.save_configuration(tasks.configuration)["success"]
+    save_data = plugin.save_data
+
+    def fail_marker(key: str, value: Any, plugin_id: str | None = None) -> object:
+        """只拒绝目录未完成标记写入，保留真实 PluginData 的其余写入。"""
+
+        if key == plugin.OBSERVATIONS_DATA_KEY and any(
+            mapping["directories"].get("/library", {}).get("needs_check") for mapping in value["mappings"]
+        ):
+            if save_failure == "exception":
+                raise OSError("controlled marker persistence failure")
+            return False
+        return save_data(key, value, plugin_id=plugin_id)
+
+    plugin.save_data = fail_marker
+    del tasks.tree["/library"]  # 若越过持久化边界，受控目录 I/O 就会失败。
+    tasks.transport.calls.clear()
+    assert plugin.trigger_scan(ScanTarget("pruning", mapping_index=1), force_complete=scan_mode == "force")["accepted"]
+    tasks.queue.run()
+
+    assert tasks.transport.calls == []
+    assert plugin.get_scan_status()["state"] == "failed"
+    assert "未完成标记保存失败" in plugin.get_scan_status()["mappings"][0]["error"]
+    assert orphan.exists()
+    recovered = DirectoryObservationStore(lambda: tasks.persisted[plugin.OBSERVATIONS_DATA_KEY], lambda _value: None)
+    assert recovered.directory(("pruning", "/library", str(tmp_path)), "/library").successful_at == tasks.now[0] - 1
+
+    plugin.save_data = save_data
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.pages("/library")
+    assert plugin.get_scan_status()["state"] == "failed"
+    assert orphan.exists()
+    tasks.tree["/library"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    plugin = _pruning_plugin(tasks)
+    tasks.transport.calls.clear()
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert plugin.get_scan_status()["state"] == "success"
+    assert not orphan.exists()
+
+
 def test_pruning_selection_change_does_not_update_existing_strm(tmp_path: Path) -> None:
     """白名单变更使冷映射完整检查，但不把选择失效误当播放地址变化。"""
 
@@ -3423,6 +3592,17 @@ def test_pruning_interrupted_work_remains_required_across_restart(tmp_path: Path
     assert tasks.transport.calls == []
 
 
+class _PartialPlaybackUpdate(LocalFileSystem):
+    """在本地边界仅让第二个已有目标的播放地址更新失败。"""
+
+    def replace_text_atomic(self, target: Path, content: str) -> None:
+        """保留第二个目标内容，允许第一项更新完成。"""
+
+        if target.name == "Other.strm":
+            raise OSError("controlled update failure")
+        super().replace_text_atomic(target, content)
+
+
 def test_pruning_playback_failure_retains_full_update_requirement_after_restart(tmp_path: Path) -> None:
     """新播放地址部分更新后失败，持久化要求使重启立即完整重试剩余目标。"""
 
@@ -3431,17 +3611,7 @@ def test_pruning_playback_failure_retains_full_update_requirement_after_restart(
     tasks.run()
     tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
 
-    class PartialUpdate(LocalFileSystem):
-        """只让第二个播放地址原子更新失败。"""
-
-        def replace_text_atomic(self, target: Path, content: str) -> None:
-            """保留第二个已有目标内容。"""
-
-            if target.name == "Other.strm":
-                raise OSError("controlled update failure")
-            super().replace_text_atomic(target, content)
-
-    tasks.restart(PartialUpdate())
+    tasks.restart(_PartialPlaybackUpdate())
     tasks.run()
     assert tasks.coordinator.status()["state"] == "partial_failure"
     assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
@@ -3493,17 +3663,7 @@ def test_pruning_reverting_failed_playback_change_restores_all_existing_strm(tmp
     tasks.run()
     tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
 
-    class PartialUpdate(LocalFileSystem):
-        """让第二个目标更新失败，保留第一项更新结果。"""
-
-        def replace_text_atomic(self, target: Path, content: str) -> None:
-            """在本地更新边界注入失败。"""
-
-            if target.name == "Other.strm":
-                raise OSError("controlled update failure")
-            super().replace_text_atomic(target, content)
-
-    tasks.restart(PartialUpdate())
+    tasks.restart(_PartialPlaybackUpdate())
     tasks.run()
     assert tasks.coordinator.status()["state"] == "partial_failure"
     assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
@@ -3566,7 +3726,10 @@ def test_pruning_stop_during_incomplete_marker_does_not_start_remote_client(tmp_
         """在持久化 I/O 边界保存标记并请求停止。"""
 
         tasks.persisted["value"] = deepcopy(value)
-        assert tasks.coordinator.stop().accepted
+        if isinstance(value, dict) and any(
+            directory["needs_check"] for mapping in value["mappings"] for directory in mapping["directories"].values()
+        ):
+            assert tasks.coordinator.stop().accepted
 
     def open_client(url: str, token: str) -> OpenListClient:
         """记录远端资源是否在停止后被打开。"""

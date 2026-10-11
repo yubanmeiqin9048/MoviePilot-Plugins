@@ -316,6 +316,19 @@ class RemoteEntry:
     modified_at: float | None = None
 
 
+def _remote_entry_from_mapping(item: Mapping[str, Any]) -> RemoteEntry | None:
+    """共享目录项映射转换，名称无效由客户端或注入 reader 各自处理。"""
+
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    return RemoteEntry(
+        name=name,
+        is_dir=bool(item.get("is_dir")),
+        modified_at=parse_modified_time(item.get("modified")),
+    )
+
+
 class OpenListClient:
     """通过管理员 API Token 递归扫描所需的 OpenList 只读客户端。"""
 
@@ -439,16 +452,10 @@ class OpenListClient:
             for item in content:
                 if not isinstance(item, Mapping):
                     raise OpenListError("OpenList 目录项格式无效", retryable=False)
-                name = item.get("name")
-                if not isinstance(name, str) or not name:
+                entry = _remote_entry_from_mapping(item)
+                if entry is None:
                     raise OpenListError("OpenList 目录项名称无效", retryable=False)
-                entries.append(
-                    RemoteEntry(
-                        name=name,
-                        is_dir=bool(item.get("is_dir")),
-                        modified_at=parse_modified_time(item.get("modified")),
-                    )
-                )
+                entries.append(entry)
             collected += len(content)
             if collected >= total:
                 break
@@ -769,6 +776,7 @@ class _MappingRun:
     configuration_fingerprint: str = ""
     playback_fingerprint: str = ""
     configuration_required: bool = False
+    configuration_revision: int = 0
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -1118,6 +1126,12 @@ class ScanCoordinator:
         if not isinstance(configuration, PluginConfiguration):
             return ScanTriggerResult(False, "没有可运行的已保存配置")
         snapshot = configuration.model_copy(deep=True)
+        if self._observation_store is not None and not self._observation_store.reconcile_mappings(
+            (instance.id, mapping.source_dir, mapping.output_dir)
+            for instance in snapshot.instances
+            for mapping in instance.mappings
+        ):
+            return ScanTriggerResult(False, "目录映射身份状态保存失败，扫描未启动")
         video_suffixes = self._normalise_suffixes(self._media_suffix_provider)
         cleanup_disqualified = self._has_overlapping_output_roots(
             Path(mapping.output_dir) for instance in snapshot.instances for mapping in instance.mappings
@@ -1193,6 +1207,7 @@ class ScanCoordinator:
                         configuration_fingerprint=configuration_fingerprint,
                         playback_fingerprint=playback_fingerprint,
                         configuration_required=configuration_required,
+                        configuration_revision=previous_configuration.revision,
                         status=status,
                     )
                 )
@@ -1366,6 +1381,7 @@ class ScanCoordinator:
                             mapping.configuration_fingerprint,
                             mapping.playback_fingerprint,
                             mapping.playback_changed,
+                            mapping.configuration_revision,
                         )
                     self._observe_stop(run)
                     self._scan_mapping(
@@ -1396,6 +1412,7 @@ class ScanCoordinator:
                                     mapping.identity,
                                     mapping.configuration_fingerprint,
                                     mapping.playback_fingerprint,
+                                    mapping.configuration_revision,
                                 )
                             self._remember_playback_identity(mapping)
                             mapping.status.state = "success"
@@ -1535,8 +1552,8 @@ class ScanCoordinator:
                 mapping.unscanned_directories.add(current)
                 pending.extend((child, False) for child in previous.children)
                 continue
-            if store is not None:
-                store.begin_check(mapping.identity, current)
+            if store is not None and not store.begin_check(mapping.identity, current):
+                raise OSError(f"目录 {current}：未完成标记保存失败，未开始目录检查")
             failed_before = mapping.status.counters.failed
             direct_files = FileTimeSummary("empty")
             children: list[str] = []
@@ -1840,13 +1857,7 @@ class ScanCoordinator:
         if isinstance(raw_entry, RemoteEntry):
             return raw_entry
         if isinstance(raw_entry, Mapping):
-            name = raw_entry.get("name")
-            if isinstance(name, str) and name:
-                return RemoteEntry(
-                    name=name,
-                    is_dir=bool(raw_entry.get("is_dir")),
-                    modified_at=parse_modified_time(raw_entry.get("modified")),
-                )
+            return _remote_entry_from_mapping(raw_entry)
         return None
 
     @staticmethod
