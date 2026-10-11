@@ -120,6 +120,8 @@ export interface ScanTriggerResponse {
   message: string
 }
 
+export type ScanMode = 'normal' | 'force_complete'
+
 export interface ScanTarget {
   instance_id: string
   mapping_index: number

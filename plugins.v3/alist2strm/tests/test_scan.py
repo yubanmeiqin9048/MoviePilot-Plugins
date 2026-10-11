@@ -215,7 +215,8 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_downloads_attac
         assert "token" not in str(call["payload"]).casefold()
 
 
-def test_playback_address_change_updates_existing_video_target(tmp_path: Path) -> None:
+@pytest.mark.parametrize("force_complete", [False, True])
+def test_playback_address_change_updates_existing_video_target(tmp_path: Path, force_complete: bool) -> None:
     """已保存播放地址变化时，当前映射的已有视频 STRM 应更新。"""
 
     first = _config(tmp_path)
@@ -260,7 +261,7 @@ def test_playback_address_change_updates_existing_video_target(tmp_path: Path) -
     assert target.read_text(encoding="utf-8") == "https://play-a.example.invalid/d/media/movies/Film.mkv"
 
     current[0] = replacement
-    assert coordinator.trigger().accepted is True
+    assert coordinator.trigger(ScanTarget("a", mapping_index=1), force_complete=force_complete).accepted is True
     queue.run()
 
     assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/media/movies/Film.mkv"
@@ -3591,3 +3592,291 @@ def test_pruning_stop_during_incomplete_marker_does_not_start_remote_client(tmp_
     tasks.run()
     assert tasks.transport.pages("/library") == [1]
     assert tasks.coordinator.status()["state"] == "success"
+
+
+def test_force_complete_runs_only_selected_saved_mapping_with_normal_output_rules(tmp_path: Path) -> None:
+    """强制方式仅处理指定快照；筛选、跳过已有产物和清理边界不变。"""
+
+    configuration = _config(tmp_path)
+    selected = configuration.instances[0].mappings[0]
+    selected.whitelist_mode = "custom"
+    selected.extensions = [".mkv", ".srt"]
+    selected.exclude_keywords = ["Sample"]
+    output = tmp_path / "a"
+    output.mkdir()
+    existing = output / "existing.strm"
+    existing.write_text("handmade", encoding="utf-8")
+    stale = output / "stale.strm"
+    stale.write_text("stale", encoding="utf-8")
+    untouched = tmp_path / "empty" / "stale.strm"
+    untouched.parent.mkdir()
+    untouched.write_text("other mapping", encoding="utf-8")
+    transport = _Transport(
+        {
+            "https://scan-a.example.invalid": {
+                "/media/movies": [
+                    {"name": "existing.mkv", "is_dir": False},
+                    {"name": "missing.mkv", "is_dir": False},
+                    {"name": "missing.srt", "is_dir": False},
+                    {"name": "ignored.txt", "is_dir": False},
+                    {"name": "Sample", "is_dir": True},
+                    {"name": "Allowed", "is_dir": True},
+                ],
+                "/media/movies/Allowed": [{"name": "deep.mkv", "is_dir": False}],
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger(ScanTarget("a", mapping_index=1), force_complete=True).accepted
+    assert not coordinator.trigger().accepted
+    assert len(queue.jobs) == 1
+    # 启动后编辑保存对象不改变本任务的白名单、源和输出快照。
+    selected.extensions = []
+    selected.source_dir = "/changed"
+    queue.run()
+    assert coordinator.status()["state"] == "success"
+    assert coordinator.status()["total_mappings"] == 1
+    assert existing.read_text(encoding="utf-8") == "handmade"
+    assert (output / "missing.strm").is_file()
+    assert (output / "missing.srt").is_file()
+    assert (output / "Allowed" / "deep.strm").is_file()
+    assert not (output / "ignored.txt").exists()
+    assert not (output / "Sample").exists()
+    assert not stale.exists()
+    assert untouched.read_text(encoding="utf-8") == "other mapping"
+    assert [call["payload"]["path"] for call in transport.calls if "path" in call["payload"]] == [
+        "/media/movies",
+        "/media/movies/Allowed",
+    ]
+
+
+def test_force_complete_requires_exactly_one_saved_mapping(tmp_path: Path) -> None:
+    """没有选择或匹配多组的强制请求不会扩大成全量任务。"""
+
+    configuration = _config(tmp_path)
+    # 历史配置绕过保存校验时，同一源目录仍不能让强制请求扩成多组。
+    configuration.instances[0].mappings[1].source_dir = "/media/movies"
+    queue = _Queue()
+    coordinator = ScanCoordinator(lambda: configuration, dispatch=queue)
+    assert not coordinator.trigger(force_complete=True).accepted
+    assert not coordinator.trigger(ScanTarget("a", source_dir="/media/movies"), force_complete=True).accepted
+    assert not coordinator.trigger(ScanTarget("missing", mapping_index=1), force_complete=True).accepted
+    assert coordinator.status()["state"] == "idle"
+    assert not queue.jobs
+
+
+@pytest.mark.parametrize(
+    "failure", ["list", "generation", "download", "stop", "cleanup", "cleanup_listing", "cleanup_stop"]
+)
+def test_force_complete_unfinished_work_is_rechecked_by_next_normal_scan(tmp_path: Path, failure: str) -> None:
+    """强制扫描失败/停止/清理失败后，重启的普通任务仍必查并补回。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "repair",
+                    "name": "补回实例",
+                    "scan_url": "https://repair.example.invalid",
+                    "api_token": "synthetic",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".srt"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    tree = {
+        "/library": [
+            {"name": "movie.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"},
+            {"name": "movie.srt", "is_dir": False, "modified": "2023-01-01T00:00:00Z"},
+        ]
+    }
+    transport = _Transport({"https://repair.example.invalid": tree})
+    active_failure = [False]
+    persisted: dict[str, object] = {}
+    now = [1_720_000_000.0]
+
+    class FileSystem(LocalFileSystem):
+        """独立模拟产物及清理的本地 I/O 故障。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """按需阻断 STRM 补回。"""
+
+            if active_failure[0] and failure == "generation":
+                raise OSError("cannot write")
+            return super().write_text_atomic(target, content)
+
+        def write_bytes_atomic(self, target: Path, chunks: Any) -> bool:
+            """按需阻断附件补回。"""
+
+            if active_failure[0] and failure == "download":
+                raise OSError("cannot write")
+            return super().write_bytes_atomic(target, chunks)
+
+        def unlink(self, target: Path) -> None:
+            """按需阻断安全清理。"""
+
+            if active_failure[0] and failure == "cleanup":
+                raise OSError("cannot remove")
+            super().unlink(target)
+            if active_failure[0] and failure == "cleanup_stop":
+                assert first.stop().accepted
+
+        def iter_files(self, root: Path) -> list[Path]:
+            """按需阻断清理候选枚举。"""
+
+            if active_failure[0] and failure == "cleanup_listing":
+                raise OSError("cannot enumerate")
+            return list(super().iter_files(root))
+
+    def coordinator() -> tuple[ScanCoordinator, _Queue]:
+        """以 PluginData 内存分区重建任务，不依赖旧协调器状态。"""
+
+        queue = _Queue()
+        store = DirectoryObservationStore(
+            lambda: persisted.get("value"), lambda value: persisted.__setitem__("value", value)
+        )
+        return ScanCoordinator(
+            lambda: configuration,
+            dispatch=queue,
+            observation_store=store,
+            filesystem=FileSystem(),
+            clock=lambda: now[0],
+            client_factory=lambda url, token: OpenListClient(url, token, transport=transport, max_retries=0),
+        ), queue
+
+    first, queue = coordinator()
+    target = ScanTarget("repair", mapping_index=1)
+    assert first.trigger(target).accepted
+    queue.run()
+    assert first.status()["state"] == "success"
+    (tmp_path / "movie.strm").unlink()
+    (tmp_path / "movie.srt").unlink()
+    stale = tmp_path / "stale.strm"
+    stale.write_text("keep until complete", encoding="utf-8")
+    active_failure[0] = True
+    original_post = transport.post_json
+
+    def failed_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """只在强制运行期间阻断源，或在列表返回时请求停止。"""
+
+        if active_failure[0] and failure == "list":
+            return HttpResponse(403, {"code": 403})
+        response = original_post(url, payload, headers)
+        if active_failure[0] and failure == "stop":
+            first.stop()
+        return response
+
+    transport.post_json = failed_post
+    now[0] += 60
+    assert first.trigger(target, force_complete=True).accepted
+    queue.run()
+    expected_state = {"list": "failed", "stop": "stopped", "cleanup_stop": "stopped"}.get(failure, "partial_failure")
+    assert first.status()["state"] == expected_state
+    assert stale.exists() is (failure != "cleanup_stop")
+    active_failure[0] = False
+    now[0] += 60
+    restarted, queue = coordinator()
+    calls_before = len(transport.calls)
+    assert restarted.trigger(target).accepted
+    queue.run()
+    assert restarted.status()["state"] == "success"
+    assert len(transport.calls) > calls_before
+    assert (tmp_path / "movie.strm").is_file()
+    assert (tmp_path / "movie.srt").is_file()
+    assert not stale.exists()
+
+
+def test_force_complete_bypasses_not_due_time_pruning_and_repairs_missing_products(tmp_path: Path) -> None:
+    """普通任务保持剪枝，而指定映射强制运行补回缺失的 STRM 与附件。"""
+
+    coordinator, queue, transport, _store, _persisted, now = _observation_task(
+        tmp_path,
+        {
+            "/library": [
+                {"name": "movie.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"},
+                {"name": "movie.srt", "is_dir": False, "modified": "2023-01-01T00:00:00Z"},
+            ]
+        },
+    )
+    target = ScanTarget("observations", mapping_index=1)
+    assert coordinator.trigger(target).accepted
+    queue.run()
+    assert coordinator.status()["state"] == "success"
+    (tmp_path / "movie.strm").unlink()
+    (tmp_path / "movie.srt").unlink()
+    listed = len(transport.pages("/library"))
+    now[0] += 60
+    assert coordinator.trigger(target).accepted
+    queue.run()
+    assert coordinator.status()["state"] == "success"
+    assert len(transport.pages("/library")) == listed
+    assert not (tmp_path / "movie.strm").exists()
+    assert not (tmp_path / "movie.srt").exists()
+
+    assert coordinator.trigger(target, force_complete=True).accepted
+    queue.run()
+    assert coordinator.status()["state"] == "success"
+    assert len(transport.pages("/library")) > listed
+    assert (tmp_path / "movie.strm").is_file()
+    assert (tmp_path / "movie.srt").is_file()
+    assert coordinator.status()["counters"]["generated"] == 1
+    assert coordinator.status()["counters"]["downloaded"] == 1
+
+
+def test_force_complete_success_restarts_normal_recheck_deadline(tmp_path: Path) -> None:
+    """提前强制成功以本次检查时间安排普通复查，后续普通运行仍剪枝。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    original_success = tasks.now[0]
+    tasks.now[0] += 86400
+    tasks.transport.calls.clear()
+    target = ScanTarget("pruning", mapping_index=1)
+    assert tasks.coordinator.trigger(target, force_complete=True).accepted
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"
+
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] = original_success + 90 * 86400
+    assert tasks.coordinator.trigger(target).accepted
+    tasks.queue.run()
+    assert tasks.transport.calls == []
+    tasks.now[0] += 86400
+    assert tasks.coordinator.trigger(target).accepted
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+
+
+def test_force_complete_stopped_before_execution_preserves_normal_deadline(tmp_path: Path) -> None:
+    """排队强制任务在执行前停止不改观测，重启后普通任务按旧期限剪枝。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    before = deepcopy(tasks.persisted)
+    tasks.now[0] += 86400
+    tasks.transport.calls.clear()
+    assert tasks.coordinator.trigger(ScanTarget("pruning", mapping_index=1), force_complete=True).accepted
+    assert tasks.coordinator.stop().accepted
+    tasks.queue.run()
+    assert tasks.coordinator.status()["state"] == "stopped"
+    assert tasks.transport.calls == []
+    assert tasks.persisted == before
+    tasks.restart()
+    tasks.run()
+    assert tasks.transport.calls == []
+    assert tasks.persisted == before

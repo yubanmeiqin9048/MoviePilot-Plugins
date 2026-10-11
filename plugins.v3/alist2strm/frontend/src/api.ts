@@ -4,6 +4,7 @@ import type {
   HistoryPage,
   PluginApi,
   ScanStatus,
+  ScanMode,
   ScanTarget,
   ScanTriggerResponse,
 } from '@/types'
@@ -51,7 +52,7 @@ export function readConfiguration(api: PluginApi, pluginId: string): Promise<Con
 
 /** 启动全部映射的手动扫描，服务端只读取已保存配置。 */
 export function startScan(api: PluginApi, pluginId: string): Promise<ScanTriggerResponse> {
-  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan'), {})
+  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan'), { scan_mode: 'normal' })
 }
 
 /** 启动一个已保存映射的手动扫描。 */
@@ -59,8 +60,9 @@ export function startMappingScan(
   api: PluginApi,
   pluginId: string,
   target: ScanTarget,
+  scanMode: ScanMode = 'normal',
 ): Promise<ScanTriggerResponse> {
-  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan/mapping'), target)
+  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan/mapping'), { scan_mode: scanMode, target })
 }
 
 /** 读取可轮询的扫描状态与六类计数。 */

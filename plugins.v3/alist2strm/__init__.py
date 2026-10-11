@@ -477,10 +477,10 @@ class Alist2Strm(_PluginBase):
             self._scan_coordinator = coordinator
         return coordinator
 
-    def trigger_scan(self, target: ScanTarget | None = None) -> dict[str, object]:
-        """捕获已保存配置并提交全部或单组手动扫描任务。"""
+    def trigger_scan(self, target: ScanTarget | None = None, *, force_complete: bool = False) -> dict[str, object]:
+        """捕获已保存配置并提交普通扫描或指定映射强制完整扫描。"""
 
-        result = self._get_scan_coordinator().trigger(target)
+        result = self._get_scan_coordinator().trigger(target, force_complete=force_complete)
         if result.accepted:
             self.scan_invocations = int(getattr(self, "scan_invocations", 0)) + 1
         return result.as_dict()
@@ -495,8 +495,12 @@ class Alist2Strm(_PluginBase):
         """解析运行接口目标，不接收或保存浏览器配置草稿。"""
 
         value: object = payload
-        if isinstance(value, Mapping) and "target" in value:
-            value = value.get("target")
+        if isinstance(value, Mapping):
+            value = (
+                value.get("target")
+                if "target" in value
+                else {key: item for key, item in value.items() if key != "scan_mode"}
+            )
         if value is None or (isinstance(value, Mapping) and not value and not required):
             if required:
                 raise HTTPException(status_code=422, detail="必须指定目录映射")
@@ -522,6 +526,15 @@ class Alist2Strm(_PluginBase):
             source_dir=source_dir,
         )
 
+    @staticmethod
+    def _force_complete(payload: object) -> bool:
+        """仅接受已定义的扫描方式，缺省仍为普通运行。"""
+
+        mode = payload.get("scan_mode", "normal") if isinstance(payload, Mapping) else "normal"
+        if mode not in ("normal", "force_complete"):
+            raise HTTPException(status_code=422, detail="扫描方式无效")
+        return mode == "force_complete"
+
     def start_scan(
         self,
         payload: dict[str, Any] | None = Body(None),  # noqa: B008 - FastAPI 请求体注入
@@ -529,7 +542,9 @@ class Alist2Strm(_PluginBase):
     ) -> dict[str, object]:
         """运行全部映射，兼容带 target 的单组请求并使用启动快照。"""
 
-        return self.trigger_scan(self._scan_target(payload))
+        force_complete = self._force_complete(payload)
+        target = self._scan_target(payload, required=force_complete)
+        return self.trigger_scan(target, force_complete=True) if force_complete else self.trigger_scan(target)
 
     def run_mapping_scan(
         self,
@@ -538,7 +553,9 @@ class Alist2Strm(_PluginBase):
     ) -> dict[str, object]:
         """运行一个已保存目录映射，不把配置草稿传入扫描任务。"""
 
-        return self.trigger_scan(self._scan_target(payload, required=True))
+        force_complete = self._force_complete(payload)
+        target = self._scan_target(payload, required=True)
+        return self.trigger_scan(target, force_complete=True) if force_complete else self.trigger_scan(target)
 
     def scan_status(
         self,

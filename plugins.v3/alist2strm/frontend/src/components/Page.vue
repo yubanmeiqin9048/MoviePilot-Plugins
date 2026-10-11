@@ -12,6 +12,7 @@ import type {
   PluginApi,
   ScanCounters,
   ScanStatus,
+  ScanMode,
   ScanTarget,
 } from '@/types'
 
@@ -223,7 +224,12 @@ async function runAll(): Promise<void> {
   }
 }
 
-async function runMapping(instance: OpenListInstance, mapping: DirectoryMapping, index: number): Promise<void> {
+async function runMapping(
+  instance: OpenListInstance,
+  mapping: DirectoryMapping,
+  index: number,
+  scanMode: ScanMode = 'normal',
+): Promise<void> {
   const target: ScanTarget = {
     instance_id: instance.id,
     mapping_index: index + 1,
@@ -231,7 +237,7 @@ async function runMapping(instance: OpenListInstance, mapping: DirectoryMapping,
   }
   triggering.value = true
   try {
-    const response = await startMappingScan(props.api, pluginId.value, target)
+    const response = await startMappingScan(props.api, pluginId.value, target, scanMode)
     showResult(response.accepted ? 'success' : 'warning', response.message)
   } catch (error) {
     showResult('error', `启动扫描失败：${getErrorMessage(error, '请稍后重试')}`)
@@ -320,6 +326,9 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
           <VAlert v-if="!loading && !config.instances.length" type="info" variant="tonal">
             尚未配置实例与映射，请先保存配置。
           </VAlert>
+          <p v-if="config.instances.length" class="text-body-2 text-medium-emphasis mb-4">
+            强制完整扫描仅绕过时间剪枝，检查指定映射的所有允许目录并尝试补回缺失产物；白名单、排除、已有文件跳过及播放地址更新规则仍生效。
+          </p>
           <div v-for="instance in config.instances" :key="instance.id || instance.name" class="mapping-group mb-5">
             <div class="text-subtitle-1 mb-2">{{ instance.name }}</div>
             <div v-if="!instance.mappings.length" class="text-body-2 text-medium-emphasis">该实例尚未配置映射。</div>
@@ -328,16 +337,28 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
                 <div>{{ mapping.source_dir }}</div>
                 <div class="text-caption text-medium-emphasis">→ {{ mapping.output_dir }}</div>
               </div>
-              <VBtn
-                size="small"
-                variant="tonal"
-                prepend-icon="mdi-play-outline"
-                :loading="triggering"
-                :disabled="loading || triggering || status.running"
-                @click="runMapping(instance, mapping, index)"
-              >
-                运行此映射
-              </VBtn>
+              <div class="mapping-actions d-flex flex-wrap ga-2">
+                <VBtn
+                  size="small"
+                  variant="tonal"
+                  prepend-icon="mdi-play-outline"
+                  :loading="triggering"
+                  :disabled="loading || triggering || status.running"
+                  @click="runMapping(instance, mapping, index)"
+                >
+                  运行此映射
+                </VBtn>
+                <VBtn
+                  size="small"
+                  variant="outlined"
+                  prepend-icon="mdi-folder-refresh-outline"
+                  :loading="triggering"
+                  :disabled="loading || triggering || status.running"
+                  @click="runMapping(instance, mapping, index, 'force_complete')"
+                >
+                  强制完整扫描
+                </VBtn>
+              </div>
             </div>
           </div>
 
@@ -492,6 +513,7 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
 .mapping-group { border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); padding-bottom: 1rem; }
 .mapping-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .5rem 0; }
 .mapping-path { min-width: 0; overflow-wrap: anywhere; }
+.mapping-actions { flex-shrink: 0; }
 .history-toolbar { min-height: 2.5rem; }
 .history-title { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: .75rem; }
 .history-meta { display: flex; flex-wrap: wrap; gap: 1rem; }

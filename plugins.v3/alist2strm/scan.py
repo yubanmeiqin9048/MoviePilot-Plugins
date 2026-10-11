@@ -792,6 +792,7 @@ class _ScanRun:
     started_at: float
     run_id: str
     cleanup_disqualified: bool = False
+    force_complete: bool = False
     state: str = "running"
     current_mapping: str | None = None
     finished_at: float | None = None
@@ -878,16 +879,18 @@ class ScanCoordinator:
 
         return [*getattr(settings, "RMT_MEDIAEXT", ()), *getattr(settings, "RMT_SUBEXT", ())]
 
-    def trigger(self, target: ScanTarget | None = None) -> ScanTriggerResult:
+    def trigger(self, target: ScanTarget | None = None, *, force_complete: bool = False) -> ScanTriggerResult:
         """捕获已保存配置并提交一次后台扫描；运行中触发不排队。"""
 
+        if force_complete and not isinstance(target, ScanTarget):
+            return ScanTriggerResult(False, "强制完整扫描必须指定一个目录映射")
         with self._lock:
             if self._run is not None and self._run.state in {"running", "stopping"}:
                 message = (
                     "扫描正在停止，已跳过本次触发" if self._run.state == "stopping" else "扫描正在运行，已跳过本次触发"
                 )
                 return ScanTriggerResult(False, message)
-            run_or_error = self._build_run(target)
+            run_or_error = self._build_run(target, force_complete=force_complete)
             if isinstance(run_or_error, ScanTriggerResult):
                 return run_or_error
             self._run = run_or_error
@@ -1105,7 +1108,7 @@ class ScanCoordinator:
                         logger.warning("Alist2Strm 扫描资源释放失败")
                     break
 
-    def _build_run(self, target: ScanTarget | None) -> _ScanRun | ScanTriggerResult:
+    def _build_run(self, target: ScanTarget | None, *, force_complete: bool = False) -> _ScanRun | ScanTriggerResult:
         """从当前已保存配置构造深拷贝快照，不读取浏览器草稿。"""
 
         try:
@@ -1197,12 +1200,15 @@ class ScanCoordinator:
             return ScanTriggerResult(False, "未找到指定的目录映射")
         if not mappings:
             return ScanTriggerResult(False, "没有可运行的目录映射")
+        if force_complete and len(mappings) != 1:
+            return ScanTriggerResult(False, "强制完整扫描必须指定一个目录映射")
         return _ScanRun(
             mappings=mappings,
             video_suffixes=video_suffixes,
             started_at=self._clock(),
             run_id=uuid.uuid4().hex,
             cleanup_disqualified=cleanup_disqualified,
+            force_complete=force_complete,
         )
 
     @staticmethod
@@ -1327,7 +1333,7 @@ class ScanCoordinator:
                     if mapping.instance_id in failed_instances:
                         self._mark_mapping_failed(mapping, "实例认证或权限失败，已跳过该实例剩余映射")
                         continue
-                    if self._can_prune_mapping(mapping):
+                    if not run.force_complete and self._can_prune_mapping(mapping):
                         mapping.unscanned_directories.add(mapping.source_dir)
                     elif self._observation_store is not None:
                         self._observation_store.begin_mapping(
