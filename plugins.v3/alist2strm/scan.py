@@ -20,6 +20,7 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 
 from .config import PluginConfiguration
+from .observations import DirectoryObservationStore, FileTimeSummary, parse_modified_time
 
 FS_LIST_PATH = "/api/fs/list"
 LIST_PER_PAGE = 100
@@ -305,6 +306,7 @@ class RemoteEntry:
 
     name: str
     is_dir: bool
+    modified_at: float | None = None
 
 
 class OpenListClient:
@@ -433,7 +435,13 @@ class OpenListClient:
                 name = item.get("name")
                 if not isinstance(name, str) or not name:
                     raise OpenListError("OpenList 目录项名称无效", retryable=False)
-                entries.append(RemoteEntry(name=name, is_dir=bool(item.get("is_dir"))))
+                entries.append(
+                    RemoteEntry(
+                        name=name,
+                        is_dir=bool(item.get("is_dir")),
+                        modified_at=parse_modified_time(item.get("modified")),
+                    )
+                )
             collected += len(content)
             if collected >= total:
                 break
@@ -749,6 +757,7 @@ class _MappingRun:
     expected_outputs: set[Path] = field(default_factory=set)
     expected_output_identities: set[Path] = field(default_factory=set)
     expected_output_resolution_failed: bool = False
+    checked_directories: set[str] = field(default_factory=set)
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -798,6 +807,7 @@ class ScanCoordinator:
         max_retries: int = MAX_RETRIES,
         history_callback: Callable[[ScanStatus], None] | None = None,
         history_discard: Callable[[str], None] | None = None,
+        observation_store: DirectoryObservationStore | None = None,
     ) -> None:
         """绑定已保存配置、后台提交器和可替换 OpenList、退避与资源边界。"""
 
@@ -818,6 +828,7 @@ class ScanCoordinator:
         self._max_retries = max(int(max_retries), 0)
         self._history_callback = history_callback
         self._history_discard = history_discard
+        self._observation_store = observation_store
         self._lock = threading.Lock()
         self._run: _ScanRun | None = None
         self._active_readers: list[Any] = []
@@ -1361,6 +1372,11 @@ class ScanCoordinator:
         while pending:
             self._observe_stop(self._run_for_mapping(mapping))
             current = pending.pop()
+            if self._observation_store is not None:
+                self._observation_store.begin_check(mapping.identity, current)
+            failed_before = mapping.status.counters.failed
+            direct_files = FileTimeSummary("empty")
+            children: list[str] = []
             try:
                 entries = self._list_directory(reader, current, self._run_for_mapping(mapping))
             except ScanStopped:
@@ -1388,8 +1404,10 @@ class ScanCoordinator:
                         continue
                     remote_path = _join_remote_path(current, entry.name)
                     if entry.is_dir:
+                        children.append(remote_path)
                         pending.append(remote_path)
                         continue
+                    direct_files = direct_files.include(entry.modified_at)
                     suffix = PurePosixPath(entry.name).suffix.casefold()
                     if not suffix or suffix not in mapping.allowed_suffixes:
                         continue
@@ -1432,6 +1450,10 @@ class ScanCoordinator:
                 except Exception as error:  # noqa: BLE001 - 单文件失败不得阻断同目录文件
                     mapping.status.counters.failed += 1
                     self._record_mapping_error(mapping, f"文件处理失败：{error}")
+            self._observe_stop(self._run_for_mapping(mapping))
+            if mapping.status.counters.failed == failed_before and self._observation_store is not None:
+                self._observation_store.record_success(mapping.identity, current, direct_files, children, self._clock())
+                mapping.checked_directories.add(current)
 
     def _remember_expected_output(self, mapping: _MappingRun, target: Path) -> None:
         """记录预期产物的词法与解析身份，解析失败时保守禁用清理。"""
@@ -1479,6 +1501,7 @@ class ScanCoordinator:
                 continue
             candidates.append(target)
 
+        unfinished: set[str] = set()
         for target in candidates:
             self._observe_stop(run)
             try:
@@ -1487,10 +1510,30 @@ class ScanCoordinator:
                 raise
             except Exception as error:  # noqa: BLE001 - 单项删除失败不得阻断其他产物
                 mapping.status.counters.failed += 1
+                owner = self._cleanup_owner(mapping, target)
+                unfinished.update({owner} if owner is not None else mapping.checked_directories)
                 self._log_cleanup_failure(mapping, target, error)
                 self._record_mapping_error(mapping, f"清理文件 {target}：删除失败（{error}）")
                 continue
             mapping.status.counters.deleted += 1
+        self._observe_stop(run)
+        if self._observation_store is not None:
+            self._observation_store.complete_cleanup(mapping.identity, mapping.checked_directories - unfinished)
+
+    @staticmethod
+    def _cleanup_owner(mapping: _MappingRun, target: Path) -> str | None:
+        """将删除责任归最近已检查祖先；已消失或排除分支由确认其消失的父层负责。"""
+
+        try:
+            relative = target.parent.relative_to(mapping.output_dir)
+        except ValueError:
+            return None
+        current = PurePosixPath(mapping.source_dir).joinpath(*relative.parts)
+        while str(current) not in mapping.checked_directories:
+            if current == current.parent:
+                return None
+            current = current.parent
+        return str(current)
 
     def _log_cleanup_failure(self, mapping: _MappingRun, target: Path, error: Exception) -> None:
         """在宿主日志中记录每项脱敏的清理失败。"""
@@ -1583,7 +1626,11 @@ class ScanCoordinator:
         if isinstance(raw_entry, Mapping):
             name = raw_entry.get("name")
             if isinstance(name, str) and name:
-                return RemoteEntry(name=name, is_dir=bool(raw_entry.get("is_dir")))
+                return RemoteEntry(
+                    name=name,
+                    is_dir=bool(raw_entry.get("is_dir")),
+                    modified_at=parse_modified_time(raw_entry.get("modified")),
+                )
         return None
 
     @staticmethod

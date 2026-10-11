@@ -29,6 +29,7 @@ from .history import (
     HistoryStore,
 )
 from .history import HISTORY_DATA_KEY as SCAN_HISTORY_DATA_KEY
+from .observations import OBSERVATIONS_DATA_KEY, DirectoryObservationStore
 from .scan import ScanCoordinator, ScanTarget
 
 
@@ -51,6 +52,7 @@ class Alist2Strm(_PluginBase):
 
     SECRET_DATA_KEY = "configuration_secrets_v1"
     HISTORY_DATA_KEY = SCAN_HISTORY_DATA_KEY
+    OBSERVATIONS_DATA_KEY = OBSERVATIONS_DATA_KEY
     HISTORY_RETENTION_CRON = "0 4 * * *"
     PersistenceError = ConfigurationPersistenceError
 
@@ -66,6 +68,7 @@ class Alist2Strm(_PluginBase):
         # 当前票据仅通过宿主一次性任务执行手动扫描；保存和启动不会调用它。
         self._scan_coordinator: ScanCoordinator | None = None
         self._history_store: HistoryStore | None = None
+        self._observation_store: DirectoryObservationStore | None = None
         self._history_recovery_done = False
         self._history_live_run_ids: set[str] = set()
         self._history_live_lock = threading.RLock()
@@ -438,6 +441,18 @@ class Alist2Strm(_PluginBase):
 
         task()
 
+    def _get_observation_store(self) -> DirectoryObservationStore:
+        """惰性绑定当前插件实例的 PluginData 观测分区，不触发扫描。"""
+
+        store = getattr(self, "_observation_store", None)
+        if not isinstance(store, DirectoryObservationStore):
+            store = DirectoryObservationStore(
+                lambda: self.get_data(self.OBSERVATIONS_DATA_KEY, plugin_id=self._plugin_id()),
+                lambda value: self.save_data(self.OBSERVATIONS_DATA_KEY, value, plugin_id=self._plugin_id()),
+            )
+            self._observation_store = store
+        return store
+
     def _get_scan_coordinator(self) -> ScanCoordinator:
         """惰性取得全插件唯一扫描协调器，兼容无构造函数的 seam 测试对象。"""
 
@@ -457,6 +472,7 @@ class Alist2Strm(_PluginBase):
                 max_retries=getattr(self, "_scan_max_retries", 2),
                 history_callback=self._record_scan_history,
                 history_discard=self._discard_scan_history,
+                observation_store=self._get_observation_store(),
             )
             self._scan_coordinator = coordinator
         return coordinator

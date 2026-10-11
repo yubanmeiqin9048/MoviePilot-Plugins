@@ -14,6 +14,7 @@ from app.plugins.alist2strm.config import (  # ty: ignore[unresolved-import]
     PluginConfiguration,
     build_configuration,
 )
+from app.plugins.alist2strm.observations import DirectoryObservationStore  # ty: ignore[unresolved-import]
 from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     DownloadResponse,
     HttpResponse,
@@ -2543,3 +2544,410 @@ def test_cleanup_stop_does_not_start_subsequent_mapping(tmp_path: Path) -> None:
     status = coordinator.status()
     assert status["state"] == "stopped"
     assert status["mappings"][1]["state"] == "stopped"  # type: ignore[index]
+
+
+def test_complete_scan_records_file_times_and_direct_children(tmp_path: Path) -> None:
+    """完整扫描建立本层和深层观测；非白名单参与，目录和排除项时间不参与。"""
+
+    configuration = _config(tmp_path)
+    transport = _Transport(
+        {
+            "https://scan-a.example.invalid": {
+                "/media/movies": [
+                    {"name": "film.mkv", "is_dir": False, "modified": "2024-01-01T00:00:00Z"},
+                    {"name": "notes.txt", "is_dir": False, "modified": "2024-02-01T08:00:00+08:00"},
+                    {"name": "Season", "is_dir": True, "modified": "2099-01-01T00:00:00Z"},
+                ],
+                "/media/movies/Season": [{"name": "Deep", "is_dir": True}],
+                "/media/movies/Season/Deep": [
+                    {"name": "extra.txt", "is_dir": False, "modified": "2024-03-01T00:00:00Z"}
+                ],
+            }
+        }
+    )
+    persisted: dict[str, object] = {}
+    store = DirectoryObservationStore(lambda: persisted.get("value"), lambda value: persisted.__setitem__("value", value))
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport, per_page=2),
+        media_suffix_provider=lambda: (".mkv",),
+        clock=lambda: 1_720_000_000.0,
+        observation_store=store,
+    )
+    assert coordinator.trigger(ScanTarget("a", mapping_index=1)).accepted
+    queue.run()
+
+    identity = ("a", "/media/movies", str(tmp_path / "a"))
+    root = store.directory(identity, "/media/movies")
+    assert root.direct_files.kind == "valid"
+    assert root.direct_files.modified_at == 1_706_745_600.0
+    assert root.children == ("/media/movies/Season",)
+    assert root.successful_at == 1_720_000_000.0
+    assert root.needs_check is False
+    assert store.directory(identity, "/media/movies/Season").direct_files.kind == "empty"
+    assert store.subtree(identity, "/media/movies").modified_at == 1_709_251_200.0
+    assert transport.pages("/media/movies") == [1, 2]
+    assert transport.pages("/media/movies/Season/Deep") == [1]
+    assert coordinator.status()["state"] == "success"
+    assert (tmp_path / "a" / "film.strm").exists()
+    assert not (tmp_path / "a" / "notes.txt").exists()
+    recovered = DirectoryObservationStore(lambda: persisted["value"], lambda _value: None)
+    assert recovered.directory(identity, "/media/movies") == root
+    assert recovered.subtree(identity, "/media/movies") == store.subtree(identity, "/media/movies")
+
+
+def test_plugin_observations_use_plugindata_and_restart_without_scan(tmp_path: Path) -> None:
+    """插件入口按实例保存观测，正常重启恢复事实但不提交任务。"""
+
+    from app.plugins.alist2strm import Alist2Strm  # ty: ignore[unresolved-import]
+
+    persisted: dict[str, object] = {}
+    accesses: list[tuple[str, str]] = []
+    queue = _Queue()
+    transport = _Transport({"https://scan-a.example.invalid": {"/media/movies": []}})
+
+    def plugin() -> Alist2Strm:
+        """构造共享 PluginData 的宿主实例，无真实网络。"""
+
+        result = object.__new__(Alist2Strm)
+        result._plugin_instance_id = "Alist2Strm-test"
+        result._scan_dispatch = queue
+        result._scan_clock = lambda: 1_720_000_000.0
+        result._scan_client_factory = lambda url, token: OpenListClient(url, token, transport=transport)
+        result.get_config = lambda _plugin_id=None: None
+
+        def load(key: str, plugin_id: str) -> object:
+            """记录宿主实例分区。"""
+
+            accesses.append((key, plugin_id))
+            return persisted.get(key)
+
+        result.get_data = load
+        result.save_data = lambda key, value, plugin_id=None: persisted.__setitem__(key, deepcopy(value))
+        result.init_plugin(
+            {
+                "instances": [
+                    {
+                        "id": "a",
+                        "name": "观测实例",
+                        "scan_url": "https://scan-a.example.invalid",
+                        "api_token": "test-only-placeholder",
+                        "mappings": [{"source_dir": "/media/movies", "output_dir": str(tmp_path / "a")}],
+                    }
+                ]
+            }
+        )
+        return result
+
+    first = plugin()
+    assert not queue.jobs
+    assert first.trigger_scan()["accepted"] is True
+    queue.run()
+    identity = ("a", "/media/movies", str(tmp_path / "a"))
+    assert first._get_observation_store().directory(identity, "/media/movies").successful_at == 1_720_000_000.0
+    restarted = plugin()
+    assert not queue.jobs
+    assert restarted._get_observation_store().subtree(identity, "/media/movies").kind == "empty"
+    assert restarted._get_observation_store().directory(identity, "/media/movies").needs_check is False
+    assert (first.OBSERVATIONS_DATA_KEY, "Alist2Strm-test") in accesses
+    assert "test-only-placeholder" not in str(persisted[first.OBSERVATIONS_DATA_KEY])
+
+
+def test_cleanup_failure_retains_only_owner_observation_until_recheck(tmp_path: Path) -> None:
+    """删除失败不撤销观测；仅归属目录必查，重启后重新观测再完成清理。"""
+
+    configuration = _config(tmp_path)
+    output = tmp_path / "a"
+    (output / "Season").mkdir(parents=True)
+    stale = output / "Season" / "old.strm"
+    stale.write_text("keep on failure", encoding="utf-8")
+    transport = _Transport(
+        {"https://scan-a.example.invalid": {"/media/movies": [{"name": "Season", "is_dir": True}], "/media/movies/Season": []}}
+    )
+    persisted: dict[str, object] = {}
+    now = [1_720_000_000.0]
+
+    class FileSystem(LocalFileSystem):
+        """仅首次清理删除失败。"""
+
+        def unlink(self, target: Path) -> None:
+            """模拟本地权限问题。"""
+
+            raise OSError("cannot remove")
+
+    def run(store: DirectoryObservationStore, filesystem: LocalFileSystem) -> ScanCoordinator:
+        """通过新协调器重新取得远端信息。"""
+
+        queue = _Queue()
+        coordinator = ScanCoordinator(
+            lambda: configuration,
+            dispatch=queue,
+            client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+            clock=lambda: now[0],
+            observation_store=store,
+            filesystem=filesystem,
+        )
+        assert coordinator.trigger(ScanTarget("a", mapping_index=1)).accepted
+        queue.run()
+        return coordinator
+
+    store = DirectoryObservationStore(lambda: persisted.get("value"), lambda value: persisted.__setitem__("value", value))
+    assert run(store, FileSystem()).status()["state"] == "failed"
+    identity = ("a", "/media/movies", str(output))
+    assert stale.exists()
+    assert store.directory(identity, "/media/movies").needs_check is False
+    assert store.directory(identity, "/media/movies/Season").successful_at == now[0]
+    recovered = DirectoryObservationStore(lambda: persisted["value"], lambda value: persisted.__setitem__("value", value))
+    assert recovered.directory(identity, "/media/movies/Season").needs_check is True
+    now[0] += 100
+    assert run(recovered, LocalFileSystem()).status()["state"] == "success"
+    assert not stale.exists()
+    assert recovered.directory(identity, "/media/movies/Season").successful_at == now[0]
+    assert recovered.directory(identity, "/media/movies/Season").needs_check is False
+    assert transport.pages("/media/movies/Season") == [1, 1]
+
+
+def _observation_task(
+    tmp_path: Path,
+    tree: dict[str, list[dict[str, Any]]],
+    *,
+    exclude_keywords: str = "",
+    filesystem: LocalFileSystem | None = None,
+) -> tuple[ScanCoordinator, _Queue, _Transport, DirectoryObservationStore, dict[str, object], list[float]]:
+    """复用扫描传输与调度替身，返回可推进时钟及内存持久化边界。"""
+
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "observations",
+                    "name": "观测实例",
+                    "scan_url": "https://observations.example.invalid",
+                    "api_token": "test-only-placeholder",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".srt"],
+                            "exclude_keywords": exclude_keywords,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    persisted: dict[str, object] = {}
+    store = DirectoryObservationStore(lambda: persisted.get("value"), lambda value: persisted.__setitem__("value", value))
+    queue = _Queue()
+    transport = _Transport({"https://observations.example.invalid": tree}, null_empty_content=True)
+    now = [1_720_000_000.0]
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport, per_page=1, max_retries=0),
+        media_suffix_provider=lambda: (".mkv",),
+        observation_store=store,
+        filesystem=filesystem,
+        clock=lambda: now[0],
+    )
+    return coordinator, queue, transport, store, persisted, now
+
+
+@pytest.mark.parametrize(
+    ("entries", "kind", "modified_at"),
+    [
+        ([], "empty", None),
+        ([{"name": "missing.txt", "is_dir": False}], "invalid", None),
+        ([{"name": "bad.txt", "is_dir": False, "modified": "not a time"}], "invalid", None),
+        ([{"name": "future.txt", "is_dir": False, "modified": "2099-01-01T00:00:00Z"}], "valid", 4_070_908_800.0),
+        ([{"name": "Sample.mkv", "is_dir": False}], "empty", None),
+        ([{"name": "Sample", "is_dir": True, "modified": "2099-01-01T00:00:00Z"}], "empty", None),
+    ],
+)
+def test_scan_observations_distinguish_empty_invalid_future_and_excluded(
+    tmp_path: Path, entries: list[dict[str, Any]], kind: str, modified_at: float | None
+) -> None:
+    """异常不可判空，未来保留原值，排除文件和整分支不贡献摘要。"""
+
+    coordinator, queue, transport, store, _persisted, now = _observation_task(
+        tmp_path, {"/library": entries}, exclude_keywords="Sample"
+    )
+    identity = ("observations", "/library", str(tmp_path))
+    assert store.subtree(identity, "/library").kind == "unknown"
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert coordinator.status()["state"] == "success"
+    observation = store.directory(identity, "/library")
+    assert observation.direct_files.kind == kind
+    assert observation.direct_files.modified_at == modified_at
+    assert observation.successful_at == now[0]
+    assert store.subtree(identity, "/library").kind == kind
+    assert transport.pages("/library/Sample") == []
+    assert not list(tmp_path.rglob("*.strm"))
+    # 本票不剪枝，即使空或很旧的记录已经完整建立，下一任务仍完整检查。
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert transport.pages("/library") == ([1] * 2)
+
+
+def test_scan_observations_replace_maximum_and_remove_disappeared_branch(tmp_path: Path) -> None:
+    """删除最新文件后最大值下降；确认消失分支撤销历史贡献并清理产物。"""
+
+    tree = {
+        "/library": [{"name": "Branch", "is_dir": True}],
+        "/library/Branch": [
+            {"name": "old.mkv", "is_dir": False, "modified": "2024-01-01T00:00:00Z"},
+            {"name": "latest.mkv", "is_dir": False, "modified": "2024-03-01T00:00:00Z"},
+        ],
+    }
+    coordinator, queue, transport, store, _persisted, now = _observation_task(tmp_path, tree)
+    identity = ("observations", "/library", str(tmp_path))
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert store.subtree(identity, "/library").modified_at == 1_709_251_200.0
+    tree["/library/Branch"].pop()
+    now[0] += 100
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert store.subtree(identity, "/library").modified_at == 1_704_067_200.0
+    assert not (tmp_path / "Branch" / "latest.strm").exists()
+    tree["/library"] = []
+    now[0] += 100
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert store.subtree(identity, "/library").kind == "empty"
+    assert store.directory(identity, "/library/Branch").direct_files.kind == "unknown"
+    assert not (tmp_path / "Branch" / "old.strm").exists()
+    assert transport.pages("/library/Branch") == [1, 2, 1]
+
+
+def test_failed_directory_keeps_last_observation_and_successful_siblings(tmp_path: Path) -> None:
+    """后页失败不提交半层结果；父层和兄弟成功事实保留且未清理者必查。"""
+
+    tree = {
+        "/library": [{"name": "Good", "is_dir": True}, {"name": "Bad", "is_dir": True}],
+        "/library/Good": [],
+        "/library/Bad": [{"name": "old.mkv", "is_dir": False, "modified": "2024-01-01T00:00:00Z"}],
+    }
+    coordinator, queue, transport, store, persisted, now = _observation_task(tmp_path, tree)
+    identity = ("observations", "/library", str(tmp_path))
+    assert coordinator.trigger().accepted
+    queue.run()
+    old = store.directory(identity, "/library/Bad")
+    tree["/library/Bad"] = [
+        {"name": "new.mkv", "is_dir": False, "modified": "2024-03-01T00:00:00Z"},
+        {"name": "second.txt", "is_dir": False, "modified": "2024-03-01T00:00:00Z"},
+    ]
+    original_post = transport.post_json
+
+    def post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """完整第一轮后，只让第二轮的子目录后页失败。"""
+
+        if payload["path"] == "/library/Bad" and payload["page"] == 2:
+            return HttpResponse(403, {"code": 403})
+        return original_post(url, payload, headers)
+
+    # 使用非认证失败，以验证同映射其他目录继续完成。
+    def failed_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """以不可重试的目录格式故障模拟后页不完整。"""
+
+        response = post(url, payload, headers)
+        return HttpResponse(200, {"code": 200, "data": {"content": [], "total": 2}}) if response.status_code == 403 else response
+
+    transport.post_json = failed_post
+    now[0] += 100
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert coordinator.status()["state"] == "failed"
+    assert (tmp_path / "Bad" / "old.strm").exists()
+    assert not (tmp_path / "Bad" / "new.strm").exists()
+    assert store.directory(identity, "/library/Bad").direct_files == old.direct_files
+    assert store.directory(identity, "/library/Bad").successful_at == old.successful_at
+    assert store.directory(identity, "/library/Good").successful_at == now[0]
+    assert store.directory(identity, "/library").successful_at == now[0]
+    assert store.subtree(identity, "/library").modified_at == 1_704_067_200.0
+    recovered = DirectoryObservationStore(lambda: persisted["value"], lambda _value: None)
+    for path in ("/library", "/library/Good", "/library/Bad"):
+        assert recovered.directory(identity, path).needs_check is True
+
+
+@pytest.mark.parametrize("failure", ["generation", "download"])
+def test_output_failure_does_not_submit_directory_success(tmp_path: Path, failure: str) -> None:
+    """本层产物失败不提交成功观测，也不回滚成功子层或进行映射清理。"""
+
+    class FileSystem(LocalFileSystem):
+        """只让测试指定的本层产物失败。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """模拟 STRM 创建失败。"""
+
+            if failure == "generation":
+                raise OSError("cannot write")
+            return super().write_text_atomic(target, content)
+
+        def write_bytes_atomic(self, target: Path, chunks: Any) -> bool:
+            """模拟附件原子写入失败。"""
+
+            raise OSError("cannot write")
+
+    tree = {
+        "/library": [
+            {"name": "broken.mkv" if failure == "generation" else "broken.srt", "is_dir": False, "modified": "2024-01-01T00:00:00Z"},
+            {"name": "Good", "is_dir": True},
+        ],
+        "/library/Good": [],
+    }
+    stale = tmp_path / "stale.strm"
+    stale.write_text("keep", encoding="utf-8")
+    coordinator, queue, _transport, store, _persisted, now = _observation_task(tmp_path, tree, filesystem=FileSystem())
+    identity = ("observations", "/library", str(tmp_path))
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert coordinator.status()["state"] == "failed"
+    assert stale.exists()
+    assert store.directory(identity, "/library").direct_files.kind == "unknown"
+    assert store.directory(identity, "/library").successful_at is None
+    assert store.subtree(identity, "/library").kind == "unknown"
+    assert store.directory(identity, "/library/Good").successful_at == now[0]
+    assert store.directory(identity, "/library/Good").needs_check is True
+
+
+def test_stop_preserves_started_and_unstarted_directory_observations(tmp_path: Path) -> None:
+    """停止保留旧成功时间，当前与已检查层必查，未开始层维持原状态。"""
+
+    tree = {
+        "/library": [{"name": "Unstarted", "is_dir": True}, {"name": "Current", "is_dir": True}],
+        "/library/Unstarted": [],
+        "/library/Current": [],
+    }
+    coordinator, queue, transport, store, persisted, now = _observation_task(tmp_path, tree)
+    identity = ("observations", "/library", str(tmp_path))
+    assert coordinator.trigger().accepted
+    queue.run()
+    unstarted = store.directory(identity, "/library/Unstarted")
+    current = store.directory(identity, "/library/Current")
+    original_post = transport.post_json
+
+    def stop_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
+        """本层请求返回时停止，不再开始后续处理或目录。"""
+
+        response = original_post(url, payload, headers)
+        if payload["path"] == "/library/Current":
+            coordinator.stop()
+        return response
+
+    transport.post_json = stop_post
+    now[0] += 100
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert coordinator.status()["state"] == "stopped"
+    recovered = DirectoryObservationStore(lambda: persisted["value"], lambda _value: None)
+    assert recovered.directory(identity, "/library/Unstarted") == unstarted
+    assert recovered.directory(identity, "/library/Current").successful_at == current.successful_at
+    assert recovered.directory(identity, "/library/Current").needs_check is True
+    assert recovered.directory(identity, "/library").successful_at == now[0]
+    assert recovered.directory(identity, "/library").needs_check is True
+    assert transport.pages("/library/Unstarted") == [1]
