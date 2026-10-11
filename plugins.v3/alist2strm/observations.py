@@ -41,6 +41,7 @@ class DirectoryObservation:
     children: tuple[str, ...] = ()
     successful_at: float | None = None
     needs_check: bool = True
+    recheck_at: float | None = None
 
 
 def parse_modified_time(value: object) -> float | None:
@@ -57,6 +58,16 @@ def parse_modified_time(value: object) -> float | None:
         return None
 
 
+@dataclass(frozen=True)
+class MappingConfigurationObservation:
+    """映射配置依据和最近处理的播放身份，不保留连接凭据。"""
+
+    fingerprint: str | None = None
+    needs_check: bool = True
+    playback_fingerprint: str | None = None
+    playback_needs_update: bool = False
+
+
 class DirectoryObservationStore:
     """通过 PluginData 读写最近目录观测，局部损坏只使对应目录未知。"""
 
@@ -68,6 +79,50 @@ class DirectoryObservationStore:
         self._lock = threading.RLock()
         self._loaded = False
         self._mappings: dict[MappingIdentity, dict[str, DirectoryObservation]] = {}
+        self._configurations: dict[MappingIdentity, MappingConfigurationObservation] = {}
+
+    def mapping_configuration(self, identity: MappingIdentity) -> MappingConfigurationObservation:
+        """读取映射配置依据和未完成要求；缺失状态必须重新完整处理。"""
+
+        with self._lock:
+            if not self._ensure_loaded():
+                return MappingConfigurationObservation()
+            return self._configurations.get(identity, MappingConfigurationObservation())
+
+    def begin_mapping(
+        self, identity: MappingIdentity, fingerprint: str, playback_fingerprint: str, playback_changed: bool
+    ) -> None:
+        """在映射开始前保存配置与播放身份，未完成播放更新不能随重试或改回配置丢失。"""
+
+        with self._lock:
+            if not self._ensure_loaded():
+                return
+            previous = self._configurations.get(identity, MappingConfigurationObservation())
+            self._configurations[identity] = replace(
+                previous,
+                fingerprint=fingerprint,
+                needs_check=True,
+                playback_fingerprint=playback_fingerprint,
+                playback_needs_update=previous.playback_needs_update or playback_changed,
+            )
+            self._persist()
+
+    def complete_mapping(self, identity: MappingIdentity, fingerprint: str, playback_fingerprint: str) -> bool:
+        """仅在映射清理完成后解除相同配置依据的必查标记。"""
+
+        with self._lock:
+            if not self._ensure_loaded():
+                return False
+            previous = self._configurations.get(identity)
+            if previous is None or previous.fingerprint != fingerprint:
+                return False
+            self._configurations[identity] = replace(
+                previous, needs_check=False, playback_fingerprint=playback_fingerprint, playback_needs_update=False
+            )
+            if not self._persist():
+                self._configurations[identity] = previous
+                return False
+            return True
 
     def directory(self, identity: MappingIdentity, path: str) -> DirectoryObservation:
         """读取本层观测；丢失或损坏记录按未知、待重建返回。"""
@@ -117,6 +172,7 @@ class DirectoryObservationStore:
         direct_files: FileTimeSummary,
         children: Iterable[str],
         successful_at: float,
+        recheck_at: float | None = None,
     ) -> None:
         """提交完整本层观测；确认消失分支撤销贡献，清理前仍须复查。"""
 
@@ -130,7 +186,7 @@ class DirectoryObservationStore:
                 for descendant in tuple(directories):
                     if descendant == removed or descendant.startswith(f"{removed}/"):
                         del directories[descendant]
-            directories[path] = DirectoryObservation(direct_files, child_paths, successful_at, True)
+            directories[path] = DirectoryObservation(direct_files, child_paths, successful_at, True, recheck_at)
             self._persist()
 
     def complete_cleanup(self, identity: MappingIdentity, paths: Iterable[str]) -> None:
@@ -181,6 +237,22 @@ class DirectoryObservationStore:
                         and _valid_path(path, key[1])
                         and (observation := _decode_observation(path, value)) is not None
                     }
+                    configuration = raw.get("configuration")
+                    if isinstance(configuration, Mapping):
+                        fingerprint = configuration.get("fingerprint")
+                        needs_check = configuration.get("needs_check")
+                        playback_fingerprint = configuration.get("playback_fingerprint")
+                        playback_needs_update = configuration.get("playback_needs_update", False)
+                        if (
+                            isinstance(fingerprint, str)
+                            and fingerprint
+                            and isinstance(needs_check, bool)
+                            and (playback_fingerprint is None or isinstance(playback_fingerprint, str))
+                            and isinstance(playback_needs_update, bool)
+                        ):
+                            self._configurations[key] = MappingConfigurationObservation(
+                                fingerprint, needs_check, playback_fingerprint, playback_needs_update
+                            )
         self._loaded = True
         return True
 
@@ -192,6 +264,14 @@ class DirectoryObservationStore:
             "mappings": [
                 {
                     "identity": list(identity),
+                    "configuration": {
+                        "fingerprint": configuration.fingerprint,
+                        "needs_check": configuration.needs_check,
+                        "playback_fingerprint": configuration.playback_fingerprint,
+                        "playback_needs_update": configuration.playback_needs_update,
+                    }
+                    if (configuration := self._configurations.get(identity)) is not None
+                    else None,
                     "directories": {
                         path: {
                             "direct_files": {
@@ -201,11 +281,12 @@ class DirectoryObservationStore:
                             "children": list(value.children),
                             "successful_at": value.successful_at,
                             "needs_check": value.needs_check,
+                            "recheck_at": value.recheck_at,
                         }
-                        for path, value in directories.items()
+                        for path, value in self._mappings.get(identity, {}).items()
                     },
                 }
-                for identity, directories in self._mappings.items()
+                for identity in sorted(set(self._mappings) | set(self._configurations))
             ],
         }
         try:
@@ -272,4 +353,13 @@ def _decode_observation(path: str, value: object) -> DirectoryObservation | None
         summary = FileTimeSummary(kind)
     else:
         return None
-    return DirectoryObservation(summary, tuple(children), float(successful_at), needs_check)
+    recheck_at = value.get("recheck_at")
+    if recheck_at is not None and (not _finite_time(recheck_at) or recheck_at < successful_at):
+        return None
+    return DirectoryObservation(
+        summary,
+        tuple(children),
+        float(successful_at),
+        needs_check,
+        float(recheck_at) if recheck_at is not None else None,
+    )

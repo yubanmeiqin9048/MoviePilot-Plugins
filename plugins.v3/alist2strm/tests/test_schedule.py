@@ -405,3 +405,48 @@ def test_stopping_plugin_exposes_no_periodic_service_and_releases_scan() -> None
 
     assert plugin.get_service() == []
     assert plugin.get_scan_status()["state"] == "idle"
+
+
+def test_manual_and_scheduled_scans_share_single_layer_pruning_deadline(tmp_path: Path) -> None:
+    """手动和定时入口共用持久化期限，跳过不清理，到期由实际回调复查。"""
+
+    plugin = _plugin(_payload(enabled=True, output_dir=str(tmp_path)))
+    queue = _Queue()
+    now = [1_720_000_000.0]
+    calls: list[str] = []
+    data: dict[str, object] = {}
+
+    class Reader:
+        """返回四十天前文件，不访问网络。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """记录是否真的发起列目录操作。"""
+
+            calls.append(path)
+            return [RemoteEntry("Film.mkv", False, 1_720_000_000.0 - 40 * 86400)]
+
+    plugin._scan_dispatch = queue
+    plugin._scan_client_factory = lambda _url, _token: Reader()
+    plugin._scan_media_suffix_provider = lambda: (".mkv",)
+    plugin._scan_whitelist_suffix_provider = lambda: (".mkv",)
+    plugin._scan_clock = lambda: now[0]
+    plugin.get_data = lambda key, plugin_id=None: data.get(key)
+    plugin.save_data = lambda key, value, plugin_id=None: data.__setitem__(key, value)
+
+    assert plugin.trigger_scan()["accepted"] is True
+    queue.run_one()
+    assert calls == ["/library"]
+    orphan = tmp_path / "removed.strm"
+    orphan.write_text("protected until checked", encoding="utf-8")
+    service = next(item for item in plugin.get_service() if item["id"] == "shared-scan")
+    now[0] += 7 * 86400 - 1
+    service["func"]()
+    queue.run_one()
+    assert calls == ["/library"]
+    assert orphan.exists()
+    now[0] += 1
+    service["func"]()
+    queue.run_one()
+    assert calls == ["/library", "/library"]
+    assert not orphan.exists()
+    assert plugin.scan_invocations == 3

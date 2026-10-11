@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -2598,6 +2599,69 @@ def test_complete_scan_records_file_times_and_direct_children(tmp_path: Path) ->
     assert recovered.subtree(identity, "/media/movies") == store.subtree(identity, "/media/movies")
 
 
+def test_single_layer_pruning_skips_remote_listing_and_protects_unscanned_outputs(tmp_path: Path) -> None:
+    """单层映射未到复查期限时跳过远端列目录并保护未覆盖产物。"""
+
+    now = [1_720_000_000.0]
+    old_modified = now[0] - 40 * 24 * 60 * 60
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "pruning",
+                    "name": "剪枝实例",
+                    "scan_url": "https://pruning.example.invalid",
+                    "api_token": "test-only-placeholder",
+                    "mappings": [{"source_dir": "/library", "output_dir": str(tmp_path)}],
+                }
+            ]
+        }
+    )
+    transport = _Transport(
+        {
+            "https://pruning.example.invalid": {
+                "/library": [
+                    {
+                        "name": "Film.mkv",
+                        "is_dir": False,
+                        "modified": "2024-05-06T00:00:00Z",
+                    }
+                ]
+            }
+        }
+    )
+    # 由独立于生产逻辑的绝对时间构造 40 天前的远端时间。
+    transport.trees["https://pruning.example.invalid"]["/library"][0]["modified"] = datetime.fromtimestamp(
+        old_modified, tz=UTC
+    ).isoformat()
+    persisted: dict[str, object] = {}
+    store = DirectoryObservationStore(lambda: persisted.get("value"), lambda value: persisted.__setitem__("value", value))
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+        clock=lambda: now[0],
+        observation_store=store,
+    )
+
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert transport.pages("/library") == [1]
+
+    protected = tmp_path / "old.strm"
+    protected.write_text("keep while library is unscanned", encoding="utf-8")
+    transport.calls.clear()
+    now[0] += 24 * 60 * 60
+
+    assert coordinator.trigger().accepted
+    queue.run()
+
+    assert transport.calls == []
+    assert protected.read_text(encoding="utf-8") == "keep while library is unscanned"
+    assert coordinator.status()["state"] == "success"
+
+
 def test_plugin_observations_use_plugindata_and_restart_without_scan(tmp_path: Path) -> None:
     """插件入口按实例保存观测，正常重启恢复事实但不提交任务。"""
 
@@ -2787,10 +2851,11 @@ def test_scan_observations_distinguish_empty_invalid_future_and_excluded(
     assert store.subtree(identity, "/library").kind == kind
     assert transport.pages("/library/Sample") == []
     assert not list(tmp_path.rglob("*.strm"))
-    # 本票不剪枝，即使空或很旧的记录已经完整建立，下一任务仍完整检查。
+    # 空层按期剪枝；异常或未来时间仍完整检查，且排除分支从不列目录。
     assert coordinator.trigger().accepted
     queue.run()
-    assert transport.pages("/library") == ([1] * 2)
+    assert transport.pages("/library") == ([1] if kind == "empty" else [1, 1])
+    assert transport.pages("/library/Sample") == []
 
 
 def test_scan_observations_replace_maximum_and_remove_disappeared_branch(tmp_path: Path) -> None:
@@ -2951,3 +3016,578 @@ def test_stop_preserves_started_and_unstarted_directory_observations(tmp_path: P
     assert recovered.directory(identity, "/library").successful_at == now[0]
     assert recovered.directory(identity, "/library").needs_check is True
     assert transport.pages("/library/Unstarted") == [1]
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "interval_days"),
+    [
+        (30 * 86400 - 1, 0),
+        (30 * 86400, 0),
+        (30 * 86400 + 1, 7),
+        (90 * 86400 - 1, 7),
+        (90 * 86400, 7),
+        (90 * 86400 + 1, 30),
+        (365 * 86400 - 1, 30),
+        (365 * 86400, 30),
+        (365 * 86400 + 1, 90),
+    ],
+)
+def test_single_layer_recheck_uses_exact_age_and_deadline_boundaries(
+    tmp_path: Path, age_seconds: int, interval_days: int
+) -> None:
+    """成功检查时分档，精确期限到达即查，等待跨档不后移期限。"""
+
+    modified = datetime.fromtimestamp(1_720_000_000 - age_seconds, tz=UTC).isoformat()
+    coordinator, queue, transport, _store, _persisted, now = _observation_task(
+        tmp_path, {"/library": [{"name": "Film.mkv", "is_dir": False, "modified": modified}]}
+    )
+    assert coordinator.trigger().accepted
+    queue.run()
+    transport.calls.clear()
+    if interval_days:
+        now[0] += interval_days * 86400 - 1
+        assert coordinator.trigger().accepted
+        queue.run()
+        assert transport.calls == []
+        now[0] += 1
+    else:
+        now[0] += 1
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert transport.pages("/library") == [1]
+    assert coordinator.status()["state"] == "success"
+
+
+class _PruningTasks:
+    """以公开任务入口驱动持久化、配置保存、受控远端和重启。"""
+
+    def __init__(self, output: Path) -> None:
+        """建立可连续运行的单层映射，不访问真实网络。"""
+
+        self.configuration: dict[str, Any] = {
+            "instances": [
+                {
+                    "id": "pruning",
+                    "name": "剪枝实例",
+                    "scan_url": "https://pruning.example.invalid",
+                    "playback_url": "https://play-old.example.invalid",
+                    "api_token": "test-only-placeholder",
+                    "mappings": [
+                        {
+                            "source_dir": "/library",
+                            "output_dir": str(output),
+                            "whitelist_mode": "custom",
+                            "extensions": [".mkv", ".srt"],
+                        }
+                    ],
+                }
+            ]
+        }
+        self.tree: dict[str, list[dict[str, Any]]] = {
+            "/library": [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+        }
+        self.transport = _Transport({"https://pruning.example.invalid": self.tree})
+        self.persisted: dict[str, object] = {}
+        self.now = [1_720_000_000.0]
+        self.queue = _Queue()
+        self.restart()
+
+    def restart(self, filesystem: LocalFileSystem | None = None) -> None:
+        """用共享持久化边界重建协调器；重启本身不启动任务。"""
+
+        store = DirectoryObservationStore(
+            lambda: self.persisted.get("value"),
+            lambda value: self.persisted.__setitem__("value", deepcopy(value)),
+        )
+        self.coordinator = ScanCoordinator(
+            lambda: build_configuration(self.configuration),
+            dispatch=self.queue,
+            client_factory=lambda url, token: OpenListClient(url, token, transport=self.transport, per_page=2),
+            media_suffix_provider=lambda: (".mkv",),
+            clock=lambda: self.now[0],
+            filesystem=filesystem,
+            observation_store=store,
+        )
+
+    def run(self) -> None:
+        """显式触发普通任务并执行捕获的宿主回调。"""
+
+        assert self.coordinator.trigger().accepted
+        self.queue.run()
+
+
+def test_pruning_selection_change_does_not_update_existing_strm(tmp_path: Path) -> None:
+    """白名单变更使冷映射完整检查，但不把选择失效误当播放地址变化。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    target = tmp_path / "Film.strm"
+    target.write_text("handmade content", encoding="utf-8")
+    tasks.configuration["instances"][0]["mappings"][0]["extensions"].append(".txt")
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert target.read_text(encoding="utf-8") == "handmade content"
+    assert tasks.coordinator.status()["counters"]["updated"] == 0  # type: ignore[index]
+
+
+def test_pruning_empty_mapping_rechecks_at_seven_days_and_cleans_checked_range(tmp_path: Path) -> None:
+    """空层期限为七个 24 小时；未扫描保留、到期完整检查后清理。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"] = []
+    tasks.run()
+    orphan = tmp_path / "orphan.strm"
+    orphan.write_text("keep until checked", encoding="utf-8")
+    tasks.now[0] += 7 * 86400 - 1
+    tasks.restart()
+    tasks.transport.calls.clear()
+    before = deepcopy(tasks.persisted)
+    tasks.run()
+    assert tasks.transport.calls == []
+    assert tasks.persisted == before
+    assert orphan.exists()
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert not orphan.exists()
+
+
+def test_pruning_deadline_starts_after_layer_processing_not_task_start(tmp_path: Path) -> None:
+    """本层处理耗时不吃掉复查间隔，排队等待也不改变已建立期限。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(tasks.now[0] - 40 * 86400, tz=UTC).isoformat()
+
+    class SlowWrite(LocalFileSystem):
+        """在本地写入边界推进受控时钟。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """完成一次原子写入后模拟两天处理耗时。"""
+
+            created = super().write_text_atomic(target, content)
+            tasks.now[0] += 2 * 86400
+            return created
+
+    tasks.restart(SlowWrite())
+    tasks.run()
+    successful_at = tasks.now[0]
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] = successful_at + 7 * 86400 - 1
+    tasks.run()
+    assert tasks.transport.calls == []
+    # 任务排队后再到期，执行时应检查而不是重设期限。
+    assert tasks.coordinator.trigger().accepted
+    tasks.now[0] = successful_at + 7 * 86400
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+
+
+@pytest.mark.parametrize("change", ["playback", "source", "output", "whitelist", "exclude"])
+def test_pruning_relevant_configuration_changes_force_complete_mapping(tmp_path: Path, change: str) -> None:
+    """五类相关配置变更在重启后仍使未到期冷映射完整处理。"""
+
+    old_output = tmp_path / "old"
+    tasks = _PruningTasks(old_output)
+    tasks.run()
+    tasks.transport.calls.clear()
+    instance = tasks.configuration["instances"][0]
+    mapping = instance["mappings"][0]
+    if change == "playback":
+        instance["playback_url"] = "https://play-new.example.invalid"
+    elif change == "source":
+        mapping["source_dir"] = "/new-library"
+        tasks.tree["/new-library"] = deepcopy(tasks.tree["/library"])
+    elif change == "output":
+        mapping["output_dir"] = str(tmp_path / "new")
+    elif change == "whitelist":
+        mapping["extensions"] = [".srt"]
+    else:
+        mapping["exclude_keywords"] = "Film"
+    tasks.restart()
+    tasks.run()
+    assert tasks.transport.pages(mapping["source_dir"]) == [1]
+    old_target = old_output / "Film.strm"
+    if change == "playback":
+        assert old_target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
+        assert tasks.coordinator.status()["counters"]["updated"] == 1  # type: ignore[index]
+    elif change == "exclude":
+        # 关键字排除仍按旧清理规则删除，不享受时间剪枝保护。
+        assert not old_target.exists()
+    else:
+        # 退出受管后缀范围或迁移根目录不会回溯删除已有产物。
+        assert old_target.exists()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+def test_pruning_unrelated_configuration_and_unstarted_stop_preserve_deadline(tmp_path: Path) -> None:
+    """计划、历史和名称配置不失效，未开始的停止任务也不修改已有计划。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    tasks.configuration.update({"schedule_cron": "0 1 * * *", "history_retention_days": 1})
+    tasks.configuration["instances"][0]["name"] = "改名"
+    tasks.restart()
+    tasks.transport.calls.clear()
+    before = deepcopy(tasks.persisted)
+    assert tasks.coordinator.trigger().accepted
+    assert tasks.coordinator.stop().accepted
+    tasks.queue.run()
+    tasks.run()
+    assert tasks.transport.calls == []
+    assert tasks.persisted == before
+
+
+def test_pruning_old_task_snapshot_does_not_clear_new_configuration_requirement(tmp_path: Path) -> None:
+    """已排队任务只应用自身快照；成功后新播放配置仍必须完整执行。"""
+
+    tasks = _PruningTasks(tmp_path)
+    assert tasks.coordinator.trigger().accepted
+    tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+    tasks.queue.run()
+    target = tmp_path / "Film.strm"
+    assert target.read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Film.mkv"
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert target.read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
+
+
+def test_pruning_mappings_with_descendants_stay_complete_and_discover_new_branches(tmp_path: Path) -> None:
+    """到期发现新分支后完整处理；保存有后代的映射每次仍完整扫描。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"] = []
+    tasks.run()
+    tasks.tree["/library"] = [{"name": "Season", "is_dir": True}]
+    tasks.tree["/library/Season"] = [{"name": "Episode.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    tasks.now[0] += 7 * 86400
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == [1]
+    assert (tmp_path / "Season" / "Episode.strm").exists()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == [1]
+
+
+@pytest.mark.parametrize("missing", ["all", "root", "configuration"])
+def test_pruning_missing_state_requires_complete_check(tmp_path: Path, missing: str) -> None:
+    """丢失全部状态、根层观测或配置依据都不能继续使用旧剪枝资格。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    if missing == "all":
+        tasks.persisted.clear()
+    else:
+        payload = tasks.persisted["value"]
+        assert isinstance(payload, dict)
+        mapping = payload["mappings"][0]
+        if missing == "root":
+            mapping["directories"].clear()
+        else:
+            mapping.pop("configuration")
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+
+
+@pytest.mark.parametrize("failure", ["listing", "write", "download", "cleanup", "cleanup_listing"])
+def test_pruning_failed_work_rechecks_after_restart_without_waiting_new_deadline(tmp_path: Path, failure: str) -> None:
+    """到期失败或观测成功后清理失败，重启立即重查而不等待新的冷期限。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    tasks.now[0] += 90 * 86400
+    orphan = tmp_path / "orphan.strm"
+    orphan.write_text("keep on failed mapping", encoding="utf-8")
+    if failure == "listing":
+        del tasks.tree["/library"]
+    elif failure == "write":
+        (tmp_path / "Film.strm").unlink()
+    elif failure == "download":
+        tasks.tree["/library"].append(
+            {"name": "Film.srt", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}
+        )
+        tasks.transport.stream_factory = lambda _url, _headers: DownloadResponse(status_code=403, body=())
+
+    class BrokenFileSystem(LocalFileSystem):
+        """在本地 I/O 边界注入一种失败，不触及扫描内部方法。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """仅模拟目标创建失败。"""
+
+            if failure == "write":
+                raise OSError("controlled creation failure")
+            return super().write_text_atomic(target, content)
+
+        def unlink(self, target: Path) -> None:
+            """仅模拟清理删除失败。"""
+
+            if failure == "cleanup":
+                raise OSError("controlled cleanup failure")
+            super().unlink(target)
+
+        def iter_files(self, root: Path) -> list[Path]:
+            """仅模拟清理枚举失败。"""
+
+            if failure == "cleanup_listing":
+                raise OSError("controlled enumeration failure")
+            return list(super().iter_files(root))
+
+    tasks.restart(BrokenFileSystem())
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.coordinator.status()["state"] in {"failed", "partial_failure"}
+    assert orphan.exists()
+    # 成功观测必须可提交，但未完成 owner 仍必查；这不是失败回滚全部事实。
+    if failure in {"cleanup", "cleanup_listing"}:
+        recovered = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None)
+        observation = recovered.directory(("pruning", "/library", str(tmp_path)), "/library")
+        assert observation.successful_at == tasks.now[0]
+        assert observation.needs_check
+    if failure == "listing":
+        tasks.tree["/library"] = [
+            {"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}
+        ]
+    tasks.transport.stream_factory = None
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += 1
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"
+    assert not orphan.exists()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+@pytest.mark.parametrize("interruption", ["processing_stop", "cleanup_stop", "crash"])
+def test_pruning_interrupted_work_remains_required_across_restart(tmp_path: Path, interruption: str) -> None:
+    """正在处理或清理时停止以及进程中断，都保留必查并重新取得源信息。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.run()
+    # 提前配置失效触发处理，不依赖原来的九十天期限。
+    tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+    orphan = tmp_path / "orphan.strm"
+    orphan.write_text("keep until successful cleanup", encoding="utf-8")
+
+    class InterruptingFileSystem(LocalFileSystem):
+        """在原子 I/O 结束后注入停止或非异常捕获的进程退出。"""
+
+        def replace_text_atomic(self, target: Path, content: str) -> None:
+            """写入完成后停止或模拟进程退出。"""
+
+            super().replace_text_atomic(target, content)
+            if interruption == "processing_stop":
+                assert tasks.coordinator.stop().accepted
+            elif interruption == "crash":
+                raise SystemExit("controlled process interruption")
+
+        def unlink(self, target: Path) -> None:
+            """清理一项完成后请求停止。"""
+
+            super().unlink(target)
+            if interruption == "cleanup_stop":
+                assert tasks.coordinator.stop().accepted
+
+    tasks.restart(InterruptingFileSystem())
+    if interruption == "crash":
+        with pytest.raises(SystemExit, match="controlled process interruption"):
+            tasks.run()
+    else:
+        tasks.run()
+        assert tasks.coordinator.status()["state"] == "stopped"
+    if interruption != "cleanup_stop":
+        assert orphan.exists()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"
+    assert not orphan.exists()
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+def test_pruning_playback_failure_retains_full_update_requirement_after_restart(tmp_path: Path) -> None:
+    """新播放地址部分更新后失败，持久化要求使重启立即完整重试剩余目标。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].append({"name": "Other.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"})
+    tasks.run()
+    tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+
+    class PartialUpdate(LocalFileSystem):
+        """只让第二个播放地址原子更新失败。"""
+
+        def replace_text_atomic(self, target: Path, content: str) -> None:
+            """保留第二个已有目标内容。"""
+
+            if target.name == "Other.strm":
+                raise OSError("controlled update failure")
+            super().replace_text_atomic(target, content)
+
+    tasks.restart(PartialUpdate())
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "partial_failure"
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
+    assert (tmp_path / "Other.strm").read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Other.mkv"
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert (tmp_path / "Other.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Other.mkv"
+
+
+def test_pruning_coverage_protects_cold_mapping_and_cleans_checked_mapping(tmp_path: Path) -> None:
+    """普通任务按映射覆盖保护未扫描产物，另一已检查映射照常清理。"""
+
+    cold_output = tmp_path / "cold"
+    active_output = tmp_path / "active"
+    tasks = _PruningTasks(cold_output)
+    tasks.configuration["instances"][0]["mappings"].append(
+        {
+            "source_dir": "/active",
+            "output_dir": str(active_output),
+            "whitelist_mode": "custom",
+            "extensions": [".mkv"],
+        }
+    )
+    tasks.tree["/active"] = [
+        {"name": "New.mkv", "is_dir": False, "modified": datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()}
+    ]
+    tasks.run()
+    cold_orphan = cold_output / "old.strm"
+    active_orphan = active_output / "old.strm"
+    cold_orphan.write_text("unscanned", encoding="utf-8")
+    active_orphan.write_text("checked", encoding="utf-8")
+    tasks.transport.calls.clear()
+    tasks.restart()
+    tasks.run()
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/active") == [1]
+    assert cold_orphan.exists()
+    assert not active_orphan.exists()
+    assert tasks.coordinator.status()["counters"]["deleted"] == 1  # type: ignore[index]
+
+
+def test_pruning_reverting_failed_playback_change_restores_all_existing_strm(tmp_path: Path) -> None:
+    """播放地址部分更新失败后改回旧配置，重启仍修复已经写入的新地址。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].append({"name": "Other.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"})
+    tasks.run()
+    tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+
+    class PartialUpdate(LocalFileSystem):
+        """让第二个目标更新失败，保留第一项更新结果。"""
+
+        def replace_text_atomic(self, target: Path, content: str) -> None:
+            """在本地更新边界注入失败。"""
+
+            if target.name == "Other.strm":
+                raise OSError("controlled update failure")
+            super().replace_text_atomic(target, content)
+
+    tasks.restart(PartialUpdate())
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "partial_failure"
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
+
+    tasks.configuration["instances"][0]["playback_url"] = "https://play-old.example.invalid"
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Film.mkv"
+    assert (tmp_path / "Other.strm").read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Other.mkv"
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+
+def test_pruning_playback_change_after_failed_first_scan_updates_created_strm(tmp_path: Path) -> None:
+    """首次处理部分创建后失败，再改播放地址仍更新已创建目标并完成缺失目标。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"].append({"name": "Other.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"})
+
+    class PartialCreation(LocalFileSystem):
+        """在首次创建的第二项注入失败。"""
+
+        def write_text_atomic(self, target: Path, content: str) -> bool:
+            """保留第一项正常创建的结果。"""
+
+            if target.name == "Other.strm":
+                raise OSError("controlled creation failure")
+            return super().write_text_atomic(target, content)
+
+    tasks.restart(PartialCreation())
+    tasks.run()
+    assert tasks.coordinator.status()["state"] == "partial_failure"
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Film.mkv"
+    assert not (tmp_path / "Other.strm").exists()
+
+    tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"
+    assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
+    assert (tmp_path / "Other.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Other.mkv"
+
+
+def test_pruning_stop_during_incomplete_marker_does_not_start_remote_client(tmp_path: Path) -> None:
+    """未完成标记保存时收到停止，随后不开始远端操作，重启重新取得源信息。"""
+
+    tasks = _PruningTasks(tmp_path)
+    opened: list[str] = []
+
+    def save_and_stop(value: object) -> None:
+        """在持久化 I/O 边界保存标记并请求停止。"""
+
+        tasks.persisted["value"] = deepcopy(value)
+        assert tasks.coordinator.stop().accepted
+
+    def open_client(url: str, token: str) -> OpenListClient:
+        """记录远端资源是否在停止后被打开。"""
+
+        opened.append(url)
+        return OpenListClient(url, token, transport=tasks.transport)
+
+    tasks.coordinator = ScanCoordinator(
+        lambda: build_configuration(tasks.configuration),
+        dispatch=tasks.queue,
+        client_factory=open_client,
+        media_suffix_provider=lambda: (".mkv",),
+        clock=lambda: tasks.now[0],
+        observation_store=DirectoryObservationStore(lambda: tasks.persisted.get("value"), save_and_stop),
+    )
+    tasks.run()
+
+    assert tasks.coordinator.status()["state"] == "stopped"
+    assert opened == []
+    assert tasks.transport.calls == []
+    tasks.restart()
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"

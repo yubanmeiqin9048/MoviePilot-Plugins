@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import stat
 import tempfile
@@ -20,7 +22,12 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 
 from .config import PluginConfiguration
-from .observations import DirectoryObservationStore, FileTimeSummary, parse_modified_time
+from .observations import (
+    DirectoryObservationStore,
+    FileTimeSummary,
+    MappingConfigurationObservation,
+    parse_modified_time,
+)
 
 FS_LIST_PATH = "/api/fs/list"
 LIST_PER_PAGE = 100
@@ -758,6 +765,10 @@ class _MappingRun:
     expected_output_identities: set[Path] = field(default_factory=set)
     expected_output_resolution_failed: bool = False
     checked_directories: set[str] = field(default_factory=set)
+    unscanned_directories: set[str] = field(default_factory=set)
+    configuration_fingerprint: str = ""
+    playback_fingerprint: str = ""
+    configuration_required: bool = False
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -1128,12 +1139,40 @@ class ScanCoordinator:
                     source_dir=mapping.source_dir,
                     output_dir=mapping.output_dir,
                 )
-                identity = (instance.id, mapping.source_dir, mapping.output_dir)
                 effective_playback_url = instance.effective_playback_url
                 allowed_suffixes = (
                     host_whitelist
                     if mapping.whitelist_mode == "follow_host"
                     else self._normalise_values(mapping.extensions)
+                )
+                identity = (instance.id, mapping.source_dir, mapping.output_dir)
+                configuration_fingerprint = self._mapping_configuration_fingerprint(
+                    instance.effective_playback_url,
+                    mapping.source_dir,
+                    mapping.output_dir,
+                    allowed_suffixes,
+                    tuple(mapping.exclude_keywords),
+                )
+                previous_configuration = (
+                    self._observation_store.mapping_configuration(identity)
+                    if self._observation_store is not None
+                    else MappingConfigurationObservation()
+                )
+                playback_fingerprint = hashlib.sha256(effective_playback_url.encode()).hexdigest()
+                configuration_required = self._observation_store is not None and (
+                    previous_configuration.fingerprint != configuration_fingerprint
+                    or previous_configuration.needs_check
+                )
+                playback_changed = (
+                    previous_configuration.playback_needs_update
+                    or playback_address_changed(
+                        self._last_playback_urls.get(identity),
+                        effective_playback_url,
+                    )
+                    or (
+                        previous_configuration.playback_fingerprint is not None
+                        and previous_configuration.playback_fingerprint != playback_fingerprint
+                    )
                 )
                 mappings.append(
                     _MappingRun(
@@ -1147,10 +1186,10 @@ class ScanCoordinator:
                         mapping_index=mapping_index,
                         allowed_suffixes=allowed_suffixes,
                         exclude_keywords=tuple(mapping.exclude_keywords),
-                        playback_changed=playback_address_changed(
-                            self._last_playback_urls.get(identity),
-                            effective_playback_url,
-                        ),
+                        playback_changed=playback_changed,
+                        configuration_fingerprint=configuration_fingerprint,
+                        playback_fingerprint=playback_fingerprint,
+                        configuration_required=configuration_required,
                         status=status,
                     )
                 )
@@ -1164,6 +1203,69 @@ class ScanCoordinator:
             started_at=self._clock(),
             run_id=uuid.uuid4().hex,
             cleanup_disqualified=cleanup_disqualified,
+        )
+
+    @staticmethod
+    def _mapping_configuration_fingerprint(
+        playback_url: str,
+        source_dir: str,
+        output_dir: str,
+        allowed_suffixes: frozenset[str],
+        exclude_keywords: tuple[str, ...],
+    ) -> str:
+        """生成不含凭据的映射配置依据，供重启后判断剪枝是否失效。"""
+
+        snapshot = json.dumps(
+            {
+                "playback_url": playback_url,
+                "source_dir": source_dir,
+                "output_dir": output_dir,
+                "allowed_suffixes": sorted(allowed_suffixes),
+                "exclude_keywords": list(exclude_keywords),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(snapshot.encode()).hexdigest()
+
+    @staticmethod
+    def _pruning_interval(summary: FileTimeSummary, now: float) -> float | None:
+        """按子树最新文件时间返回单层映射复查间隔；异常状态不剪枝。"""
+
+        if summary.kind == "empty":
+            return 7 * 24 * 60 * 60
+        if summary.kind != "valid" or summary.modified_at is None or summary.modified_at > now:
+            return None
+        age = now - summary.modified_at
+        if age <= 30 * 24 * 60 * 60:
+            return 0
+        if age <= 90 * 24 * 60 * 60:
+            return 7 * 24 * 60 * 60
+        if age <= 365 * 24 * 60 * 60:
+            return 30 * 24 * 60 * 60
+        return 90 * 24 * 60 * 60
+
+    def _can_prune_mapping(self, mapping: _MappingRun) -> bool:
+        """判断无后代的完整单层映射是否尚未到本轮复查期限。"""
+
+        store = self._observation_store
+        if store is None or mapping.configuration_required:
+            return False
+        observation = store.directory(mapping.identity, mapping.source_dir)
+        if observation.needs_check or observation.children or observation.successful_at is None:
+            return False
+        now = self._clock()
+        summary = store.subtree(mapping.identity, mapping.source_dir)
+        # 档位以成功结束时的年龄固定；等待变冷不能后移已经建立的期限。
+        interval = self._pruning_interval(summary, observation.successful_at)
+        return (
+            observation.successful_at <= now
+            and interval is not None
+            and interval > 0
+            and observation.recheck_at is not None
+            and observation.recheck_at <= observation.successful_at + interval
+            and now < observation.recheck_at
         )
 
     @staticmethod
@@ -1221,11 +1323,22 @@ class ScanCoordinator:
                     run.current_mapping = mapping.label
                 self._notify_history(run)
                 try:
+                    self._observe_stop(run)
                     if mapping.instance_id in failed_instances:
                         self._mark_mapping_failed(mapping, "实例认证或权限失败，已跳过该实例剩余映射")
                         continue
+                    if self._can_prune_mapping(mapping):
+                        mapping.unscanned_directories.add(mapping.source_dir)
+                    elif self._observation_store is not None:
+                        self._observation_store.begin_mapping(
+                            mapping.identity,
+                            mapping.configuration_fingerprint,
+                            mapping.playback_fingerprint,
+                            mapping.playback_changed,
+                        )
+                    self._observe_stop(run)
                     reader = readers.get(mapping.instance_id)
-                    if reader is None:
+                    if reader is None and not mapping.unscanned_directories:
                         if not mapping.token:
                             raise OpenListError(
                                 "实例未配置管理员 API Token",
@@ -1253,6 +1366,16 @@ class ScanCoordinator:
                             if not mapping.status.error:
                                 mapping.status.error = "映射内存在失败操作"
                         else:
+                            if (
+                                mapping.status.cleanup_eligible
+                                and not mapping.unscanned_directories
+                                and self._observation_store is not None
+                            ):
+                                self._observation_store.complete_mapping(
+                                    mapping.identity,
+                                    mapping.configuration_fingerprint,
+                                    mapping.playback_fingerprint,
+                                )
                             self._remember_playback_identity(mapping)
                             mapping.status.state = "success"
                             mapping.status.cleanup_eligible = (
@@ -1368,6 +1491,8 @@ class ScanCoordinator:
     def _scan_mapping(self, reader: Any, mapping: _MappingRun, video_suffixes: frozenset[str]) -> None:
         """按任务快照递归筛选并生成视频 STRM 或下载其他白名单文件。"""
 
+        if mapping.unscanned_directories:
+            return
         pending = [mapping.source_dir]
         while pending:
             self._observe_stop(self._run_for_mapping(mapping))
@@ -1452,7 +1577,16 @@ class ScanCoordinator:
                     self._record_mapping_error(mapping, f"文件处理失败：{error}")
             self._observe_stop(self._run_for_mapping(mapping))
             if mapping.status.counters.failed == failed_before and self._observation_store is not None:
-                self._observation_store.record_success(mapping.identity, current, direct_files, children, self._clock())
+                successful_at = self._clock()
+                interval = self._pruning_interval(direct_files, successful_at)
+                self._observation_store.record_success(
+                    mapping.identity,
+                    current,
+                    direct_files,
+                    children,
+                    successful_at,
+                    successful_at + interval if interval is not None else None,
+                )
                 mapping.checked_directories.add(current)
 
     def _remember_expected_output(self, mapping: _MappingRun, target: Path) -> None:
@@ -1481,6 +1615,9 @@ class ScanCoordinator:
                 f"Alist2Strm 已跳过受管产物清理：实例“{mapping.instance_name}”，"
                 f"映射 {mapping.mapping_index}（{mapping.source_dir}），解析后的输出目录存在重叠"
             )
+            return
+
+        if mapping.unscanned_directories:
             return
 
         managed_suffixes = self._managed_output_suffixes(mapping.allowed_suffixes, run.video_suffixes)
