@@ -87,6 +87,86 @@ function mountPage(api) {
   return { rootNode, unmount: () => app.unmount() }
 }
 
+function mountConfig(api, initialConfig = {}) {
+  const configPath = path.join(root, 'src/components/Config.vue')
+  const app = renderer.createApp(loadModule(configPath).default, { api, initialConfig, pluginId: 'Alist2Strm-test' })
+  const componentNames = new Set(fs.readFileSync(configPath, 'utf8').match(/\bV[A-Z][A-Za-z]+/g))
+  for (const name of componentNames) {
+    app.component(name, {
+      inheritAttrs: false,
+      setup(_props, { attrs, slots }) {
+        return () => vue.h(name === 'VBtn' ? 'button' : 'div', attrs, slots.default?.())
+      },
+    })
+  }
+  const rootNode = element('root')
+  app.mount(rootNode)
+  return { rootNode, unmount: () => app.unmount() }
+}
+
+test('Config edits all pruning times and retains the draft on save failure', async () => {
+  const calls = []
+  let fail = true
+  const config = mountConfig({
+    async put(url, payload) {
+      calls.push({ url, payload })
+      if (fail) throw new Error('保存失败，请重试')
+      return { success: true, data: payload }
+    },
+  })
+  try {
+    await click(button(config.rootNode, '通用设置'))
+    const fields = all(config.rootNode, (node) => node.props.suffix === '天' && node.props.hint)
+    assert.deepEqual(fields.map((node) => node.props.modelValue), [30, 7, 90, 7, 365, 30, 90])
+    const values = [5, 3, 12, 2, 20, 4, 6]
+    fields.forEach((node, index) => node.props['onUpdate:modelValue'](values[index]))
+    await settle()
+    await click(button(config.rootNode, '保存'))
+    assert.match(text(config.rootNode), /保存失败，请重试/)
+    assert.deepEqual(fields.map((node) => node.props.modelValue), values)
+    fail = false
+    await click(button(config.rootNode, '保存'))
+    assert.deepEqual(calls[1], {
+      url: 'plugin/Alist2Strm-test/config',
+      payload: {
+        instances: [], schedule_enabled: false, schedule_cron: '0 3 * * *', history_retention_days: 90,
+        time_pruning: {
+          recent_days: 5, cold_after_days: 12, archive_after_days: 20,
+          stale_recheck_days: 2, cold_recheck_days: 4, archive_recheck_days: 6, empty_recheck_days: 3,
+        },
+      },
+    })
+    assert.equal(button(config.rootNode, '保存').props.disabled, true)
+  } finally {
+    config.unmount()
+  }
+})
+
+test('Config loads saved pruning times and prevents saving invalid days or ordering', async () => {
+  let puts = 0
+  const config = mountConfig({ put: async () => { puts += 1 } }, { time_pruning: {
+    recent_days: 5, cold_after_days: 12, archive_after_days: 20,
+    stale_recheck_days: 2, cold_recheck_days: 4, archive_recheck_days: 6, empty_recheck_days: 3,
+  } })
+  try {
+    await click(button(config.rootNode, '通用设置'))
+    const fields = all(config.rootNode, (node) => node.props.suffix === '天' && node.props.hint)
+    assert.deepEqual(fields.map((node) => node.props.modelValue), [5, 3, 12, 2, 20, 4, 6])
+    for (const [index, value] of [[0, 0], [0, 1.5], [0, ''], [0, 12], [3, 5], [6, 3]]) {
+      const previous = fields[index].props.modelValue
+      fields[index].props['onUpdate:modelValue'](value)
+      await settle()
+      assert.equal(button(config.rootNode, '保存').props.disabled, true)
+      assert.ok(fields.some((node) => node.props['error-messages']))
+      fields[index].props['onUpdate:modelValue'](previous)
+      await settle()
+    }
+    assert.equal(puts, 0)
+  } finally {
+    config.unmount()
+  }
+})
+
 const idle = {
   state: 'idle', status: 'idle', running: false, current_mapping: null, total_mappings: 0,
   counters: { generated: 0, downloaded: 0, updated: 0, skipped: 0, deleted: 0, failed: 0 },

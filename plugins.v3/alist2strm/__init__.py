@@ -48,7 +48,7 @@ class Alist2Strm(_PluginBase):
     plugin_label = "网盘"
     plugin_config_prefix = "alist2strm_"
     plugin_order = 999
-    auth_level = 2
+    auth_level = 1
 
     SECRET_DATA_KEY = "configuration_secrets_v1"
     HISTORY_DATA_KEY = SCAN_HISTORY_DATA_KEY
@@ -340,6 +340,7 @@ class Alist2Strm(_PluginBase):
             "schedule_enabled": configuration.schedule_enabled,
             "schedule_cron": configuration.schedule_cron,
             "history_retention_days": configuration.history_retention_days,
+            "time_pruning": configuration.time_pruning.model_dump(mode="python"),
         }
 
     def save_configuration(self, payload: Mapping[str, object]) -> dict[str, object]:

@@ -172,6 +172,15 @@ function emptyConfig(): ConfigModel {
     schedule_enabled: false,
     schedule_cron: '0 3 * * *',
     history_retention_days: 90,
+    time_pruning: {
+      recent_days: 30,
+      cold_after_days: 90,
+      archive_after_days: 365,
+      stale_recheck_days: 7,
+      cold_recheck_days: 30,
+      archive_recheck_days: 90,
+      empty_recheck_days: 7,
+    },
   }
 }
 

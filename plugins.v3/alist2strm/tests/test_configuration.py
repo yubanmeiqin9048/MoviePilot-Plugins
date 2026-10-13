@@ -180,3 +180,66 @@ def test_pydantic_models_do_not_silently_accept_unknown_mapping_fields() -> None
                 ]
             }
         )
+
+
+def test_time_pruning_defaults_and_custom_settings_round_trip() -> None:
+    """旧配置沿用既有时间规则，自定义七个参数进入公开投影并可重新载入。"""
+
+    assert public_configuration(build_configuration({}))["time_pruning"] == {
+        "recent_days": 30,
+        "cold_after_days": 90,
+        "archive_after_days": 365,
+        "stale_recheck_days": 7,
+        "cold_recheck_days": 30,
+        "archive_recheck_days": 90,
+        "empty_recheck_days": 7,
+    }
+    custom = {
+        "recent_days": 5,
+        "cold_after_days": 12,
+        "archive_after_days": 20,
+        "stale_recheck_days": 2,
+        "cold_recheck_days": 4,
+        "archive_recheck_days": 6,
+        "empty_recheck_days": 3,
+    }
+    public = public_configuration(build_configuration({"time_pruning": custom}))
+    assert public["time_pruning"] == custom
+    assert build_configuration(public).time_pruning.model_dump() == custom
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "recent_days",
+        "cold_after_days",
+        "archive_after_days",
+        "stale_recheck_days",
+        "cold_recheck_days",
+        "archive_recheck_days",
+        "empty_recheck_days",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1, 1.5, "7", True])
+def test_time_pruning_requires_positive_integer_days(field: str, value: object) -> None:
+    """任一时间参数的非法类型或非正整数都在保存前拒绝。"""
+
+    with pytest.raises(ConfigurationValidationError) as error:
+        build_configuration({"time_pruning": {field: value}})
+    assert any(item["field"] == f"time_pruning.{field}" for item in error.value.errors)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cold_after_days": 30},
+        {"archive_after_days": 90},
+        {"cold_recheck_days": 6},
+        {"archive_recheck_days": 29},
+    ],
+)
+def test_time_pruning_rejects_unordered_thresholds_and_decreasing_intervals(overrides: dict[str, int]) -> None:
+    """阈值重叠和越陈旧越频繁的复查配置应明确拒绝。"""
+
+    with pytest.raises(ConfigurationValidationError):
+        build_configuration({"time_pruning": overrides})

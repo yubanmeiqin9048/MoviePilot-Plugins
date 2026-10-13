@@ -31,12 +31,23 @@ export interface Notices {
   output_directory: string
 }
 
+export interface TimePruningConfiguration {
+  recent_days: number
+  cold_after_days: number
+  archive_after_days: number
+  stale_recheck_days: number
+  cold_recheck_days: number
+  archive_recheck_days: number
+  empty_recheck_days: number
+}
+
 export interface ConfigModel {
   plugin_id?: string
   instances: OpenListInstance[]
   schedule_enabled: boolean
   schedule_cron: string
   history_retention_days: number
+  time_pruning: TimePruningConfiguration
   notices?: Notices
 }
 

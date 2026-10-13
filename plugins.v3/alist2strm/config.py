@@ -306,6 +306,30 @@ class OpenListInstance(BaseModel):
         return self.playback_url or self.scan_url
 
 
+class TimePruningConfiguration(BaseModel):
+    """所有目录映射共用的时间剪枝窗口和复查间隔，单位为天。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    recent_days: StrictInt = Field(default=30, gt=0)
+    cold_after_days: StrictInt = Field(default=90, gt=0)
+    archive_after_days: StrictInt = Field(default=365, gt=0)
+    stale_recheck_days: StrictInt = Field(default=7, gt=0)
+    cold_recheck_days: StrictInt = Field(default=30, gt=0)
+    archive_recheck_days: StrictInt = Field(default=90, gt=0)
+    empty_recheck_days: StrictInt = Field(default=7, gt=0)
+
+    @model_validator(mode="after")
+    def _ordered_times(self) -> TimePruningConfiguration:
+        """阈值严格递增，陈旧程度增加时复查间隔不能缩短。"""
+
+        if not self.recent_days < self.cold_after_days < self.archive_after_days:
+            raise ValueError("剪枝阈值必须满足：近期窗口 < 冷目录阈值 < 长期静态目录阈值")
+        if not self.stale_recheck_days <= self.cold_recheck_days <= self.archive_recheck_days:
+            raise ValueError("复查间隔必须满足：陈旧目录 ≤ 冷目录 ≤ 长期静态目录")
+        return self
+
+
 class PluginConfiguration(BaseModel):
     """Alist2Strm 的可持久化公开配置。"""
 
@@ -315,6 +339,7 @@ class PluginConfiguration(BaseModel):
     schedule_enabled: StrictBool = False
     schedule_cron: str = DEFAULT_SCHEDULE_CRON
     history_retention_days: StrictInt = Field(default=DEFAULT_HISTORY_RETENTION_DAYS, gt=0)
+    time_pruning: TimePruningConfiguration = Field(default_factory=TimePruningConfiguration)
 
     @model_validator(mode="before")
     @classmethod
@@ -560,6 +585,7 @@ def public_configuration(configuration: PluginConfiguration, *, plugin_id: str |
         "schedule_enabled": configuration.schedule_enabled,
         "schedule_cron": configuration.schedule_cron,
         "history_retention_days": configuration.history_retention_days,
+        "time_pruning": configuration.time_pruning.model_dump(mode="python"),
         "notices": {
             "admin_token": ADMIN_TOKEN_WARNING,
             "root": ROOT_WARNING,
@@ -583,6 +609,7 @@ __all__ = [
     "DirectoryMapping",
     "OpenListInstance",
     "PluginConfiguration",
+    "TimePruningConfiguration",
     "build_configuration",
     "find_output_conflicts",
     "host_default_extensions",

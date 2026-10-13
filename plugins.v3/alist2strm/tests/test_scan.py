@@ -3135,6 +3135,111 @@ def _pruning_plugin(tasks: _PruningTasks) -> Alist2Strm:
     return plugin
 
 
+@pytest.mark.parametrize(
+    ("age_seconds", "interval_days"),
+    [
+        (5 * 86400 - 1, 0),
+        (5 * 86400, 0),
+        (5 * 86400 + 1, 2),
+        (12 * 86400 - 1, 2),
+        (12 * 86400, 2),
+        (12 * 86400 + 1, 4),
+        (20 * 86400 - 1, 4),
+        (20 * 86400, 4),
+        (20 * 86400 + 1, 6),
+        (None, 3),
+    ],
+)
+def test_custom_pruning_times_control_scan_requests_and_exact_deadlines(
+    tmp_path: Path, age_seconds: int | None, interval_days: int
+) -> None:
+    """七个自定义时间参数实际控制任务请求，重启保留期限，到期即获得复查资格。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.configuration["time_pruning"] = {
+        "recent_days": 5,
+        "cold_after_days": 12,
+        "archive_after_days": 20,
+        "stale_recheck_days": 2,
+        "cold_recheck_days": 4,
+        "archive_recheck_days": 6,
+        "empty_recheck_days": 3,
+    }
+    if age_seconds is None:
+        tasks.tree["/library"] = []
+    else:
+        tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(
+            tasks.now[0] - age_seconds, tz=UTC
+        ).isoformat()
+    tasks.run()
+    tasks.transport.calls.clear()
+    tasks.restart()
+    if interval_days:
+        tasks.now[0] += interval_days * 86400 - 1
+        tasks.run()
+        assert tasks.transport.calls == []
+        tasks.now[0] += 1
+    else:
+        tasks.now[0] += 1
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.coordinator.status()["state"] == "success"
+
+
+def test_pruning_time_changes_apply_after_save_reload_and_preserve_task_snapshot(tmp_path: Path) -> None:
+    """时间参数完整保存并重新载入，已排队任务继续使用旧快照且新期限不被推迟。"""
+
+    tasks = _PruningTasks(tmp_path)
+    plugin = _pruning_plugin(tasks)
+    saved: dict[str, Any] = {}
+
+    def save_config(value: dict[str, Any], plugin_id: str | None = None) -> bool:
+        """捕获宿主配置持久化内容，供重新初始化使用。"""
+
+        saved.update(deepcopy(value))
+        return True
+
+    plugin.update_config = save_config
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    tasks.transport.calls.clear()
+    assert plugin.trigger_scan()["accepted"]
+    tasks.configuration["time_pruning"] = {
+        "recent_days": 5,
+        "cold_after_days": 12,
+        "archive_after_days": 20,
+        "stale_recheck_days": 2,
+        "cold_recheck_days": 4,
+        "archive_recheck_days": 6,
+        "empty_recheck_days": 3,
+    }
+    assert plugin.save_configuration(tasks.configuration)["data"]["time_pruning"] == tasks.configuration["time_pruning"]
+    tasks.now[0] += 6 * 86400 - 1
+    tasks.queue.run()
+    assert tasks.transport.calls == []  # 已排队任务仍使用默认的 90 天间隔。
+    plugin.init_plugin(saved)
+    assert plugin.public_configuration()["time_pruning"] == tasks.configuration["time_pruning"]
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.calls == []  # 缩短间隔后，新的期限之前仍跳过。
+    tasks.configuration["time_pruning"]["archive_recheck_days"] = 60
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    plugin.init_plugin(saved)
+    tasks.now[0] += 1
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+    tasks.transport.calls.clear()
+    tasks.now[0] += 60 * 86400 - 1
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.calls == []
+    tasks.now[0] += 1
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]  # 成功复查后采用新配置的 60 天间隔。
+
+
 @pytest.mark.parametrize("scan_between_changes", [True, False])
 def test_pruning_reactivated_mapping_identity_requires_full_check_after_restart(
     tmp_path: Path, scan_between_changes: bool

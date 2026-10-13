@@ -21,7 +21,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from app.sdk.config import settings
 from app.sdk.logging import logger
 
-from .config import PluginConfiguration
+from .config import PluginConfiguration, TimePruningConfiguration
 from .observations import (
     DirectoryObservationStore,
     FileTimeSummary,
@@ -767,6 +767,7 @@ class _MappingRun:
     allowed_suffixes: frozenset[str]
     exclude_keywords: tuple[str, ...]
     status: MappingScanStatus
+    time_pruning: TimePruningConfiguration = field(default_factory=TimePruningConfiguration)
     playback_changed: bool = False
     expected_outputs: set[Path] = field(default_factory=set)
     expected_output_identities: set[Path] = field(default_factory=set)
@@ -1209,6 +1210,7 @@ class ScanCoordinator:
                         configuration_required=configuration_required,
                         configuration_revision=previous_configuration.revision,
                         status=status,
+                        time_pruning=snapshot.time_pruning,
                     )
                 )
         if target is not None and not mappings:
@@ -1251,21 +1253,23 @@ class ScanCoordinator:
         return hashlib.sha256(snapshot.encode()).hexdigest()
 
     @staticmethod
-    def _pruning_interval(summary: FileTimeSummary, now: float) -> float | None:
+    def _pruning_interval(
+        summary: FileTimeSummary, now: float, configuration: TimePruningConfiguration
+    ) -> float | None:
         """按子树最新文件时间返回目录复查间隔；异常状态不剪枝。"""
 
         if summary.kind == "empty":
-            return 7 * 24 * 60 * 60
+            return configuration.empty_recheck_days * 24 * 60 * 60
         if summary.kind != "valid" or summary.modified_at is None or summary.modified_at > now:
             return None
         age = now - summary.modified_at
-        if age <= 30 * 24 * 60 * 60:
+        if age <= configuration.recent_days * 24 * 60 * 60:
             return 0
-        if age <= 90 * 24 * 60 * 60:
-            return 7 * 24 * 60 * 60
-        if age <= 365 * 24 * 60 * 60:
-            return 30 * 24 * 60 * 60
-        return 90 * 24 * 60 * 60
+        if age <= configuration.cold_after_days * 24 * 60 * 60:
+            return configuration.stale_recheck_days * 24 * 60 * 60
+        if age <= configuration.archive_after_days * 24 * 60 * 60:
+            return configuration.cold_recheck_days * 24 * 60 * 60
+        return configuration.archive_recheck_days * 24 * 60 * 60
 
     def _can_prune_directory(self, mapping: _MappingRun, path: str) -> bool:
         """独立判断本层是否尚未到期，后代状态只影响档位而不刷新成功时间。"""
@@ -1277,15 +1281,14 @@ class ScanCoordinator:
         if observation.needs_check or observation.successful_at is None:
             return False
         now = self._clock()
-        interval = self._pruning_interval(store.subtree(mapping.identity, path), now)
-        return (
-            observation.successful_at <= now
-            and interval is not None
-            and interval > 0
-            and observation.recheck_at is not None
-            and observation.recheck_at <= observation.successful_at + interval
-            and now < observation.recheck_at
-        )
+        interval = self._pruning_interval(store.subtree(mapping.identity, path), now, mapping.time_pruning)
+        if observation.successful_at > now or interval is None or interval <= 0 or observation.recheck_at is None:
+            return False
+        recheck_at = min(observation.recheck_at, observation.successful_at + interval)
+        if recheck_at < observation.recheck_at:
+            # 调参取得的较早机会也需持久保留，随后延长间隔不能撤销它。
+            store.advance_recheck(mapping.identity, path, recheck_at)
+        return now < recheck_at
 
     def _mapping_reader(self, mapping: _MappingRun, readers: dict[str, Any]) -> Any:
         """本层实际取得检查资格后才打开客户端，避免资格判断跨过期限时丢失连接。"""
@@ -1309,7 +1312,9 @@ class ScanCoordinator:
         current = PurePosixPath(path)
         while True:
             observation = store.directory(mapping.identity, str(current))
-            interval = self._pruning_interval(store.subtree(mapping.identity, str(current)), self._clock())
+            interval = self._pruning_interval(
+                store.subtree(mapping.identity, str(current)), self._clock(), mapping.time_pruning
+            )
             if observation.successful_at is not None and interval is not None:
                 store.advance_recheck(mapping.identity, str(current), observation.successful_at + interval)
             if str(current) == mapping.source_dir or current == current.parent:
