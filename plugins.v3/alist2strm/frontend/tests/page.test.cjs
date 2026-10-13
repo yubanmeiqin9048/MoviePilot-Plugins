@@ -89,7 +89,11 @@ function mountPage(api) {
 
 function mountConfig(api, initialConfig = {}) {
   const configPath = path.join(root, 'src/components/Config.vue')
-  const app = renderer.createApp(loadModule(configPath).default, { api, initialConfig, pluginId: 'Alist2Strm-test' })
+  const app = renderer.createApp(loadModule(configPath).default, {
+    api: { get: async () => ({ success: true, data: initialConfig }), ...api },
+    initialConfig,
+    pluginId: 'Alist2Strm-test',
+  })
   const componentNames = new Set(fs.readFileSync(configPath, 'utf8').match(/\bV[A-Z][A-Za-z]+/g))
   for (const name of componentNames) {
     app.component(name, {
@@ -103,6 +107,79 @@ function mountConfig(api, initialConfig = {}) {
   app.mount(rootNode)
   return { rootNode, unmount: () => app.unmount() }
 }
+
+test('Config reads current default extensions on every reopen without saving', async () => {
+  // 宿主浅合并持久化配置后，实例内的展示字段会从 initialConfig 中丢失。
+  const initialConfig = { instances: [{
+    id: 'saved-instance', name: '已保存实例', scan_url: 'https://openlist.example.invalid',
+    mappings: [{
+      source_dir: '/media', output_dir: '/strm', whitelist_mode: 'follow_host',
+      extensions: [], exclude_keywords: [],
+    }],
+  }] }
+  const calls = []
+  let puts = 0
+  for (const extensions of [['.mkv', '.srt'], ['.mp4', '.ass']]) {
+    const config = mountConfig({
+      async get(url) {
+        calls.push(url)
+        return { success: true, data: { instances: [{
+          ...initialConfig.instances[0], api_token_configured: true,
+          mappings: [{ ...initialConfig.instances[0].mappings[0], effective_extensions: extensions }],
+        }] } }
+      },
+      async put() { puts += 1 },
+    }, initialConfig)
+    try {
+      await settle()
+      assert.ok(text(config.rootNode).includes(extensions.join('  ')))
+      assert.equal(button(config.rootNode, '保存').props.disabled, true)
+      assert.equal(all(config.rootNode, (node) => node.props.label === '管理员 API Token')[0].props.placeholder,
+        '已配置，留空保持不变')
+    } finally {
+      config.unmount()
+    }
+  }
+  assert.deepEqual(calls, ['plugin/Alist2Strm-test/config', 'plugin/Alist2Strm-test/config'])
+  assert.equal(puts, 0)
+})
+
+test('Config retains edits and a completed save when the initial read arrives late', async () => {
+  const initialConfig = { instances: [{ id: 'saved-instance', name: '原名称', mappings: [] }] }
+  for (const saveBeforeRead of [false, true]) {
+    let finishRead
+    const config = mountConfig({
+      get: () => new Promise((resolve) => { finishRead = resolve }),
+      put: async (_url, payload) => ({ success: true, data: payload }),
+    }, initialConfig)
+    try {
+      const name = all(config.rootNode, (node) => node.props.label === '名称')[0]
+      name.props['onUpdate:modelValue']('新名称')
+      await settle()
+      assert.equal(button(config.rootNode, '保存').props.disabled, false)
+      if (saveBeforeRead) await click(button(config.rootNode, '保存'))
+      finishRead({ success: true, data: initialConfig })
+      await settle()
+      assert.equal(all(config.rootNode, (node) => node.props.label === '名称')[0].props.modelValue, '新名称')
+      assert.equal(button(config.rootNode, '保存').props.disabled, saveBeforeRead)
+    } finally {
+      config.unmount()
+    }
+  }
+})
+
+test('Config retains the initial form and reports a configuration read failure', async () => {
+  const config = mountConfig({ get: async () => { throw new Error('配置读取失败，请重新打开设置。') } },
+    { instances: [{ id: 'saved-instance', name: '已保存实例', mappings: [] }] })
+  try {
+    await settle()
+    assert.match(text(config.rootNode), /配置读取失败，请重新打开设置/)
+    assert.equal(all(config.rootNode, (node) => node.props.label === '名称')[0].props.modelValue, '已保存实例')
+    assert.equal(button(config.rootNode, '保存').props.disabled, true)
+  } finally {
+    config.unmount()
+  }
+})
 
 test('Config edits all pruning times and retains the draft on save failure', async () => {
   const calls = []

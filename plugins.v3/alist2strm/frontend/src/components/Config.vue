@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, inject, onMounted, ref, watch } from 'vue'
+import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 
-import { getErrorMessage, saveConfiguration } from '@/api'
+import { getErrorMessage, readConfiguration, saveConfiguration } from '@/api'
 import { configurationEditorState } from '@/configState'
 import type { ConfigModel, DirectoryMapping, Notices, OpenListInstance, PluginApi, TimePruningConfiguration } from '@/types'
 
@@ -56,6 +56,7 @@ const draft = ref<ConfigModel>(emptyModel())
 const baseline = ref('')
 const saveError = ref('')
 const saving = ref(false)
+let configRequestSequence = 0
 
 /** 当前视图：某个实例或通用设置。 */
 const view = ref<'instance' | 'general'>('instance')
@@ -77,13 +78,28 @@ const confirmOpen = computed({
   set: value => { if (!value) pendingDelete.value = null },
 })
 
-watch(() => props.initialConfig, value => {
+watch(() => props.initialConfig, async value => {
+  const requestSequence = ++configRequestSequence
   const next = normalizeConfig(value)
   draft.value = next
   baseline.value = serialize(toPayload(next))
   saveError.value = ''
   configurationEditorState.dirty = false
   clampActive()
+  if (!pluginId.value) return
+  try {
+    // 宿主用持久化配置浅覆盖初始模型，会丢失后缀与 Token 状态等展示字段。
+    const response = await readConfiguration(props.api, pluginId.value)
+    if (requestSequence !== configRequestSequence || dirty.value || saving.value) return
+    const current = normalizeConfig(response.data)
+    draft.value = current
+    baseline.value = serialize(toPayload(current))
+    configurationEditorState.dirty = false
+    clampActive()
+  } catch (error) {
+    if (requestSequence !== configRequestSequence || dirty.value || saving.value) return
+    saveError.value = getErrorMessage(error, '配置读取失败，请关闭后重新打开设置。')
+  }
 }, { immediate: true, deep: true })
 
 watch(draft, () => {
@@ -93,6 +109,7 @@ watch(draft, () => {
 watch([view, activeIndex], () => { revealToken.value = false })
 
 onMounted(() => emit('layout', { maxWidth: '68rem' }))
+onUnmounted(() => { configRequestSequence += 1 })
 
 function emptyModel(): ConfigModel {
   return {
@@ -329,6 +346,7 @@ async function save(): Promise<void> {
     saveError.value = '缺少插件实例 ID，无法保存配置。'
     return
   }
+  configRequestSequence += 1
   saving.value = true
   const payload = toPayload(draft.value)
   try {
@@ -588,7 +606,7 @@ async function save(): Promise<void> {
                     <div v-else class="a2s-filter-hint">
                       {{ mapping.effective_extensions?.length
                         ? mapping.effective_extensions.join('  ')
-                        : '使用 MoviePilot 的媒体与字幕后缀，保存后显示生效列表' }}
+                        : '使用 MoviePilot 的媒体与字幕后缀' }}
                     </div>
                   </div>
 
