@@ -135,12 +135,26 @@ function recognitionState(candidate: SubtitleCandidate): StatePresentation {
     : { label: '未识别', icon: 'mdi-help-circle-outline', color: 'warning' }
 }
 
+/** 将编号压缩为区间文本,连续编号合并为 `E01-E12`,不连续段以 `/` 分隔。 */
+function numberRanges(values: number[], prefix: string): string {
+  const label = (value: number) => `${prefix}${String(value).padStart(2, '0')}`
+  const sorted = [...new Set(values)].sort((a, b) => a - b)
+  const parts: string[] = []
+  for (let index = 0; index < sorted.length;) {
+    let end = index
+    while (end + 1 < sorted.length && sorted[end + 1] === sorted[end] + 1) end++
+    parts.push(end === index ? label(sorted[index]) : `${label(sorted[index])}-${label(sorted[end])}`)
+    index = end + 1
+  }
+  return parts.join('/')
+}
+
 function candidateRange(candidate: SubtitleCandidate): string {
   const seasons = candidate.seasons.length ? candidate.seasons : (candidate.season == null ? [] : [candidate.season])
   const episodes = candidate.episodes.length ? candidate.episodes : (candidate.episode == null ? [] : [candidate.episode])
   const range = [
-    seasons.length ? seasons.map(value => `S${String(value).padStart(2, '0')}`).join('/') : '',
-    episodes.length ? episodes.map(value => `E${String(value).padStart(2, '0')}`).join('/') : '',
+    numberRanges(seasons, 'S'),
+    numberRanges(episodes, 'E'),
   ].filter(Boolean).join(' · ')
   return range || packageLabels[candidate.package_scope]
 }
