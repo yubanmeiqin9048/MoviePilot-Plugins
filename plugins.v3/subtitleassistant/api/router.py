@@ -430,10 +430,11 @@ class ApiController:
             total=result.total,
         )
 
-    def _annotate_candidates(
+    async def _annotate_candidates(
         self,
         run: SourceSearchResult,
         target: SearchTarget,
+        recognition_cache: dict[tuple[str, str, str], Any],
     ) -> tuple[list[CandidateRecognition], list[CandidateHandle]]:
         """对手动来源候选逐条执行识别标注，不筛除任何候选。"""
 
@@ -441,10 +442,11 @@ class ApiController:
         handles: list[CandidateHandle] = []
         for handle in run.candidates:
             try:
-                recognition = self._matcher.recognize_candidate(
+                recognition = await self._matcher.recognize_candidate(
                     handle.candidate,
                     target.context,
                     target.match_context,
+                    recognition_cache,
                 )
             except Exception:  # noqa: BLE001 - 单候选异常必须降级且保留会话
                 recognition = CandidateRecognition(
@@ -482,8 +484,9 @@ class ApiController:
             self._log_source_result(history_id, run)
         recognitions_by_run: list[list[CandidateRecognition]] = []
         handles_by_run: list[list[CandidateHandle]] = []
+        recognition_cache: dict[tuple[str, str, str], Any] = {}
         for run in runs:
-            recognitions, handles = self._annotate_candidates(run, target)
+            recognitions, handles = await self._annotate_candidates(run, target, recognition_cache)
             recognitions_by_run.append(recognitions)
             handles_by_run.append(handles)
         session_id = await self._sessions.create(target, [handle for handles in handles_by_run for handle in handles])

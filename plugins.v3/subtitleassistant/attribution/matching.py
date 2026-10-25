@@ -205,15 +205,18 @@ class MoviePilotMatcher:
         )
         return candidate, entries
 
-    def _match_candidate(
+    async def _match_candidate(
         self,
         candidate: SubtitleCandidate,
         entries: list[tuple[str, str, Any]],
         context: SubtitleTarget,
         match_context: CandidateMatchContext | None,
+        recognition_cache: dict[tuple[str, str, str], HostMediaInfo | None] | None = None,
     ) -> SubtitleCandidate | None:
         """用宿主公共规则判断已补全候选是否属于当前目标。"""
 
+        if recognition_cache is None:
+            recognition_cache = {}
         season_episodes: dict[int, list[int]] | None = None
         candidate_range_covers_target = False
         if context.media_type is MediaType.TV:
@@ -279,31 +282,47 @@ class MoviePilotMatcher:
                     continue
             except AttributeError, TypeError, ValueError:
                 continue
+            if TorrentHelper.requires_identity_disambiguation(mediainfo=host_mediainfo, torrent_meta=meta):
+                key = (meta.cn_name or "", meta.en_name or "", meta.year or "")
+                if key not in recognition_cache:
+                    recognition_cache[key] = await MediaChain().async_recognize_by_meta(meta)
+                recognized = recognition_cache[key]
+                if recognized is None:
+                    continue
+                matched, _evidence = TorrentHelper.match_same_work_evidence(
+                    target_mediainfo=host_mediainfo,
+                    candidate_mediainfo=recognized,
+                    torrent_meta=meta,
+                )
+                if not matched:
+                    continue
             candidate.exact_id_match = False
             return candidate
         return None
 
-    def normalize_candidate(
+    async def normalize_candidate(
         self,
         candidate: SubtitleCandidate,
         context: SubtitleTarget,
         match_context: CandidateMatchContext | None,
+        recognition_cache: dict[tuple[str, str, str], HostMediaInfo | None] | None = None,
     ) -> SubtitleCandidate | None:
-        """用宿主公共规则确认自动候选，并保留候选自身的完整季集范围。"""
+        """用宿主规则及消歧确认自动候选；识别结果仅在本次搜索内复用。"""
 
         enriched, entries = self._enrich_candidate(candidate)
-        return self._match_candidate(enriched, entries, context, match_context)
+        return await self._match_candidate(enriched, entries, context, match_context, recognition_cache)
 
-    def recognize_candidate(
+    async def recognize_candidate(
         self,
         candidate: SubtitleCandidate,
         context: SubtitleTarget,
         match_context: CandidateMatchContext | None,
+        recognition_cache: dict[tuple[str, str, str], HostMediaInfo | None] | None = None,
     ) -> CandidateRecognition:
-        """复用自动匹配规则识别人工候选，并始终返回安全候选副本。"""
+        """复用自动匹配与消歧识别人工候选，并始终返回安全候选副本。"""
 
         enriched, entries = self._enrich_candidate(candidate)
-        normalized = self._match_candidate(enriched, entries, context, match_context)
+        normalized = await self._match_candidate(enriched, entries, context, match_context, recognition_cache)
         if normalized is not None:
             return CandidateRecognition(
                 candidate=normalized,

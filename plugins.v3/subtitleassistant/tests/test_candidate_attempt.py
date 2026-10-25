@@ -251,11 +251,12 @@ class _Matcher:
             package_scope=candidate.package_scope,
         )
 
-    def normalize_candidate(
+    async def normalize_candidate(
         self,
         candidate: SubtitleCandidate,
         _context: SubtitleTarget,
         _match_context: Any,
+        recognition_cache: Any = None,
     ) -> SubtitleCandidate:
         """保留自动流程中的测试候选。"""
 

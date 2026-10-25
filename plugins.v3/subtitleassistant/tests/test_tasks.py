@@ -213,11 +213,12 @@ class _TaskArchive:
 class _TaskMatcher(AttributionService):
     """默认保留候选的媒体匹配替身。"""
 
-    def normalize_candidate(
+    async def normalize_candidate(
         self,
         candidate: SubtitleCandidate,
         _context: SubtitleTarget,
         _match_context: CandidateMatchContext | None,
+        recognition_cache: Any = None,
     ) -> SubtitleCandidate:
         """原样返回候选。"""
 
@@ -1098,16 +1099,17 @@ async def test_search_logs_each_source_result_and_post_match_filtering(
     )
     original_normalize = coordinator._matcher.normalize_candidate
 
-    def normalize(
+    async def normalize(
         candidate: SubtitleCandidate,
         context: SubtitleTarget,
         match_context: CandidateMatchContext | None,
+        recognition_cache: Any = None,
     ) -> SubtitleCandidate | None:
         """过滤一个 ASSRT 候选以暴露协调层计数。"""
 
         if candidate.candidate_key == "assrt-filtered":
             return None
-        return original_normalize(candidate, context, match_context)
+        return await original_normalize(candidate, context, match_context, recognition_cache)
 
     monkeypatch.setattr(coordinator._matcher, "normalize_candidate", normalize)
     logs = _LogCapture()

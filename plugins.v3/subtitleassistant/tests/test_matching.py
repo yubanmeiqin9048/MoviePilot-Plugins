@@ -103,28 +103,28 @@ def test_structured_id_prefers_tmdb_over_conflicting_imdb() -> None:
     assert MoviePilotMatcher._structured_id_result(candidate, context) is True
 
 
-def test_manual_recognition_does_not_relax_automatic_candidate_admission() -> None:
+async def test_manual_recognition_does_not_relax_automatic_candidate_admission() -> None:
     """人工流程保留未识别候选时，自动流程仍拒绝同一候选。"""
 
     candidate = _candidate(tmdb_id=999, name="Other.Show.S02E03")
     matcher = MoviePilotMatcher()
 
-    recognition = matcher.recognize_candidate(candidate, _context(), None)
+    recognition = await matcher.recognize_candidate(candidate, _context(), None)
 
     assert recognition.status is CandidateRecognitionStatus.UNRECOGNIZED
     assert recognition.candidate.candidate_key == candidate.candidate_key
-    assert matcher.normalize_candidate(candidate, _context(), None) is None
+    assert await matcher.normalize_candidate(candidate, _context(), None) is None
 
 
-def test_default_file_attributor_rejects_candidate_for_another_media() -> None:
+async def test_default_file_attributor_rejects_candidate_for_another_media() -> None:
     """生产默认归属 facade 不得绕过自动媒体匹配。"""
 
     candidate = _candidate(tmdb_id=999, name="Other.Show.S02E03")
 
-    assert AttributionService().normalize_candidate(candidate, _context(), None) is None
+    assert await AttributionService().normalize_candidate(candidate, _context(), None) is None
 
 
-def test_normalize_candidate_preserves_all_parsed_ranges_without_target_writeback(
+async def test_normalize_candidate_preserves_all_parsed_ranges_without_target_writeback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """自动准入聚合候选三个文本的全部季集，不把当前目标写回单值字段。"""
@@ -149,7 +149,7 @@ def test_normalize_candidate_preserves_all_parsed_ranges_without_target_writebac
     )
     candidate = _candidate(tmdb_id=100)
 
-    normalized = MoviePilotMatcher().normalize_candidate(candidate, _context(), None)
+    normalized = await MoviePilotMatcher().normalize_candidate(candidate, _context(), None)
 
     assert normalized is not candidate
     assert normalized.seasons == [1, 2, 3]
@@ -162,7 +162,7 @@ def test_normalize_candidate_preserves_all_parsed_ranges_without_target_writebac
     assert candidate.episodes == []
 
 
-def test_normalize_candidate_exact_id_uses_host_season_gate_without_copying_target(
+async def test_normalize_candidate_exact_id_uses_host_season_gate_without_copying_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """精确 ID 但候选无范围时仍执行季集门禁，且不把目标季集变成候选证据。"""
@@ -190,7 +190,7 @@ def test_normalize_candidate_exact_id_uses_host_season_gate_without_copying_targ
     monkeypatch.setattr(matching_module, "TorrentHelper", _HostHelper)
     candidate = _candidate(tmdb_id=100)
 
-    normalized = MoviePilotMatcher().normalize_candidate(candidate, _context(), None)
+    normalized = await MoviePilotMatcher().normalize_candidate(candidate, _context(), None)
 
     assert normalized is not candidate
     assert normalized.seasons == []
@@ -203,7 +203,7 @@ def test_normalize_candidate_exact_id_uses_host_season_gate_without_copying_targ
     assert candidate.episodes == []
 
 
-def test_normalize_candidate_without_id_uses_public_season_then_media_match(
+async def test_normalize_candidate_without_id_uses_public_season_then_media_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """候选无可比 ID 时按候选文本顺序执行宿主季集与媒体准入。"""
@@ -226,6 +226,8 @@ def test_normalize_candidate_without_id_uses_public_season_then_media_match(
             events.append(("season", torrent.title))
             return torrent.title == "Show 第二季字幕"
 
+        requires_identity_disambiguation = staticmethod(lambda **_kwargs: False)
+
         @staticmethod
         def match_torrent(torrent: Any, **_kwargs: Any) -> bool:
             """记录季集门禁之后的媒体匹配。"""
@@ -235,7 +237,7 @@ def test_normalize_candidate_without_id_uses_public_season_then_media_match(
 
     monkeypatch.setattr(matching_module, "TorrentHelper", _HostHelper)
 
-    normalized = MoviePilotMatcher().normalize_candidate(
+    normalized = await MoviePilotMatcher().normalize_candidate(
         _candidate(),
         _context(),
         CandidateMatchContext(title="示例剧集", media_type=MediaType.TV, year=2024, tmdb_id=100),
@@ -666,3 +668,87 @@ async def test_batch_attribution_uses_each_request_and_isolates_failures(monkeyp
     assert result.evidence_by_key["file_0001"].tmdb_id == 101
     assert result.evidence_by_key["file_0003"].tmdb_id == 103
     assert result.evidence_by_key["file_0003"].episode == 3
+
+
+@pytest.mark.parametrize("recognized_id", [100, 999, None])
+async def test_alias_disambiguation_uses_host_recognition_and_search_scoped_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    recognized_id: int | None,
+) -> None:
+    """无年份别名通过宿主识别确认作品，同次搜索复用命中与未识别结果。"""
+
+    calls: list[str] = []
+
+    class _MediaChain:
+        """只替换识别 I/O，保留宿主真实匹配与消歧规则。"""
+
+        async def async_recognize_by_meta(self, meta: Any) -> Any:
+            """返回相同作品、其他作品或未识别。"""
+
+            calls.append(meta.title)
+            if recognized_id is None:
+                return None
+            return matching_module.HostMediaInfo(
+                type=matching_module.HostMediaType.TV,
+                title="Other Show" if recognized_id != 100 else "Original Show",
+                original_title="Other Show" if recognized_id != 100 else "Original Show",
+                year="2000" if recognized_id != 100 else "2024",
+                tmdb_id=recognized_id,
+            )
+
+    monkeypatch.setattr(matching_module, "MediaChain", _MediaChain)
+    match_context = CandidateMatchContext(
+        title="Original Show",
+        original_title="Original Show",
+        aliases=["Alias Show"],
+        season_years=(("2", "2024"),),
+        media_type=MediaType.TV,
+        year=2024,
+        tmdb_id=100,
+    )
+    candidate = _candidate(name="Alias.Show.S02E03", file_name=None, metadata={})
+    matcher = MoviePilotMatcher()
+    cache: dict[tuple[str, str, str], Any] = {}
+    for source in (SubtitleSource.ASSRT, SubtitleSource.OPENSUBTITLES):
+        candidate.source = source
+        recognition = await matcher.recognize_candidate(candidate, _context(), match_context, cache)
+        normalized = await matcher.normalize_candidate(candidate, _context(), match_context, cache)
+        assert (recognition.status is CandidateRecognitionStatus.RECOGNIZED) is (recognized_id == 100)
+        assert (normalized is not None) is (recognized_id == 100)
+    assert len(calls) == 1
+    await matcher.normalize_candidate(candidate, _context(), match_context, {})
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("name", "tmdb_id", "expected"),
+    [
+        ("Original.Show.S02E03", None, True),
+        ("Alias.Show.2024.S02E03", None, True),
+        ("Alias.Show.S02E03", 100, True),
+        ("Alias.Show.S02E03", 999, False),
+        ("Alias.Show.S03E03", None, False),
+        ("Unrelated.Show.S02E03", None, False),
+    ],
+)
+async def test_candidate_recognition_only_calls_host_for_ambiguous_rule_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    tmdb_id: int | None,
+    expected: bool,
+) -> None:
+    """普通命中、明确 ID 和规则拒绝均不进入宿主辅助识别。"""
+
+    monkeypatch.setattr(matching_module, "MediaChain", _fail_host_call)
+    match_context = CandidateMatchContext(
+        title="Original Show",
+        original_title="Original Show",
+        aliases=["Alias Show"],
+        season_years=(("2", "2024"),),
+        media_type=MediaType.TV,
+        year=2024,
+        tmdb_id=100,
+    )
+    candidate = _candidate(name=name, file_name=None, metadata={}, tmdb_id=tmdb_id)
+    normalized = await MoviePilotMatcher().normalize_candidate(candidate, _context(), match_context)
+    assert (normalized is not None) is expected

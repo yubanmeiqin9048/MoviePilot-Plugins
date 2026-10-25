@@ -438,6 +438,7 @@ class TaskOperations:
         batch = await self._search.search(item.context)
         handles: list[CandidateHandle] = []
         self._source_conclusions = []
+        recognition_cache: dict[tuple[str, str, str], Any] = {}
         for source, result in batch.sources.items():
             self._source_conclusions.append(f"{SOURCE_NAMES[source]}：{describe_source_run(result)}")
 
@@ -456,7 +457,9 @@ class TaskOperations:
                 summary = None
             media_matched_count = 0
             for handle in candidates:
-                normalized = self._matcher.normalize_candidate(handle.candidate, item.context, item.match_context)
+                normalized = await self._matcher.normalize_candidate(
+                    handle.candidate, item.context, item.match_context, recognition_cache
+                )
                 if normalized is not None:
                     handles.append(CandidateHandle(candidate=normalized, download_handle=handle.download_handle))
                     media_matched_count += 1

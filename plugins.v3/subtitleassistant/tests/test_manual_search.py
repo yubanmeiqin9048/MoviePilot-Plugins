@@ -646,17 +646,18 @@ async def test_manual_search_keeps_recognized_and_unrecognized_candidates_downlo
     class _ExplodingMatcher:
         """为一个候选模拟识别边界异常。"""
 
-        def recognize_candidate(
+        async def recognize_candidate(
             self,
             candidate: SubtitleCandidate,
             context: SubtitleTarget,
             host_mediainfo: Any | None,
+            recognition_cache: Any = None,
         ) -> CandidateRecognition:
             """仅让指定候选抛出异常。"""
 
             if candidate.candidate_key == "moviepilot:recognition-error":
                 raise ValueError("unsafe parser detail")
-            return AttributionService().recognize_candidate(candidate, context, host_mediainfo)
+            return await AttributionService().recognize_candidate(candidate, context, host_mediainfo, recognition_cache)
 
     cache = _FakeCache()
     coordinator = _ManualCoordinator()
