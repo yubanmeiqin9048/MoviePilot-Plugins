@@ -57,7 +57,7 @@ def test_page_history_tab_uses_injected_api_and_projects_paginated_mapping_summa
     types = (PLUGIN_ROOT / "frontend" / "src" / "types.ts").read_text(encoding="utf-8")
 
     assert "readHistory(props.api" in page
-    assert '<VTab value="history">历史</VTab>' in page
+    assert '<VTab value="history" prepend-icon="mdi-history">历史</VTab>' in page
     assert "VExpansionPanels" in page and "historyExpanded" in page
     assert "VPagination" in page and "historyPageNumber" in page
     assert "historyLoading" in page and "historyError" in page
