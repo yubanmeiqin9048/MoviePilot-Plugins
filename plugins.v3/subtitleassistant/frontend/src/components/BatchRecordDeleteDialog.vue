@@ -2,7 +2,7 @@
 import { computed, ref, useId, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 
-import { deleteBatchRecords, getErrorMessage } from '@/api/client'
+import { deleteBatchRecords, getErrorDetail, getErrorMessage } from '@/api/client'
 import StateChip from '@/components/StateChip.vue'
 import { useDialogFocusReturn } from '@/composables/useDialogFocusReturn'
 import {
@@ -166,8 +166,24 @@ async function submit(): Promise<void> {
     const message = getErrorMessage(requestError, '批量删除失败，请稍后重试。')
     const statusCode = (requestError as { response?: { status?: number } })?.response?.status
     if (statusCode === 409) {
-      emit('refresh-required', message)
-      emit('update:modelValue', false)
+      const detail = getErrorDetail(requestError) as { items?: Array<{ record_id: string; executable: boolean; error_code?: string; message?: string }> } | null
+      const failures = (detail?.items || []).filter(item => !item.executable)
+      const reasons = failures.map(item => {
+        const record = rowsForRequest.find(row => row.record.id === item.record_id)?.record
+        return `${record?.subtitle_file_name || item.record_id}：${item.message || item.error_code || message}`
+      }).join('；')
+      const needsRefresh = !failures.length || failures.some(item =>
+        item.error_code === 'record_not_found' || item.error_code === 'record_version_conflict',
+      )
+      if (needsRefresh) {
+        emit('refresh-required', reasons || message)
+        emit('update:modelValue', false)
+      } else {
+        const hint = failures.some(item => item.error_code === 'shared_record_file') && !recordOnlyDisabled.value
+          ? '如只需清理匹配记录，可选择“删除记录，保留当前字幕文件”。'
+          : '请调整删除范围或取消后重新选择。'
+        generalError.value = `批量删除未开始：${reasons}。${hint}`
+      }
       return
     }
     generalError.value = message

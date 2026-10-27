@@ -43,17 +43,34 @@ function compactParams(values: Record<string, unknown>): Record<string, unknown>
   )
 }
 
-function responseMessage(payload: unknown): string | null {
+function responseDetail(payload: unknown): Record<string, unknown> | null {
   if (!payload || typeof payload !== 'object') return null
   const record = payload as Record<string, unknown>
+  // 宿主会把 HTTPException.detail 序列化为统一响应中的 message 字符串。
+  for (const value of [record.detail, record.message]) {
+    let detail = value
+    if (typeof detail === 'string') {
+      try { detail = JSON.parse(detail) } catch { continue }
+    }
+    if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+      return detail as Record<string, unknown>
+    }
+  }
+  return record
+}
+
+export function getErrorDetail(error: unknown): Record<string, unknown> | null {
+  if (!error || typeof error !== 'object') return null
+  return responseDetail((error as { response?: { data?: unknown } }).response?.data)
+}
+
+function responseMessage(payload: unknown): string | null {
+  const record = responseDetail(payload)
+  if (!record) return null
   if (typeof record.message === 'string' && record.message) return record.message
   if (typeof record.detail === 'string' && record.detail) return record.detail
-  if (record.detail && typeof record.detail === 'object' && !Array.isArray(record.detail)) {
-    const detail = record.detail as Record<string, unknown>
-    if (typeof detail.message === 'string' && detail.message) return detail.message
-    if (typeof detail.error_message === 'string' && detail.error_message) return detail.error_message
-    if (typeof detail.code === 'string' && detail.code) return detail.code
-  }
+  if (typeof record.error_message === 'string' && record.error_message) return record.error_message
+  if (typeof record.code === 'string' && record.code) return record.code
   if (Array.isArray(record.detail)) {
     const messages = record.detail
       .map(item => (item && typeof item === 'object' ? (item as Record<string, unknown>).msg : null))
@@ -64,13 +81,9 @@ function responseMessage(payload: unknown): string | null {
 }
 
 function responseCode(payload: unknown): string | null {
-  if (!payload || typeof payload !== 'object') return null
-  const record = payload as Record<string, unknown>
+  const record = responseDetail(payload)
+  if (!record) return null
   if (typeof record.code === 'string' && record.code) return record.code
-  if (record.detail && typeof record.detail === 'object' && !Array.isArray(record.detail)) {
-    const detail = record.detail as Record<string, unknown>
-    if (typeof detail.code === 'string' && detail.code) return detail.code
-  }
   return null
 }
 

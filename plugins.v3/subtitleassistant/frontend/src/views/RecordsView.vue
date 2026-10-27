@@ -132,11 +132,10 @@ watch(pageSize, () => {
   if (props.active) void loadPage({ requestedPage: 1 })
 })
 
-watch(page, next => {
-  if (!isDesktop.value || !props.active) return
+function changePage(next: number): void {
   scrollTableToTop()
   void loadPage({ requestedPage: next })
-})
+}
 
 watch(isDesktop, () => {
   page.value = 1
@@ -152,11 +151,9 @@ function scrollTableToTop(): void {
 async function loadPage(options: { silent?: boolean; append?: boolean; requestedPage?: number } = {}): Promise<void> {
   const requestId = ++listRequest
   const requestedPage = options.requestedPage ?? page.value
-  if (!options.silent) {
-    if (!loaded.value || !items.value.length) loading.value = true
-    else refreshing.value = true
-    error.value = ''
-  }
+  if (!loaded.value || !items.value.length) loading.value = true
+  else refreshing.value = true
+  if (!options.silent) error.value = ''
   try {
     const response = await listRecords(props.api, props.pluginId, {
       page: requestedPage,
@@ -165,13 +162,18 @@ async function loadPage(options: { silent?: boolean; append?: boolean; requested
       status: status.value,
     })
     if (requestId !== listRequest) return
+    const lastPage = Math.max(1, Math.ceil(response.total / (isDesktop.value ? pageSize.value : 25)))
+    if (requestedPage > lastPage) {
+      await loadPage({ ...options, append: false, requestedPage: isDesktop.value ? lastPage : 1 })
+      return
+    }
     if (options.append) {
       const known = new Set(items.value.map(item => item.id))
       items.value = [...items.value, ...response.items.filter(item => !known.has(item.id))]
       page.value = requestedPage
     } else {
       items.value = response.items
-      if (!isDesktop.value) page.value = requestedPage
+      page.value = requestedPage
     }
     const refreshedSelection = new Map(selectedRecords.value)
     for (const item of response.items) {
@@ -270,8 +272,7 @@ async function confirmDelete(mode: RecordDeleteMode): Promise<void> {
     nextSelection.delete(target.id)
     selectedRecords.value = nextSelection
     if (selectedId.value === target.id) closeDetail()
-    if (isDesktop.value && items.value.length === 1 && page.value > 1) page.value -= 1
-    else await loadPage({ silent: true, requestedPage: isDesktop.value ? page.value : 1 })
+    await loadPage({ silent: true, requestedPage: isDesktop.value ? page.value : 1 })
     emit('action')
   } catch (requestError) {
     const statusCode = (requestError as { response?: { status?: number } })?.response?.status
@@ -419,7 +420,7 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
             <VBtn color="primary" variant="tonal" size="small" prepend-icon="mdi-swap-horizontal-bold" :disabled="Boolean(selectionLimitError)" @click="openBatchRetarget">批量改配</VBtn>
             <VBtn color="error" variant="tonal" size="small" prepend-icon="mdi-delete-outline" :disabled="Boolean(selectionLimitError)" @click="openBatchDelete">批量删除</VBtn>
           </div>
-          <VTooltip v-else text="刷新匹配记录">
+          <VTooltip text="刷新匹配记录">
             <template #activator="{ props: tooltipProps }">
               <VBtn v-bind="tooltipProps" icon="mdi-refresh" size="small" variant="text" :loading="refreshing" aria-label="刷新匹配记录" @click="loadPage({ silent: loaded, requestedPage: isDesktop ? page : 1 })" />
             </template>
@@ -525,7 +526,7 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
 
         <div v-if="isDesktop" class="pagination-bar">
           <span>共 {{ total }} 条</span>
-          <VPagination v-model="page" :length="totalPages" :total-visible="5" density="comfortable" class="table-pagination" />
+          <VPagination :model-value="page" :length="totalPages" :total-visible="5" density="comfortable" class="table-pagination" @update:model-value="changePage" />
           <VSelect v-model="pageSize" :items="pageSizeOptions" label="每页" density="compact" class="page-size" />
         </div>
         <div v-else-if="canLoadMore" class="load-more"><VBtn variant="tonal" prepend-icon="mdi-chevron-down" :loading="refreshing" @click="loadMore">加载更多</VBtn></div>
