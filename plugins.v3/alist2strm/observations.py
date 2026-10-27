@@ -343,8 +343,8 @@ class DirectoryObservationStore:
             return True
         try:
             payload = self._load()
-        except Exception:  # noqa: BLE001 - 不泄露底层持久化错误或凭据
-            logger.warning("Alist2Strm 目录观测读取失败，目录状态暂按未知处理")
+        except Exception as error:  # noqa: BLE001 - 不泄露底层持久化错误或凭据
+            logger.warning(f"Alist2Strm 目录观测读取失败，目录状态暂按未知处理：类型={type(error).__name__}")
             return False
         if isinstance(payload, Mapping) and payload.get("version") in (1, 2):
             retries = payload.get("instance_retries", {})
@@ -448,8 +448,8 @@ class DirectoryObservationStore:
         try:
             if self._save(payload) is False:
                 raise OSError("目录观测保存未成功")
-        except Exception:  # noqa: BLE001 - 返回失败供持久边界保护任务，不泄露底层信息
-            logger.warning("Alist2Strm 目录观测保存失败，后续任务仍需重建或复查")
+        except Exception as error:  # noqa: BLE001 - 返回失败供持久边界保护任务，不泄露底层信息
+            logger.warning(f"Alist2Strm 目录观测保存失败，后续任务仍需重建或复查：类型={type(error).__name__}")
             return False
         return True
 

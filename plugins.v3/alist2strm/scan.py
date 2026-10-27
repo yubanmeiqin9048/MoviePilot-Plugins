@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -383,7 +384,11 @@ class OpenListClient:
         if response.status_code == 0:
             raise OpenListError("OpenList 无响应", retryable=True)
         if response.status_code >= 500:
-            raise OpenListError(f"OpenList 服务端错误（HTTP {response.status_code}）", retryable=True)
+            raise OpenListError(
+                f"OpenList 服务端错误（HTTP {response.status_code}）",
+                retryable=True,
+                status_code=response.status_code,
+            )
         if response.status_code >= 400:
             raise OpenListError(
                 f"OpenList 请求被拒绝（HTTP {response.status_code}）",
@@ -420,7 +425,12 @@ class OpenListClient:
                     if error.retryable and retry_index >= self._max_retries:
                         raise error.exhausted() from error
                     raise
-                self._sleep(max(float(self._retry_backoff(retry_index + 1)), 0.0))
+                delay = max(float(self._retry_backoff(retry_index + 1)), 0.0)
+                logger.warning(
+                    f"Alist2Strm 目录分页请求重试：页码={payload.get('page')}，"
+                    f"重试={retry_index + 1}/{self._max_retries}，等待={delay:.2f}秒，状态码={error.status_code}"
+                )
+                self._sleep(delay)
         raise AssertionError("OpenList 重试循环未返回")
 
     def list_dir(self, remote_path: str) -> list[RemoteEntry]:
@@ -456,6 +466,7 @@ class OpenListClient:
                     raise OpenListError("OpenList 目录项名称无效", retryable=False)
                 entries.append(entry)
             collected += len(content)
+            logger.debug(f"Alist2Strm 目录分页读取完成：页码={page}，本页={len(content)}，累计={collected}/{total}")
             if collected >= total:
                 break
             if not content:
@@ -898,23 +909,32 @@ class ScanCoordinator:
                 message = (
                     "扫描正在停止，已跳过本次触发" if self._run.state == "stopping" else "扫描正在运行，已跳过本次触发"
                 )
+                logger.debug(f"Alist2Strm 任务 {self._run.run_id}：{message}")
                 return ScanTriggerResult(False, message)
             run_or_error = self._build_run(target, force_complete=force_complete)
             if isinstance(run_or_error, ScanTriggerResult):
+                logger.warning(f"Alist2Strm 扫描未启动：{run_or_error.message}")
                 return run_or_error
             if only_due and not any(self._mapping_has_due_work(mapping) for mapping in run_or_error.mappings):
+                logger.debug("Alist2Strm 定时检查跳过：没有到期目录")
                 return ScanTriggerResult(False, "没有到期目录")
             self._run = run_or_error
+        logger.info(
+            f"Alist2Strm 任务 {run_or_error.run_id} 提交：映射数={len(run_or_error.mappings)}，"
+            f"强制完整扫描={force_complete}，仅到期检查={only_due}"
+        )
         # 先保存运行中的初始快照，重启发生在后台回调开始前也能识别中断。
         self._notify_history(run_or_error)
         try:
             accepted = self._dispatch(self.execute)
-        except Exception:  # noqa: BLE001 - 调度边界失败不把后台细节返回前端
+        except Exception as error:  # noqa: BLE001 - 调度边界失败不把后台细节返回前端
+            logger.error(f"Alist2Strm 任务 {run_or_error.run_id} 调度异常：类型={type(error).__name__}")
             accepted = False
         if not accepted:
             with self._lock:
                 if self._run is run_or_error:
                     self._run = None
+            logger.warning(f"Alist2Strm 任务 {run_or_error.run_id} 调度被拒绝，扫描未启动")
             self._discard_history(run_or_error.run_id)
             return ScanTriggerResult(False, "后台任务调度不可用，扫描未启动")
         return ScanTriggerResult(True, "扫描已在后台启动")
@@ -1007,6 +1027,7 @@ class ScanCoordinator:
                 run.finished_at = self._clock()
                 notify = True
             result = ScanTriggerResult(True, "扫描正在停止")
+        logger.info(f"Alist2Strm 任务 {run.run_id} 收到停止请求：状态={run.state}")
         if notify:
             self._notify_history(run)
         return result
@@ -1035,12 +1056,13 @@ class ScanCoordinator:
                 run.started = True
         if run is None:
             return
+        logger.info(f"Alist2Strm 任务 {run.run_id} 开始执行")
         try:
             self._execute_mappings(run)
         except ScanStopped:
             pass
-        except Exception:  # noqa: BLE001 - 后台任务不得把异常传播回调度器
-            logger.error("Alist2Strm 扫描任务异常终止")
+        except Exception as error:  # noqa: BLE001 - 后台任务不得把异常传播回调度器
+            logger.error(f"Alist2Strm 任务 {run.run_id} 异常终止：类型={type(error).__name__}")
             with self._lock:
                 if run.stop_requested:
                     self._mark_pending_stopped_locked(run)
@@ -1073,6 +1095,11 @@ class ScanCoordinator:
                 run.current_mapping = None
                 run.finished_at = self._clock()
             self._notify_history(run)
+            logger.info(
+                f"Alist2Strm 任务 {run.run_id} 结束：状态={run.state}，"
+                f"耗时={max(run.finished_at - run.started_at, 0):.2f}秒，"
+                f"计数={self._status_for_run(run).counters.as_dict()}"
+            )
 
     def _finish_mapping_timestamp(self, mapping: _MappingRun) -> None:
         """只为已开始且进入终态的映射补写一次结束时间。"""
@@ -1384,6 +1411,12 @@ class ScanCoordinator:
                     mapping.status.finished_at = None
                     run.current_mapping = mapping.label
                 self._notify_history(run)
+                self._log_mapping(
+                    mapping,
+                    "info",
+                    f"映射开始：输出目录={mapping.output_dir}，"
+                    f"播放地址变化={mapping.playback_changed}，配置需要应用={mapping.configuration_required}",
+                )
                 try:
                     self._observe_stop(run)
                     if mapping.instance_id in failed_instances or (
@@ -1443,20 +1476,17 @@ class ScanCoordinator:
                     self._mark_mapping_stopped(mapping)
                     raise
                 except OpenListError as error:
-                    self._mark_mapping_failed(mapping, error.message)
+                    self._mark_mapping_failed(mapping, f"{error.message}（状态码={error.status_code}）")
                     if self._is_auth_failure(error):
                         failed_instances.add(mapping.instance_id)
                         if self._observation_store is not None:
                             self._observation_store.defer_instance(
                                 mapping.instance_id, self._clock(), mapping.active_recheck_minutes * 60
                             )
-                    self._log_mapping_failure(mapping)
                 except (OSError, ValueError) as error:
                     self._mark_mapping_failed(mapping, str(error))
-                    self._log_mapping_failure(mapping)
-                except Exception:  # noqa: BLE001 - 单组不可用不得阻断独立映射
-                    self._mark_mapping_failed(mapping, "映射扫描失败")
-                    self._log_mapping_failure(mapping)
+                except Exception as error:  # noqa: BLE001 - 单组不可用不得阻断独立映射
+                    self._mark_mapping_failed(mapping, f"映射扫描失败（类型={type(error).__name__}）")
                 finally:
                     if mapping.status.state in {"failed", "stopped"} and self._observation_store is not None:
                         self._observation_store.defer_cleanup(
@@ -1468,6 +1498,12 @@ class ScanCoordinator:
                         self._finish_mapping_timestamp(mapping)
                         run.current_mapping = None
                     self._notify_history(run)
+                    self._log_mapping(
+                        mapping,
+                        "info",
+                        f"映射结束：状态={mapping.status.state}，"
+                        f"允许清理={mapping.status.cleanup_eligible}，计数={mapping.status.counters.as_dict()}",
+                    )
         finally:
             with self._lock:
                 self._active_readers = []
@@ -1487,7 +1523,12 @@ class ScanCoordinator:
                     if error.retryable and retry_index >= self._max_retries:
                         raise error.exhausted() from error
                     raise
-                self._sleep(max(float(self._retry_backoff(retry_index + 1)), 0.0))
+                delay = max(float(self._retry_backoff(retry_index + 1)), 0.0)
+                logger.warning(
+                    f"Alist2Strm 任务 {run.run_id} I/O 重试："
+                    f"重试={retry_index + 1}/{self._max_retries}，等待={delay:.2f}秒，状态码={error.status_code}"
+                )
+                self._sleep(delay)
         raise AssertionError("扫描重试循环未返回")
 
     def _observe_stop(self, run: _ScanRun) -> None:
@@ -1514,21 +1555,29 @@ class ScanCoordinator:
         """移除映射 Token，保留可定位的错误上下文。"""
 
         safe_error = error or "映射扫描失败"
-        return safe_error.replace(mapping.token, "<redacted>") if mapping.token else safe_error
+        for secret in (mapping.token, quote(mapping.token, safe="")):
+            if secret:
+                safe_error = safe_error.replace(secret, "<redacted>")
+        safe_error = re.sub(r"(?i)https?://[^\s）\"<>]+", "<地址已隐藏>", safe_error)
+        safe_error = re.sub(
+            r"(?i)(authorization|password|token|sign)\s*[:=]\s*[^\s,;]+",
+            r"\1=<redacted>",
+            safe_error,
+        )
+        return safe_error.replace("\r", "\\r").replace("\n", "\\n")
 
-    @classmethod
-    def _record_mapping_error(cls, mapping: _MappingRun, error: str) -> None:
-        """记录首个失败位置和原因，避免逐文件历史明细。"""
+    def _record_mapping_error(self, mapping: _MappingRun, error: str) -> None:
+        """逐项记录安全失败日志，历史仅保留首个失败位置和原因。"""
 
-        safe_error = cls._safe_error(mapping, error)
+        safe_error = self._safe_error(mapping, error)
+        self._log_mapping(mapping, "warning", safe_error)
         if not mapping.status.error:
             mapping.status.error = safe_error
 
-    @classmethod
-    def _mark_mapping_failed(cls, mapping: _MappingRun, error: str) -> None:
+    def _mark_mapping_failed(self, mapping: _MappingRun, error: str) -> None:
         """设置脱敏映射失败结果并保留已完成计数。"""
 
-        cls._record_mapping_error(mapping, error)
+        self._record_mapping_error(mapping, error)
         mapping.status.state = "failed"
         mapping.status.cleanup_eligible = False
         mapping.status.counters.failed += 1
@@ -1548,13 +1597,14 @@ class ScanCoordinator:
 
         return error.auth_failure or error.status_code in {401, 403}
 
-    def _log_mapping_failure(self, mapping: _MappingRun) -> None:
-        """记录含实例、映射和安全原因的中文失败日志。"""
+    def _log_mapping(self, mapping: _MappingRun, level: str, message: str) -> None:
+        """统一输出任务与映射上下文，过滤凭据、URL 和换行。"""
 
-        logger.warning(
-            f"Alist2Strm 映射扫描失败：{mapping.instance_name} / {mapping.source_dir} / "
-            f"{self._safe_error(mapping, mapping.status.error or '映射扫描失败')}"
-        )
+        run = self._run
+        context = f"Alist2Strm 任务 {run.run_id if run else '-'} / {mapping.label}：{message}"
+        for item in run.mappings if run else (mapping,):
+            context = self._safe_error(item, context)
+        getattr(logger, level)(context)
 
     def _scan_mapping(
         self, reader_provider: Callable[[], Any], mapping: _MappingRun, video_suffixes: frozenset[str]
@@ -1590,6 +1640,11 @@ class ScanCoordinator:
                         self._remember_expected_output(mapping, mapping.output_dir.joinpath(*relative.parts, name))
                 else:
                     mapping.unscanned_directories.add(current)
+                self._log_mapping(
+                    mapping,
+                    "debug",
+                    f"目录时间剪枝：{current}，下次检查={previous.recheck_at}，需要复查={previous.needs_check}",
+                )
                 pending.extend((child, False) for child in previous.children)
                 continue
             if store is not None and not store.begin_check(
@@ -1602,13 +1657,16 @@ class ScanCoordinator:
             try:
                 self._observe_stop(run)
                 reader = reader_provider()
+                self._log_mapping(mapping, "debug", f"目录检查开始：{current}")
                 entries = self._list_directory(reader, current, run)
+                self._log_mapping(mapping, "debug", f"目录读取完成：{current}，条目数={len(entries)}")
                 if store is not None:
                     store.clear_instance_retry(mapping.instance_id)
             except ScanStopped:
                 raise
             except OpenListError as error:
                 if self._is_auth_failure(error):
+                    self._log_mapping(mapping, "warning", f"目录认证或权限失败：{current}，状态码={error.status_code}")
                     raise
                 if store is not None:
                     store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_minutes * 60)
@@ -1635,6 +1693,7 @@ class ScanCoordinator:
                         self._record_mapping_error(mapping, f"目录 {current}：目录项格式无效")
                         continue
                     if self._excluded(entry.name, mapping.exclude_keywords):
+                        self._log_mapping(mapping, "debug", f"排除关键字命中：目录={current}，名称={entry.name}")
                         continue
                     remote_path = _join_remote_path(current, entry.name)
                     observed_entries.append((entry.name, entry.is_dir, None if entry.is_dir else entry.modified_at))
@@ -1644,7 +1703,9 @@ class ScanCoordinator:
                         continue
                     suffix = PurePosixPath(entry.name).suffix.casefold()
                     if not suffix or suffix not in mapping.allowed_suffixes:
+                        self._log_mapping(mapping, "debug", f"后缀不在白名单：{remote_path}")
                         continue
+                    self._log_mapping(mapping, "debug", f"文件处理开始：{remote_path}")
                     if is_video_name(entry.name, video_suffixes):
                         target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
                         self._remember_expected_output(mapping, target)
@@ -1674,16 +1735,20 @@ class ScanCoordinator:
                             )
                     if failure:
                         self._record_mapping_error(mapping, f"文件 {remote_path}：{failure}")
+                    else:
+                        self._log_mapping(mapping, "debug", f"文件处理完成：{remote_path}，产物={target}")
                 except ScanStopped:
                     raise
                 except OpenListError as error:
                     if self._is_auth_failure(error):
                         raise
                     mapping.status.counters.failed += 1
-                    self._record_mapping_error(mapping, f"文件处理失败：{error.message}")
+                    self._record_mapping_error(mapping, f"目录 {current} 文件处理失败：{error.message}")
                 except Exception as error:  # noqa: BLE001 - 单文件失败不得阻断同目录文件
                     mapping.status.counters.failed += 1
-                    self._record_mapping_error(mapping, f"文件处理失败：{error}")
+                    self._record_mapping_error(
+                        mapping, f"目录 {current} 文件处理失败（{type(error).__name__}）：{error}"
+                    )
             self._observe_stop(self._run_for_mapping(mapping))
             if mapping.status.counters.failed != failed_before and previous is not None:
                 pending.extend((child, rebuild) for child in previous.children if child not in children)
@@ -1823,6 +1888,7 @@ class ScanCoordinator:
                 self._record_mapping_error(mapping, f"清理文件 {target}：删除失败（{error}）")
                 continue
             mapping.status.counters.deleted += 1
+            self._log_mapping(mapping, "debug", f"受管产物已删除：{target}")
         self._observe_stop(run)
         if self._observation_store is not None:
             self._observation_store.complete_cleanup(mapping.identity, mapping.checked_directories - unfinished)

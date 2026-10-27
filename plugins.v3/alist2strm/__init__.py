@@ -235,6 +235,11 @@ class Alist2Strm(_PluginBase):
         self._stopped = False
         self._recover_or_prune_history(candidate.history_retention_days)
         self._reconcile_mapping_identities(candidate)
+        logger.info(
+            f"Alist2Strm 初始化完成：实例数={len(candidate.instances)}，"
+            f"映射数={sum(len(instance.mappings) for instance in candidate.instances)}，"
+            f"自动扫描={candidate.schedule_enabled}，活跃复查间隔={candidate.active_recheck_minutes}分钟"
+        )
 
     def get_state(self) -> bool:
         """返回当前配置是否有效且可进入后续运行视图。"""
@@ -369,10 +374,12 @@ class Alist2Strm(_PluginBase):
                 raise ConfigurationPersistenceError("宿主配置保存失败")
             self.save_data(self.SECRET_DATA_KEY, new_tokens, plugin_id=self._plugin_id())
         except ConfigurationPersistenceError:
+            logger.error("Alist2Strm 配置保存失败：宿主拒绝写入")
             if public_write_started and result is not False:
                 self._rollback_persistence(old_public, old_tokens)
             raise
         except Exception as error:
+            logger.error(f"Alist2Strm 配置保存失败，开始回滚：类型={type(error).__name__}")
             self._rollback_persistence(old_public, old_tokens)
             raise ConfigurationPersistenceError("配置保存失败，编辑内容未改变") from error
 
@@ -381,6 +388,7 @@ class Alist2Strm(_PluginBase):
         self._configuration_valid = True
         self._prune_history(candidate.history_retention_days)
         self._refresh_scheduler_registration()
+        logger.info(f"Alist2Strm 配置已保存：实例数={len(candidate.instances)}，自动扫描={candidate.schedule_enabled}")
         return {
             "success": True,
             "message": "Alist2Strm 配置已保存；当前任务如正在运行仍使用原配置。",

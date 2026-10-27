@@ -2386,7 +2386,7 @@ def test_cleanup_delete_failure_continues_and_marks_run_failed(tmp_path: Path, m
 
             logs.append(message)
 
-    monkeypatch.setattr(scan_module, "logger", Logger())
+    monkeypatch.setattr(scan_module.logger, "warning", Logger().warning)
     coordinator = ScanCoordinator(
         lambda: configuration,
         dispatch=queue,
@@ -5245,3 +5245,39 @@ def test_slow_listing_failure_waits_full_active_interval_before_retry(tmp_path: 
     assert tasks.coordinator.trigger(only_due=True).accepted
     tasks.queue.run()
     assert tasks.transport.pages("/library") == [1]
+
+
+def test_scan_logs_each_directory_failure_with_run_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """多个目录失败均可关联任务与映射，异常中的凭据和签名地址不会进入日志。"""
+
+    configuration = _config(tmp_path)
+    queue = _Queue()
+    messages: list[str] = []
+    for level in ("info", "warning", "debug", "error"):
+        monkeypatch.setattr(scan_module.logger, level, messages.append)
+
+    class Reader:
+        """为每个源目录返回包含敏感信息的失败。"""
+
+        def list_dir(self, path: str) -> list[RemoteEntry]:
+            """模拟外部边界异常，验证安全日志而不访问网络。"""
+
+            raise OSError(f"{path}: token-a token-b https://user:password@example.invalid/file?sign=private-sign\n伪造日志")
+
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda _url, _token: Reader(),
+        media_suffix_provider=lambda: (".mkv",),
+    )
+    assert coordinator.trigger().accepted
+    queue.run()
+    run_id = coordinator.status().run_id
+    failures = [message for message in messages if "目录读取失败" in message]
+    assert len(failures) == 3
+    assert all(run_id in message for message in failures)
+    assert any("映射结束" in message for message in messages)
+    assert any("结束：状态=failed" in message for message in messages)
+    assert all("private-sign" not in message and "user:password" not in message for message in messages)
+    assert all("\n" not in message for message in messages)
+    assert all("token-a" not in message and "token-b" not in message for message in messages)

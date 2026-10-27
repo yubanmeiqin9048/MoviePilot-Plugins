@@ -171,7 +171,8 @@ class HistoryStore:
 
         try:
             raw = self._load()
-        except Exception:  # noqa: BLE001 - 历史读取失败不阻断插件生命周期
+        except Exception as error:  # noqa: BLE001 - 历史读取失败不阻断插件生命周期
+            logger.warning(f"Alist2Strm 扫描历史读取失败：类型={type(error).__name__}")
             return [], False, False
         items = normalize_history(raw, secrets=self._secret_values())
         canonical = _storage_payload(items)
