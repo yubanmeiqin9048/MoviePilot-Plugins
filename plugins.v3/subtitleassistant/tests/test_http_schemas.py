@@ -65,6 +65,7 @@ def test_all_http_model_field_shapes_are_explicitly_locked() -> None:
         task.TaskListItem: _TASK_LIST_FIELDS,
         task.TaskDetail: _TASK_LIST_FIELDS
         | {
+            "download_attempts",
             "tmdb_id",
             "imdb_id",
             "target_storage",

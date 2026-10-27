@@ -2817,3 +2817,52 @@ async def test_task_translates_business_rules_to_explicit_download_policies(
     assert not hasattr(request, "operation")
     assert not hasattr(request, "trigger")
     await coordinator.shutdown("测试清理")
+
+
+@pytest.mark.parametrize("status", list(DownloadStatus))
+async def test_candidate_attempt_snapshot_survives_storage_and_http_projection(
+    tmp_path: Path, status: DownloadStatus,
+) -> None:
+    """下载前可见候选，完成后保留结果，持久化和 HTTP 投影不暴露下载句柄。"""
+
+    from app.plugins.subtitleassistant.schemas.http.task import TaskDetail
+
+    store = _TaskStore()
+    coordinator = object.__new__(TaskOperations)
+    coordinator._store = store
+    coordinator._strategy = PackageAttributionStrategy.TRUST_PACKAGE
+    coordinator._attempt_seq = 0
+    item = _work_item(tmp_path, "attempt-snapshot")
+    handle = _candidate("snapshot-candidate")
+    task = SubtitleTask(
+        media_title=item.context.title,
+        target_file_name=item.context.target_file_name,
+        target_path=item.context.target_path,
+    )
+
+    async def download(_request: object) -> DownloadResult:
+        """验证外部下载开始前已保存候选快照。"""
+
+        saved = store.tasks[task.id]
+        assert saved.download_attempts is not None
+        assert saved.download_attempts[0].name == handle.candidate.name
+        assert saved.download_attempts[0].result is None
+        return DownloadResult(records=(), result=status)
+
+    coordinator._download = SimpleNamespace(download=download)
+    if status is DownloadStatus.INTERRUPTED:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._try_candidate(task, item, handle)
+    else:
+        await coordinator._try_candidate(task, item, handle)
+    saved = SubtitleTask.model_validate_json(store.tasks[task.id].model_dump_json())
+    detail = TaskDetail.model_validate(saved.model_dump(mode="json", include=set(TaskDetail.model_fields)))
+    assert detail.download_attempts is not None
+    assert detail.download_attempts[0].result == status
+    assert detail.download_attempts[0].candidate_key == handle.candidate.candidate_key
+    assert set(detail.download_attempts[0].model_dump()) == {
+        "candidate_key", "name", "source", "result", "error_summary",
+    }
+    assert SubtitleTask.model_validate_json(
+        task.model_dump_json(exclude={"download_attempts"})
+    ).download_attempts is None

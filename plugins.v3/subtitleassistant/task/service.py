@@ -37,6 +37,7 @@ from ..schemas.source import (
 )
 from ..schemas.target import MediaType, PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 from ..schemas.task import (
+    CandidateAttempt,
     SubtitleTask,
     TaskStatus,
     TaskTrigger,
@@ -263,6 +264,7 @@ class TaskOperations:
                 target_history_id=item.target_history_id,
                 history_target_path=item.context.target_path if history_target else None,
                 target_storage=item.context.target_storage,
+                download_attempts=[],
                 trigger=TaskTrigger.MANUAL_CANDIDATE if manual_handle else TaskTrigger.TRANSFER_EVENT,
             )
             await self._store.save_task(task)
@@ -711,6 +713,15 @@ class TaskOperations:
 
         operation = operation or item.attempt_operation or SubtitleWrittenOperation.AUTOMATIC_CANDIDATE
         retention = retention or DownloadRetention(item.attempt_retention or DownloadRetention.DISCARD.value)
+        attempt = CandidateAttempt(
+            candidate_key=handle.candidate.candidate_key,
+            name=handle.candidate.name,
+            source=handle.candidate.source,
+        )
+        if task.download_attempts is None:
+            task.download_attempts = []
+        task.download_attempts.append(attempt)
+        await self._save(task)
         result = await self._download.download(
             DownloadRequest(
                 task_id=task.id,
@@ -730,6 +741,9 @@ class TaskOperations:
                 destination=item.destination,
             )
         )
+        attempt.result = result.result
+        attempt.error_summary = result.error_summary
+        await self._save(task)
         self._log_candidate_attempt(task, handle.candidate, result)
         if result.result is DownloadStatus.INTERRUPTED:
             await self._publish_committed_files(task, operation, result.committed_files)

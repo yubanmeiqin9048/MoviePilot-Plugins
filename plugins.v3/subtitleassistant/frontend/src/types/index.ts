@@ -93,7 +93,16 @@ export interface TaskListItem {
   trigger: TaskTrigger
 }
 
+export interface CandidateAttempt {
+  candidate_key: string
+  name: string
+  source: SubtitleSource
+  result: 'success' | 'download_failed' | 'extract_failed' | 'no_match' | 'write_failed' | 'interrupted' | null
+  error_summary: string | null
+}
+
 export interface TaskDetail extends TaskListItem {
+  download_attempts?: CandidateAttempt[] | null
   subtitle_directory?: string | null
   tmdb_id: number | null
   imdb_id: string | null

@@ -11,7 +11,7 @@ import EmptyState from '@/components/EmptyState.vue'
 import StateChip from '@/components/StateChip.vue'
 import { useDebouncedValue } from '@/composables/useDebouncedValue'
 import { useStickyContentClipping, useStickyTableClipping } from '@/composables/useStickyTableClipping'
-import type { PluginApi, TaskDetail, TaskListItem, TaskStatus } from '@/types'
+import type { CandidateAttempt, PluginApi, TaskDetail, TaskListItem, TaskStatus } from '@/types'
 import {
   elapsedDuration,
   formatDate,
@@ -19,6 +19,7 @@ import {
   isTerminalTask,
   mediaLabel,
   mediaTypeLabels,
+  sourceLabels,
   taskStates,
   taskTriggerLabels,
 } from '@/types/presentation'
@@ -42,6 +43,14 @@ const statusOptions: Array<{ title: string; value: TaskStatus | '' }> = [
   { title: '已中断', value: 'interrupted' },
 ]
 const pageSizeOptions = [25, 50, 100]
+const attemptResultLabels: Record<NonNullable<CandidateAttempt['result']>, string> = {
+  success: '处理成功',
+  download_failed: '下载失败',
+  extract_failed: '解包失败',
+  no_match: '未匹配目标',
+  write_failed: '保存失败',
+  interrupted: '已中断',
+}
 
 const items = ref<TaskListItem[]>([])
 const total = ref(0)
@@ -517,6 +526,24 @@ function taskTime(item: TaskListItem): string {
           </VExpansionPanel>
 
           <VExpansionPanel>
+            <VExpansionPanelTitle>下载候选（{{ detail.download_attempts?.length ?? 0 }}）</VExpansionPanelTitle>
+            <VExpansionPanelText>
+              <div v-for="(attempt, index) in detail.download_attempts" :key="index" class="candidate-attempt">
+                <strong>{{ index + 1 }}. {{ attempt.name || attempt.candidate_key }}</strong>
+                <dl>
+                  <DetailRow label="字幕源">{{ sourceLabels[attempt.source] }}</DetailRow>
+                  <DetailRow label="处理结果">{{ attempt.result ? attemptResultLabels[attempt.result] : (isTerminalTask(detail.status) ? '未记录完成结果' : '处理中') }}</DetailRow>
+                  <DetailRow v-if="attempt.error_summary" label="原因">{{ attempt.error_summary }}</DetailRow>
+                </dl>
+              </div>
+              <p v-if="!detail.download_attempts?.length" class="muted">{{ detail.reason_code === 'staged_inventory_consumed'
+                ? '本次使用暂存库存，未下载新候选。'
+                : detail.download_attempts == null ? '此任务未记录候选下载明细。'
+                  : isTerminalTask(detail.status) ? '本次没有尝试下载候选。' : '尚未开始下载候选。' }}</p>
+            </VExpansionPanelText>
+          </VExpansionPanel>
+
+          <VExpansionPanel>
             <VExpansionPanelTitle>目标</VExpansionPanelTitle>
             <VExpansionPanelText>
               <dl>
@@ -587,6 +614,8 @@ function taskTime(item: TaskListItem): string {
 .page-size { min-width: 7rem; }
 .detail-state { margin: 1rem; }
 .detail-sections { border-radius: 0; }
+.candidate-attempt { overflow-wrap: anywhere; }
+.candidate-attempt + .candidate-attempt { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .muted { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: 0.8125rem; line-height: 1.5; }
 .error-text { display: block; margin-top: 0.25rem; color: rgb(var(--v-theme-error)); font-size: 0.8125rem; }
 .mobile-list { padding: 0; border-block: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); background: transparent; }

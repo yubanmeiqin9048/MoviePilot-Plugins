@@ -150,6 +150,7 @@ SCHEMA_EXPORTS = {
     },
     "download": {"DownloadStatus", "DownloadReasonCode", "DownloadRetention", "DownloadRequest", "DownloadResult"},
     "task": {
+        "CandidateAttempt",
         "ManualSubmitResult",
         "ManualSubmitStatus",
         "SubtitleTask",

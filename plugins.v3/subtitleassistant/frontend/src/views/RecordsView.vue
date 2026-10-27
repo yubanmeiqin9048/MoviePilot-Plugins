@@ -551,6 +551,9 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
             <VExpansionPanelTitle>文件</VExpansionPanelTitle>
             <VExpansionPanelText><dl>
               <DetailRow label="记录 ID"><CopyValue :value="detail.id" label="记录 ID" /></DetailRow>
+              <DetailRow label="状态"><StateChip :state="recordStates[detail.status]" /></DetailRow>
+              <DetailRow label="创建时间">{{ formatDate(detail.created_at) }}</DetailRow>
+              <DetailRow label="最后更新">{{ formatDate(detail.updated_at) }}</DetailRow>
               <DetailRow label="字幕文件">{{ detail.subtitle_file_name }}</DetailRow>
               <DetailRow label="格式">{{ detail.format }}</DetailRow>
               <DetailRow label="大小">{{ formatBytes(detail.size) }}</DetailRow>
@@ -582,6 +585,10 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
           <VExpansionPanel>
             <VExpansionPanelTitle>来源</VExpansionPanelTitle>
             <VExpansionPanelText><dl>
+              <DetailRow label="来源任务"><CopyValue :value="detail.source_task_id" label="来源任务 ID" /></DetailRow>
+              <DetailRow v-if="detail.staged_at" label="暂存时间">{{ formatDate(detail.staged_at) }}</DetailRow>
+              <DetailRow v-if="detail.consumed_task_id" label="库存使用任务"><CopyValue :value="detail.consumed_task_id" label="库存使用任务 ID" /></DetailRow>
+              <DetailRow v-if="detail.consumed_at" label="库存使用时间">{{ formatDate(detail.consumed_at) }}</DetailRow>
               <DetailRow label="字幕源">{{ sourceLabels[detail.source] }}</DetailRow>
               <DetailRow label="候选">{{ detail.candidate_name || detail.candidate_key }}</DetailRow>
               <DetailRow label="候选键"><CopyValue :value="detail.candidate_key" label="候选键" /></DetailRow>
@@ -590,18 +597,6 @@ async function handleBatchDeleteRefreshRequired(message: string): Promise<void> 
               <DetailRow label="翻译类型">{{ translationLabels[detail.translation_type] }}</DetailRow>
               <DetailRow label="文件归属方式">{{ detail.file_attribution_method ? fileAttributionLabels[detail.file_attribution_method] : '未记录' }}</DetailRow>
               <DetailRow v-if="detail.unmatched_reason" label="未匹配原因">{{ unmatchedReasonLabels[detail.unmatched_reason] }}</DetailRow>
-            </dl></VExpansionPanelText>
-          </VExpansionPanel>
-          <VExpansionPanel>
-            <VExpansionPanelTitle>生命周期</VExpansionPanelTitle>
-            <VExpansionPanelText><dl>
-              <DetailRow label="状态"><StateChip :state="recordStates[detail.status]" /></DetailRow>
-              <DetailRow label="来源任务"><CopyValue :value="detail.source_task_id" label="来源任务 ID" /></DetailRow>
-              <DetailRow label="创建时间">{{ formatDate(detail.created_at) }}</DetailRow>
-              <DetailRow label="首次暂存">{{ formatDate(detail.staged_at) }}</DetailRow>
-              <DetailRow label="最后更新">{{ formatDate(detail.updated_at) }}</DetailRow>
-              <DetailRow label="消费任务"><CopyValue :value="detail.consumed_task_id" label="消费任务 ID" /></DetailRow>
-              <DetailRow label="消费时间">{{ formatDate(detail.consumed_at) }}</DetailRow>
             </dl></VExpansionPanelText>
           </VExpansionPanel>
           <VExpansionPanel>

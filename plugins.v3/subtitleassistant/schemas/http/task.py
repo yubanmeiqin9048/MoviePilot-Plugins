@@ -9,6 +9,8 @@ from typing import Annotated
 
 from pydantic import BeforeValidator
 
+from ...schemas.download import DownloadStatus
+from ...schemas.source import SubtitleSource
 from ...schemas.target import MediaType
 from ...schemas.task import TaskStatus, TaskTrigger
 from .base import ApiModel
@@ -95,6 +97,16 @@ class TaskListItem(ApiModel):
     duration_ms: int | None
 
 
+class CandidateAttempt(ApiModel):
+    """供任务详情展示的候选下载尝试。"""
+
+    candidate_key: str
+    name: str
+    source: Annotated[SubtitleSource, BeforeValidator(_enum_parser(SubtitleSource))]
+    result: Annotated[DownloadStatus | None, BeforeValidator(_enum_parser(DownloadStatus))] = None
+    error_summary: str | None = None
+
+
 class TaskDetail(TaskListItem):
     """字幕任务详情。"""
 
@@ -104,6 +116,7 @@ class TaskDetail(TaskListItem):
     matched_path_mapping: PathMappingSnapshot | None
     target_file_exists: bool | None
     subtitle_directory: str | None = None
+    download_attempts: list[CandidateAttempt] | None = None
 
 
 class TaskPage(ApiModel):

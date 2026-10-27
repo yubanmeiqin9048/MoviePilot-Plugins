@@ -11,14 +11,16 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field
 
 from .base import StrictModel, new_id, utc_now
+from .download import DownloadStatus
 from .event import SubtitleWrittenOperation
-from .source import CandidateHandle
+from .source import CandidateHandle, SubtitleSource
 from .target import MediaType, PathMappingSnapshot, SubtitleDestination, SubtitleTarget
 
 if TYPE_CHECKING:
     from .attribution import CandidateMatchContext
 
 __all__ = [
+    "CandidateAttempt",
     "ManualSubmitResult",
     "ManualSubmitStatus",
     "SubtitleTask",
@@ -46,6 +48,16 @@ class TaskTrigger(StrEnum):
     MANUAL_CANDIDATE = "manual_candidate"
 
 
+class CandidateAttempt(StrictModel):
+    """任务实际尝试的候选快照，不保存下载句柄。"""
+
+    candidate_key: str
+    name: str
+    source: SubtitleSource
+    result: DownloadStatus | None = None
+    error_summary: str | None = None
+
+
 class SubtitleTask(StrictModel):
     """持久化的字幕任务：身份与目标、终态结论与时间。"""
 
@@ -67,6 +79,7 @@ class SubtitleTask(StrictModel):
     target_file_exists: bool | None = None
     target_storage: str | None = None
 
+    download_attempts: list[CandidateAttempt] | None = None
     status: TaskStatus = TaskStatus.QUEUED
     reason_code: str | None = None
     reason_message: str | None = None

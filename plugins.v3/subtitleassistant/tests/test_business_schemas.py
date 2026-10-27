@@ -62,6 +62,7 @@ from app.plugins.subtitleassistant.schemas.task import SubtitleTask, TaskStatus,
 EXPECTED_EXPORTS = {
     "download": {"DownloadStatus", "DownloadReasonCode", "DownloadRetention", "DownloadRequest", "DownloadResult"},
     "task": {
+        "CandidateAttempt",
         "SubtitleTask",
         "TaskStatus",
         "TaskTrigger",
@@ -150,6 +151,7 @@ EXPECTED_EXPORTS = {
 
 EXPECTED_PERSISTED_FIELDS = {
     "SubtitleTask": {
+        "download_attempts",
         "id",
         "trigger",
         "media_title",
