@@ -245,7 +245,7 @@ def test_invalid_active_interval_is_rejected_before_persistence_or_schedule_refr
     plugin.update_config = lambda *args, **kwargs: pytest.fail("活跃间隔 校验失败不应写入宿主")
 
     with pytest.raises(ConfigurationValidationError):
-        plugin.save_configuration({**_payload(enabled=True), "active_recheck_minutes": 0})
+        plugin.save_configuration({**_payload(enabled=True), "active_recheck_days": 0})
 
     assert refreshes == []
     assert plugin._configuration.schedule_enabled is False
@@ -446,7 +446,7 @@ def test_manual_and_scheduled_scans_share_single_layer_pruning_deadline(tmp_path
     orphan = tmp_path / "removed.strm"
     orphan.write_text("protected until checked", encoding="utf-8")
     service = next(item for item in plugin.get_service() if item["id"] == "shared-scan")
-    now[0] += 3600 - 1
+    now[0] += 7 * 86400 - 1
     assert service["func"]()["accepted"] is False
     assert not queue.jobs
     assert calls == ["/library"]

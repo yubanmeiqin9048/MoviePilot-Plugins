@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { DEFAULT_FILE_AGE_POLICY } from '@/fileAgePolicy'
 import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { getErrorMessage, readConfiguration, saveConfiguration } from '@/api'
@@ -50,8 +51,13 @@ const dirty = computed(() => serialize(toPayload(draft.value)) !== baseline.valu
 const notices = computed(() => ({ ...DEFAULT_NOTICES, ...(draft.value.notices || {}) }))
 const outputConflicts = computed(() => findOutputConflicts(draft.value.instances))
 const pruningError = computed(() => {
-  const minutes = draft.value.active_recheck_minutes
-  return Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440 ? '' : '请输入 1 至 1440 的整数分钟数'
+  const days = draft.value.active_recheck_days
+  if (!Number.isInteger(days) || days < 1) return '天数必须为正整数'
+  const policy = draft.value.file_age_policy
+  if (Object.values(policy).some(value => !Number.isInteger(value) || value <= 0)) return '天数必须为正整数'
+  if (!(policy.recent_days < policy.cold_after_days && policy.cold_after_days < policy.archive_after_days)) return '年龄阈值必须满足：近期窗口 < 冷目录阈值 < 长期静态阈值'
+  if (!(days <= policy.stale_recheck_days && policy.stale_recheck_days <= policy.cold_recheck_days && policy.cold_recheck_days <= policy.archive_recheck_days)) return '复查间隔必须满足：近期目录 ≤ 陈旧目录 ≤ 冷目录 ≤ 长期静态目录'
+  return ''
 })
 const canSave = computed(() => !saving.value && dirty.value && !outputConflicts.value.size && !pruningError.value)
 const activeInstance = computed(() => draft.value.instances[activeIndex.value] ?? null)
@@ -98,7 +104,8 @@ function emptyModel(): ConfigModel {
   return {
     instances: [],
     schedule_enabled: false,
-    active_recheck_minutes: 60,
+    active_recheck_days: 1,
+    file_age_policy: { ...DEFAULT_FILE_AGE_POLICY },
     history_retention_days: 90,
     notices: { ...DEFAULT_NOTICES },
   }
@@ -110,7 +117,8 @@ function normalizeConfig(value?: Partial<ConfigModel>): ConfigModel {
   return {
     instances: rawInstances.map((item, instanceIndex) => normalizeInstance(item, instanceIndex)),
     schedule_enabled: input.schedule_enabled === true,
-    active_recheck_minutes: typeof input.active_recheck_minutes === 'number' ? input.active_recheck_minutes : 60,
+    file_age_policy: { ...DEFAULT_FILE_AGE_POLICY, ...(value?.file_age_policy || {}) },
+    active_recheck_days: typeof input.active_recheck_days === 'number' ? input.active_recheck_days : 1,
     history_retention_days: Number.isInteger(Number(input.history_retention_days)) && Number(input.history_retention_days) > 0
       ? Number(input.history_retention_days)
       : 90,
@@ -604,7 +612,7 @@ async function save(): Promise<void> {
             <div class="a2s-section-head">
               <div>
                 <h3 class="a2s-section-title">自动扫描</h3>
-                <p class="a2s-section-desc">自动检查到期目录，稳定目录逐步降低读取频率。</p>
+                <p class="a2s-section-desc">自动检查到期目录，按子树最新文件修改时间区分冷热。</p>
               </div>
               <VSwitch
                 v-model="draft.schedule_enabled"
@@ -616,22 +624,113 @@ async function save(): Promise<void> {
                 class="a2s-switch"
               />
             </div>
-            <div class="a2s-grid">
+            <div class="a2s-grid a2s-age-row">
               <VTextField
-                v-model.number="draft.active_recheck_minutes"
-                label="活跃目录复查间隔"
-                hint="默认 60 分钟；检查失败后也按此间隔重试。"
-                :error-messages="pruningError"
+                v-model.number="draft.file_age_policy.recent_days"
                 type="number"
                 min="1"
-                max="1440"
                 step="1"
-                suffix="分钟"
+                suffix="天"
+                label="近期窗口上限"
+                hint="最新文件年龄不超过此天数。"
+                persistent-hint
+              />
+              <VTextField
+                v-model.number="draft.active_recheck_days"
+                label="近期目录复查间隔"
+                hint="检查失败后也按此间隔重试。"
+                type="number"
+                min="1"
+                :error-messages="pruningError"
+                step="1"
+                suffix="天"
+                persistent-hint
+              />
+            </div>
+            <div class="a2s-grid a2s-age-row">
+              <VTextField
+                v-model.number="draft.file_age_policy.cold_after_days"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
+                label="陈旧窗口上限"
+                hint="超过近期窗口，且不超过此天数。"
+                persistent-hint
+              />
+              <VTextField
+                v-model.number="draft.file_age_policy.stale_recheck_days"
+                label="陈旧目录复查间隔"
+                hint="对应左侧陈旧窗口。"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
+                persistent-hint
+              />
+            </div>
+            <div class="a2s-grid a2s-age-row">
+              <VTextField
+                v-model.number="draft.file_age_policy.archive_after_days"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
+                label="冷目录窗口上限"
+                hint="超过陈旧窗口，且不超过此天数。"
+                persistent-hint
+              />
+              <VTextField
+                v-model.number="draft.file_age_policy.cold_recheck_days"
+                label="冷目录复查间隔"
+                hint="对应左侧冷目录窗口。"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
+                persistent-hint
+              />
+            </div>
+            <div class="a2s-grid a2s-age-row">
+              <VTextField
+                :model-value="`超过 ${draft.file_age_policy.archive_after_days} 天`"
+                readonly
+                label="长期静态窗口"
+                hint="超过冷目录窗口上限。"
+                persistent-hint
+              />
+              <VTextField
+                v-model.number="draft.file_age_policy.archive_recheck_days"
+                label="长期静态目录复查间隔"
+                hint="对应左侧长期静态窗口。"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
+                persistent-hint
+              />
+            </div>
+            <div class="a2s-grid a2s-age-row">
+              <VTextField
+                model-value="空目录或时间不确定"
+                readonly
+                label="空目录／异常时间"
+                hint="没有文件，或文件修改时间缺失、异常。"
+                persistent-hint
+              />
+              <VTextField
+                v-model.number="draft.file_age_policy.uncertain_recheck_days"
+                label="空目录／异常时间复查间隔"
+                hint="混合有效时间时，取本间隔与正常档位间隔中的较短值。"
+                type="number"
+                min="1"
+                step="1"
+                suffix="天"
                 persistent-hint
               />
             </div>
             <p class="a2s-section-desc">
-              每层目录独立判断变化。成功检查确认稳定达到 1、7、30 天后，分别每 1、7、30 天复查；发现变化后恢复活跃间隔。空目录遵循相同规则。
+              首次扫描后即可按上述文件年龄阈值分档。所有映射共用设置，一天按 24 小时计算。缩短间隔可提前复查，延长间隔不推迟已经取得的期限；新档位在复查后使用。父目录跳过不阻挡已知子目录独立到期复查。
               冷却期间新增、删除等变化可能延迟发现。需要立即检查时，可在总览运行全部强制完整扫描，或单独运行某个映射的强制完整扫描。
             </p>
           </section>
@@ -848,6 +947,10 @@ async function save(): Promise<void> {
   color: rgba(var(--v-theme-on-surface), 0.6);
 }
 .a2s-section-desc--warn .v-icon { vertical-align: -2px; margin-inline-end: 0.125rem; }
+
+.a2s-age-row + .a2s-age-row {
+  margin-top: 1rem;
+}
 
 .a2s-grid {
   display: grid;

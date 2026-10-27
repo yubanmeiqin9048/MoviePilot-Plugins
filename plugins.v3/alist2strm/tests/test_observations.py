@@ -86,8 +86,8 @@ def test_modified_time_is_absolute_or_unknown(value: object, expected: float | N
 @pytest.mark.parametrize(
     ("field", "invalid"),
     [
-        ("stable_seconds", -1),
-        ("stable_seconds", float("nan")),
+        ("uncertain_time", "unknown"),
+        ("latest_modified_at", float("nan")),
         ("attempted_at", True),
         ("cleanup_retry_at", "tomorrow"),
         ("configuration_revision", -1),
@@ -95,8 +95,8 @@ def test_modified_time_is_absolute_or_unknown(value: object, expected: float | N
         ("fingerprint", []),
     ],
 )
-def test_corrupt_stability_or_cleanup_state_requires_rebuild(field: str, invalid: object) -> None:
-    """损坏的稳定或清理状态不能让目录长期跳过检查或越界清理。"""
+def test_corrupt_file_time_or_cleanup_state_requires_rebuild(field: str, invalid: object) -> None:
+    """损坏的文件时间或清理状态不能让目录长期跳过检查或越界清理。"""
 
     persisted: dict[str, Any] = {}
     identity = ("instance", "/library", "/output")

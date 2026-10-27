@@ -104,7 +104,7 @@ def test_automatic_scanning_and_force_all_controls_match_public_api() -> None:
     config = (PLUGIN_ROOT / "frontend/src/components/Config.vue").read_text(encoding="utf-8")
     page = (PLUGIN_ROOT / "frontend/src/components/Page.vue").read_text(encoding="utf-8")
     api = (PLUGIN_ROOT / "frontend/src/api.ts").read_text(encoding="utf-8")
-    assert "draft.active_recheck_minutes" in config
+    assert "draft.active_recheck_days" in config
     assert "draft.schedule_cron" not in config and "draft.time_pruning" not in config
     assert "全部强制完整扫描" in page
     assert "runAll('force_complete')" in page

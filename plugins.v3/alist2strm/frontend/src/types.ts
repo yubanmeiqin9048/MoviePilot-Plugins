@@ -31,11 +31,22 @@ export interface Notices {
   output_directory: string
 }
 
+export interface FileAgePolicy {
+  recent_days: number
+  cold_after_days: number
+  archive_after_days: number
+  stale_recheck_days: number
+  cold_recheck_days: number
+  archive_recheck_days: number
+  uncertain_recheck_days: number
+}
+
 export interface ConfigModel {
   plugin_id?: string
   instances: OpenListInstance[]
   schedule_enabled: boolean
-  active_recheck_minutes: number
+  active_recheck_days: number
+  file_age_policy: FileAgePolicy
   history_retention_days: number
   notices?: Notices
 }

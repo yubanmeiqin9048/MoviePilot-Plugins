@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0002
 ---
 
 # 按本层已观测稳定时长降低目录复查频率

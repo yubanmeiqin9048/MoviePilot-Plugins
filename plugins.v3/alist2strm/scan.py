@@ -22,7 +22,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from app.sdk.config import settings
 from app.sdk.logging import logger
 
-from .config import PluginConfiguration
+from .config import FileAgePolicy, PluginConfiguration
 from .observations import (
     DirectoryObservationStore,
     MappingConfigurationObservation,
@@ -777,7 +777,8 @@ class _MappingRun:
     allowed_suffixes: frozenset[str]
     exclude_keywords: tuple[str, ...]
     status: MappingScanStatus
-    active_recheck_minutes: int = 60
+    active_recheck_days: int = 1
+    file_age_policy: FileAgePolicy = field(default_factory=FileAgePolicy)
     playback_changed: bool = False
     expected_outputs: set[Path] = field(default_factory=set)
     expected_output_identities: set[Path] = field(default_factory=set)
@@ -1240,7 +1241,8 @@ class ScanCoordinator:
                         configuration_changed=previous_configuration.fingerprint != configuration_fingerprint,
                         configuration_revision=previous_configuration.revision,
                         status=status,
-                        active_recheck_minutes=snapshot.active_recheck_minutes,
+                        active_recheck_days=snapshot.active_recheck_days,
+                        file_age_policy=snapshot.file_age_policy,
                     )
                 )
         if target is not None and not mappings:
@@ -1283,13 +1285,52 @@ class ScanCoordinator:
         return hashlib.sha256(snapshot.encode()).hexdigest()
 
     @staticmethod
-    def _recheck_interval(stable_seconds: float, active_minutes: int) -> float:
-        """按成功观测覆盖的稳定时长分档，不按文件年龄或检查次数分档。"""
+    def _recheck_interval(
+        latest_modified_at: float | None, uncertain: bool, now: float, active_days: int, policy: FileAgePolicy
+    ) -> float:
+        """按子树文件年龄分档；空目录和不确定时间使用配置的保底间隔。"""
 
-        for days in (30, 7, 1):
-            if stable_seconds >= days * 86400:
-                return days * 86400
-        return active_minutes * 60
+        if latest_modified_at is None or latest_modified_at > now:
+            return policy.uncertain_recheck_days * 86400
+        age = now - latest_modified_at
+        if age <= policy.recent_days * 86400:
+            return min(active_days, policy.uncertain_recheck_days) * 86400 if uncertain else active_days * 86400
+        days = (
+            policy.stale_recheck_days
+            if age <= policy.cold_after_days * 86400
+            else policy.cold_recheck_days
+            if age <= policy.archive_after_days * 86400
+            else policy.archive_recheck_days
+        )
+        return min(days, policy.uncertain_recheck_days) * 86400 if uncertain else days * 86400
+
+    def _directory_interval(self, mapping: _MappingRun, path: str, now: float) -> float:
+        """使用已保存的子树文件时间选择间隔，不访问远端。"""
+
+        assert self._observation_store is not None
+        latest, uncertain = self._observation_store.subtree_file_time(mapping.identity, path, now)
+        return self._recheck_interval(latest, uncertain, now, mapping.active_recheck_days, mapping.file_age_policy)
+
+    def _refresh_recheck_deadlines(self, mapping: _MappingRun) -> None:
+        """本轮观测结束后汇总子树；只初始化或提前各层自身的期限。"""
+
+        store = self._observation_store
+        if store is None:
+            return
+        now = self._clock()
+        pending = [mapping.source_dir]
+        visited: set[str] = set()
+        while pending:
+            path = pending.pop()
+            if path in visited:
+                continue
+            visited.add(path)
+            previous = store.directory(mapping.identity, path)
+            if previous.successful_at is not None and not previous.needs_check:
+                store.advance_recheck(
+                    mapping.identity, path, previous.successful_at + self._directory_interval(mapping, path, now)
+                )
+            pending.extend(previous.children)
 
     def _mapping_has_due_work(self, mapping: _MappingRun) -> bool:
         """只查看本地观测，到期前不创建后台任务和运行历史。"""
@@ -1338,7 +1379,7 @@ class ScanCoordinator:
             or previous.recheck_at is None
         ):
             return False
-        interval = self._recheck_interval(previous.stable_seconds, mapping.active_recheck_minutes)
+        interval = self._directory_interval(mapping, path, now)
         recheck_at = min(previous.recheck_at, previous.successful_at + interval)
         if recheck_at < previous.recheck_at:
             store.advance_recheck(mapping.identity, path, recheck_at)
@@ -1481,18 +1522,19 @@ class ScanCoordinator:
                         failed_instances.add(mapping.instance_id)
                         if self._observation_store is not None:
                             self._observation_store.defer_instance(
-                                mapping.instance_id, self._clock(), mapping.active_recheck_minutes * 60
+                                mapping.instance_id, self._clock(), mapping.active_recheck_days * 86400
                             )
                 except (OSError, ValueError) as error:
                     self._mark_mapping_failed(mapping, str(error))
                 except Exception as error:  # noqa: BLE001 - 单组不可用不得阻断独立映射
                     self._mark_mapping_failed(mapping, f"映射扫描失败（类型={type(error).__name__}）")
                 finally:
+                    self._refresh_recheck_deadlines(mapping)
                     if mapping.status.state in {"failed", "stopped"} and self._observation_store is not None:
                         self._observation_store.defer_cleanup(
                             mapping.identity,
                             mapping.checked_directories,
-                            self._clock() + mapping.active_recheck_minutes * 60,
+                            self._clock() + mapping.active_recheck_days * 86400,
                         )
                     with self._lock:
                         self._finish_mapping_timestamp(mapping)
@@ -1648,7 +1690,7 @@ class ScanCoordinator:
                 pending.extend((child, False) for child in previous.children)
                 continue
             if store is not None and not store.begin_check(
-                mapping.identity, current, self._clock(), mapping.active_recheck_minutes * 60
+                mapping.identity, current, self._clock(), mapping.active_recheck_days * 86400
             ):
                 raise OSError(f"目录 {current}：未完成标记保存失败，未开始目录检查")
             failed_before = mapping.status.counters.failed
@@ -1669,7 +1711,7 @@ class ScanCoordinator:
                     self._log_mapping(mapping, "warning", f"目录认证或权限失败：{current}，状态码={error.status_code}")
                     raise
                 if store is not None:
-                    store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_minutes * 60)
+                    store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_days * 86400)
                 mapping.status.counters.failed += 1
                 self._record_mapping_error(mapping, f"目录 {current}：{error.message}")
                 if previous is not None:
@@ -1677,7 +1719,7 @@ class ScanCoordinator:
                 continue
             except Exception as error:  # noqa: BLE001 - 单个目录失败不阻断兄弟目录
                 if store is not None:
-                    store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_minutes * 60)
+                    store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_days * 86400)
                 mapping.status.counters.failed += 1
                 self._record_mapping_error(mapping, f"目录 {current}：目录读取失败（{error}）")
                 if previous is not None:
@@ -1761,22 +1803,10 @@ class ScanCoordinator:
                         separators=(",", ":"),
                     ).encode()
                 ).hexdigest()
-                stable_seconds = 0.0
-                if (
-                    previous is not None
-                    and previous.fingerprint == fingerprint
-                    and previous.configuration_fingerprint == mapping.configuration_fingerprint
-                    and previous.configuration_revision == mapping.configuration_revision
-                    and previous.successful_at is not None
-                    and now >= previous.successful_at
-                ):
-                    stable_seconds = previous.stable_seconds
-                    if (
-                        not previous.needs_check
-                        and previous.successful_at is not None
-                        and now >= previous.successful_at
-                    ):
-                        stable_seconds += now - previous.successful_at
+                file_times = [modified for _, is_dir, modified in observed_entries if not is_dir]
+                valid_times = [modified for modified in file_times if modified is not None and modified <= now]
+                latest_modified_at = max(valid_times, default=None)
+                uncertain_time = any(modified is None or modified > now for modified in file_times)
                 relative = PurePosixPath(current).relative_to(mapping.source_dir)
                 output_directory = mapping.output_dir.joinpath(*relative.parts)
                 store.record_success(
@@ -1784,17 +1814,22 @@ class ScanCoordinator:
                     current,
                     children,
                     now,
-                    now + self._recheck_interval(stable_seconds, mapping.active_recheck_minutes),
+                    None,
                     fingerprint=fingerprint,
-                    stable_seconds=stable_seconds,
+                    latest_modified_at=latest_modified_at,
+                    uncertain_time=uncertain_time,
                     configuration_fingerprint=mapping.configuration_fingerprint,
                     configuration_revision=mapping.configuration_revision,
                     outputs=(path.name for path in mapping.expected_outputs if path.parent == output_directory),
-                    cleanup_retry_at=now + mapping.active_recheck_minutes * 60,
+                    cleanup_retry_at=now + mapping.active_recheck_days * 86400,
                 )
+                if previous is not None and previous.successful_at is not None:
+                    store.advance_recheck(
+                        mapping.identity, current, now + self._directory_interval(mapping, current, now)
+                    )
                 mapping.checked_directories.add(current)
             elif store is not None:
-                store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_minutes * 60)
+                store.record_failure(mapping.identity, current, self._clock(), mapping.active_recheck_days * 86400)
 
     def _remember_expected_output(self, mapping: _MappingRun, target: Path) -> None:
         """记录预期产物的词法与解析身份，解析失败时保守禁用清理。"""
@@ -1810,7 +1845,7 @@ class ScanCoordinator:
 
         if self._observation_store is not None:
             self._observation_store.defer_cleanup(
-                mapping.identity, mapping.checked_directories, self._clock() + mapping.active_recheck_minutes * 60
+                mapping.identity, mapping.checked_directories, self._clock() + mapping.active_recheck_days * 86400
             )
         if mapping.expected_output_resolution_failed:
             mapping.status.cleanup_eligible = False

@@ -190,14 +190,75 @@ def test_active_interval_and_legacy_configuration_migration() -> None:
     )
     public = public_configuration(configuration)
     assert public["schedule_enabled"] is True
-    assert public["active_recheck_minutes"] == 60
+    assert public["active_recheck_days"] == 1
+    assert "active_recheck_minutes" not in public
     assert "schedule_cron" not in public and "time_pruning" not in public
-    assert build_configuration({"active_recheck_minutes": 15}).active_recheck_minutes == 15
+
+
+@pytest.mark.parametrize("minutes", [1, 15, 60, 1440])
+def test_legacy_minutes_migrate_to_one_day(minutes: int) -> None:
+    """旧分钟配置统一迁移为一天，显式新配置优先。"""
+
+    assert build_configuration({"active_recheck_minutes": minutes}).active_recheck_days == 1
+    configuration = build_configuration({"active_recheck_minutes": minutes, "active_recheck_days": 2})
+    assert public_configuration(configuration)["active_recheck_days"] == 2
 
 
 @pytest.mark.parametrize("value", [0, -1, 1441, 1.5, "60", True])
 def test_active_interval_requires_bounded_integer_minutes(value: object) -> None:
-    """活跃间隔只接受一分钟至一天的整数。"""
+    """旧分钟配置仍拒绝原范围之外或类型无效的值。"""
 
     with pytest.raises(ConfigurationValidationError):
         build_configuration({"active_recheck_minutes": value})
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, "1", True, None])
+def test_recent_interval_requires_positive_integer_days(value: object) -> None:
+    """近期目录间隔只接受正整数天数。"""
+
+    with pytest.raises(ConfigurationValidationError):
+        build_configuration({"active_recheck_days": value})
+
+
+def test_recent_interval_cannot_exceed_stale_interval() -> None:
+    """近期目录不能比陈旧目录复查得更慢。"""
+
+    assert build_configuration({"active_recheck_days": 7}).active_recheck_days == 7
+    with pytest.raises(ConfigurationValidationError):
+        build_configuration({"active_recheck_days": 8})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "recent_days",
+        "cold_after_days",
+        "archive_after_days",
+        "stale_recheck_days",
+        "cold_recheck_days",
+        "archive_recheck_days",
+        "uncertain_recheck_days",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1, 1.5, "7", True])
+def test_file_age_policy_requires_positive_integer_days(field: str, value: object) -> None:
+    """所有年龄策略字段拒绝非正整数和隐式类型转换。"""
+
+    with pytest.raises(ConfigurationValidationError):
+        build_configuration({"file_age_policy": {field: value}})
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"recent_days": 90},
+        {"archive_after_days": 90},
+        {"stale_recheck_days": 31},
+        {"cold_recheck_days": 91},
+    ],
+)
+def test_file_age_policy_rejects_invalid_order(policy: dict[str, int]) -> None:
+    """年龄严格递增，正常档位的复查间隔不得随陈旧程度增加而缩短。"""
+
+    with pytest.raises(ConfigurationValidationError):
+        build_configuration({"file_age_policy": policy})

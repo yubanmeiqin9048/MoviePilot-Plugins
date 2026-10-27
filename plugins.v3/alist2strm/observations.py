@@ -25,7 +25,8 @@ class DirectoryObservation:
     needs_check: bool = True
     recheck_at: float | None = None
     fingerprint: str | None = None
-    stable_seconds: float = 0
+    latest_modified_at: float | None = None
+    uncertain_time: bool = False
     configuration_fingerprint: str | None = None
     configuration_revision: int = 0
     attempted_at: float | None = None
@@ -188,6 +189,35 @@ class DirectoryObservationStore:
             self._ensure_loaded()
             return self._mappings.get(identity, {}).get(path, DirectoryObservation())
 
+    def subtree_file_time(self, identity: MappingIdentity, path: str, now: float) -> tuple[float | None, bool]:
+        """汇总未排除文件的最新时间；缺失、未来或无成功观测标记为不确定。"""
+
+        with self._lock:
+            self._ensure_loaded()
+            pending = [path]
+            visited: set[str] = set()
+            latest: float | None = None
+            uncertain = False
+            while pending:
+                current = pending.pop()
+                if current in visited:
+                    uncertain = True
+                    continue
+                visited.add(current)
+                observation = self._mappings.get(identity, {}).get(current)
+                if observation is None or observation.successful_at is None:
+                    uncertain = True
+                    continue
+                uncertain |= observation.uncertain_time
+                modified = observation.latest_modified_at
+                if modified is not None:
+                    if modified > now:
+                        uncertain = True
+                    else:
+                        latest = modified if latest is None else max(latest, modified)
+                pending.extend(observation.children)
+            return latest, uncertain
+
     def instance_retry_pending(self, instance_id: str, now: float) -> bool:
         """认证失败按实例退避，时钟回拨时允许重新检查。"""
 
@@ -234,7 +264,7 @@ class DirectoryObservationStore:
             return True
 
     def record_failure(self, identity: MappingIdentity, path: str, now: float, interval: float) -> None:
-        """从失败发生时安排重试，保留此前成功基线及稳定时长。"""
+        """从失败发生时安排重试，保留此前成功观测的文件时间。"""
 
         with self._lock:
             self._ensure_loaded()
@@ -252,7 +282,8 @@ class DirectoryObservationStore:
         recheck_at: float | None = None,
         *,
         fingerprint: str | None = None,
-        stable_seconds: float = 0,
+        latest_modified_at: float | None = None,
+        uncertain_time: bool = False,
         configuration_fingerprint: str | None = None,
         configuration_revision: int = 0,
         outputs: Iterable[str] = (),
@@ -285,7 +316,8 @@ class DirectoryObservationStore:
                 False,
                 recheck_at,
                 fingerprint,
-                stable_seconds,
+                latest_modified_at,
+                uncertain_time,
                 configuration_fingerprint,
                 configuration_revision,
                 successful_at,
@@ -322,7 +354,7 @@ class DirectoryObservationStore:
             self._persist()
 
     def complete_cleanup(self, identity: MappingIdentity, paths: Iterable[str]) -> None:
-        """仅解除本地清理要求，不改变远端检查与稳定观测。"""
+        """仅解除本地清理要求，不改变远端检查与文件时间观测。"""
 
         with self._lock:
             if not self._ensure_loaded():
@@ -346,7 +378,7 @@ class DirectoryObservationStore:
         except Exception as error:  # noqa: BLE001 - 不泄露底层持久化错误或凭据
             logger.warning(f"Alist2Strm 目录观测读取失败，目录状态暂按未知处理：类型={type(error).__name__}")
             return False
-        if isinstance(payload, Mapping) and payload.get("version") in (1, 2):
+        if isinstance(payload, Mapping) and payload.get("version") in (1, 2, 3):
             retries = payload.get("instance_retries", {})
             if isinstance(retries, Mapping):
                 self._instance_retries = {
@@ -376,7 +408,7 @@ class DirectoryObservationStore:
                     self._mappings[key] = {
                         path: observation
                         for path, value in directories.items()
-                        if payload.get("version") == 2
+                        if payload.get("version") == 3
                         and isinstance(path, str)
                         and _valid_path(path, key[1])
                         and (observation := _decode_observation(path, value)) is not None
@@ -409,7 +441,7 @@ class DirectoryObservationStore:
         """保存目录级摘要与清理产物名称，不包含凭据或源文件内容。"""
 
         payload = {
-            "version": 2,
+            "version": 3,
             "instance_retries": {key: list(value) for key, value in self._instance_retries.items()},
             "mappings": [
                 {
@@ -431,7 +463,8 @@ class DirectoryObservationStore:
                             "needs_check": value.needs_check,
                             "recheck_at": value.recheck_at,
                             "fingerprint": value.fingerprint,
-                            "stable_seconds": value.stable_seconds,
+                            "latest_modified_at": value.latest_modified_at,
+                            "uncertain_time": value.uncertain_time,
                             "configuration_fingerprint": value.configuration_fingerprint,
                             "configuration_revision": value.configuration_revision,
                             "attempted_at": value.attempted_at,
@@ -506,7 +539,8 @@ def _decode_observation(path: str, value: object) -> DirectoryObservation | None
         return None
     fingerprint = value.get("fingerprint")
     configuration = value.get("configuration_fingerprint")
-    stable_seconds = value.get("stable_seconds", 0)
+    latest_modified_at = value.get("latest_modified_at")
+    uncertain_time = value.get("uncertain_time", False)
     revision = value.get("configuration_revision", 0)
     attempted_at = value.get("attempted_at")
     cleanup_pending = value.get("cleanup_pending", False)
@@ -515,8 +549,8 @@ def _decode_observation(path: str, value: object) -> DirectoryObservation | None
     if (
         not (fingerprint is None or isinstance(fingerprint, str))
         or not (configuration is None or isinstance(configuration, str))
-        or not _finite_time(stable_seconds)
-        or stable_seconds < 0
+        or (latest_modified_at is not None and not _finite_time(latest_modified_at))
+        or not isinstance(uncertain_time, bool)
         or not isinstance(revision, int)
         or isinstance(revision, bool)
         or revision < 0
@@ -536,7 +570,8 @@ def _decode_observation(path: str, value: object) -> DirectoryObservation | None
         needs_check,
         float(recheck_at) if recheck_at is not None else None,
         fingerprint,
-        float(stable_seconds),
+        float(latest_modified_at) if latest_modified_at is not None else None,
+        uncertain_time,
         configuration,
         revision,
         float(attempted_at) if attempted_at is not None else None,

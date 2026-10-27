@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { DEFAULT_FILE_AGE_POLICY } from '@/fileAgePolicy'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { getErrorMessage, readConfiguration, readHistory, readScanStatus, startMappingScan, startScan, stopScan } from '@/api'
@@ -177,7 +178,8 @@ function emptyConfig(): ConfigModel {
   return {
     instances: [],
     schedule_enabled: false,
-    active_recheck_minutes: 60,
+    active_recheck_days: 1,
+    file_age_policy: { ...DEFAULT_FILE_AGE_POLICY },
     history_retention_days: 90,
   }
 }

@@ -238,7 +238,7 @@ class Alist2Strm(_PluginBase):
         logger.info(
             f"Alist2Strm 初始化完成：实例数={len(candidate.instances)}，"
             f"映射数={sum(len(instance.mappings) for instance in candidate.instances)}，"
-            f"自动扫描={candidate.schedule_enabled}，活跃复查间隔={candidate.active_recheck_minutes}分钟"
+            f"自动扫描={candidate.schedule_enabled}，近期复查间隔={candidate.active_recheck_days}天"
         )
 
     def get_state(self) -> bool:
@@ -347,7 +347,8 @@ class Alist2Strm(_PluginBase):
         return {
             "instances": instances,
             "schedule_enabled": configuration.schedule_enabled,
-            "active_recheck_minutes": configuration.active_recheck_minutes,
+            "active_recheck_days": configuration.active_recheck_days,
+            "file_age_policy": configuration.file_age_policy.model_dump(mode="python"),
             "history_retention_days": configuration.history_retention_days,
         }
 

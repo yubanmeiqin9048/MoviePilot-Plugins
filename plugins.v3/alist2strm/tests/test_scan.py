@@ -2587,7 +2587,7 @@ def test_complete_scan_records_fingerprints_and_direct_children(tmp_path: Path) 
     identity = ("a", "/media/movies", str(tmp_path / "a"))
     root = store.directory(identity, "/media/movies")
     assert root.fingerprint is not None
-    assert root.stable_seconds == 0
+    assert root.latest_modified_at == 1_706_745_600.0
     assert root.children == ("/media/movies/Season",)
     assert root.successful_at == 1_720_000_000.0
     assert root.needs_check is False
@@ -2660,7 +2660,7 @@ def test_single_layer_pruning_skips_remote_listing_and_protects_unscanned_output
     protected = tmp_path / "old.strm"
     protected.write_text("keep while library is unscanned", encoding="utf-8")
     transport.calls.clear()
-    now[0] += 3599
+    now[0] += 86400 - 1
 
     assert coordinator.trigger().accepted
     queue.run()
@@ -2782,12 +2782,12 @@ def test_cleanup_failure_retains_only_owner_observation_until_recheck(tmp_path: 
         lambda: persisted["value"], lambda value: persisted.__setitem__("value", value)
     )
     assert recovered.directory(identity, "/media/movies/Season").cleanup_pending is True
-    now[0] += 3600
+    now[0] += 86400
     assert run(recovered, LocalFileSystem()).status()["state"] == "success"
     assert not stale.exists()
-    assert recovered.directory(identity, "/media/movies/Season").successful_at == now[0]
+    assert recovered.directory(identity, "/media/movies/Season").successful_at == now[0] - 86400
     assert recovered.directory(identity, "/media/movies/Season").needs_check is False
-    assert transport.pages("/media/movies/Season") == [1, 1]
+    assert transport.pages("/media/movies/Season") == [1]
 
 
 def _observation_task(
@@ -3043,34 +3043,43 @@ def test_stop_preserves_started_and_unstarted_directory_observations(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("stable_seconds", "interval"),
+    ("age_seconds", "interval_days"),
     [
-        (0, 3600),
-        (86399, 3600),
-        (86400, 86400),
-        (7 * 86400 - 1, 86400),
-        (7 * 86400, 7 * 86400),
-        (30 * 86400 - 1, 7 * 86400),
-        (30 * 86400, 30 * 86400),
+        (30 * 86400 - 1, 1),
+        (30 * 86400, 1),
+        (30 * 86400 + 1, 7),
+        (90 * 86400 - 1, 7),
+        (90 * 86400, 7),
+        (90 * 86400 + 1, 30),
+        (365 * 86400 - 1, 30),
+        (365 * 86400, 30),
+        (365 * 86400 + 1, 90),
     ],
 )
-def test_single_layer_recheck_uses_stability_and_exact_deadlines(
-    tmp_path: Path, stable_seconds: int, interval: int
+def test_single_layer_recheck_uses_exact_age_and_deadline_boundaries(
+    tmp_path: Path, age_seconds: int, interval_days: float
 ) -> None:
-    """只有成功观测跨度提升档位，精确到期前无请求，到期即检查。"""
+    """成功检查时分档，精确期限到达即查，等待跨档不后移期限。"""
 
-    tasks = _PruningTasks(tmp_path)
-    tasks.run()
-    tasks.now[0] += stable_seconds
-    assert tasks.coordinator.trigger(force_complete=True).accepted
-    tasks.queue.run()
-    tasks.transport.calls.clear()
-    tasks.now[0] += interval - 1
-    tasks.run()
-    assert tasks.transport.calls == []
-    tasks.now[0] += 1
-    tasks.run()
-    assert tasks.transport.pages("/library") == [1]
+    modified = datetime.fromtimestamp(1_720_000_000 - age_seconds, tz=UTC).isoformat()
+    coordinator, queue, transport, _store, _persisted, now = _observation_task(
+        tmp_path, {"/library": [{"name": "Film.mkv", "is_dir": False, "modified": modified}]}
+    )
+    assert coordinator.trigger().accepted
+    queue.run()
+    transport.calls.clear()
+    if interval_days:
+        now[0] += interval_days * 86400 - 1
+        assert coordinator.trigger().accepted
+        queue.run()
+        assert transport.calls == []
+        now[0] += 1
+    else:
+        now[0] += 1
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert transport.pages("/library") == [1]
+    assert coordinator.status()["state"] == "success"
 
 
 class _PruningTasks:
@@ -3131,17 +3140,18 @@ class _PruningTasks:
         self.queue.run()
 
 
-def _stabilize_except(tasks: _PruningTasks, active_paths: tuple[str, ...] = ()) -> None:
-    """通过两轮真实受控扫描建立七天稳定观测，指定层在第二轮发生可观测变化。"""
+def _set_recent_paths(tasks: _PruningTasks, active_paths: tuple[str, ...] = ()) -> None:
+    """通过受控远端时间建立冷热分支，不使用扫描次数或等待稳定时长。"""
 
-    tasks.now[0] += 7 * 86400
     for path in active_paths:
         files = [entry for entry in tasks.tree[path] if not entry.get("is_dir")]
+        modified = datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()
         if files:
-            files[0]["modified"] = "2025-01-01T00:00:00Z"
+            files[0]["modified"] = modified
         else:
-            tasks.tree[path].append({"name": "stability-note.txt", "is_dir": False})
-    tasks.run()
+            tasks.tree[path].append({"name": "recent-note.txt", "is_dir": False, "modified": modified})
+    assert tasks.coordinator.trigger(force_complete=True).accepted
+    tasks.queue.run()
     assert tasks.coordinator.status()["state"] == "success"
 
 
@@ -3162,14 +3172,15 @@ def _pruning_plugin(tasks: _PruningTasks) -> Alist2Strm:
     return plugin
 
 
-@pytest.mark.parametrize("minutes", [1, 15, 60, 1440])
-def test_active_interval_controls_first_recheck(tmp_path: Path, minutes: int) -> None:
-    """新基线不因文件很旧直接变冷，活跃间隔支持完整配置范围。"""
+@pytest.mark.parametrize("days", [1, 2, 3, 7])
+def test_active_interval_controls_first_recheck(tmp_path: Path, days: int) -> None:
+    """近期目录按用户设置的整数天数复查，精确到期前不发起请求。"""
 
     tasks = _PruningTasks(tmp_path)
-    tasks.configuration["active_recheck_minutes"] = minutes
+    tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()
+    tasks.configuration["active_recheck_days"] = days
     tasks.run()
-    tasks.now[0] += minutes * 60 - 1
+    tasks.now[0] += days * 86400 - 1
     tasks.transport.calls.clear()
     tasks.restart()
     tasks.run()
@@ -3180,9 +3191,11 @@ def test_active_interval_controls_first_recheck(tmp_path: Path, minutes: int) ->
 
 
 def test_active_interval_save_reload_and_task_snapshot(tmp_path: Path) -> None:
-    """活跃间隔保存生效，排队快照不被修改，延长不能撤销已提前的期限。"""
+    """天数间隔保存生效，排队快照不被修改，延长不能撤销已提前的期限。"""
 
     tasks = _PruningTasks(tmp_path)
+    tasks.configuration["active_recheck_days"] = 3
+    tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()
     plugin = _pruning_plugin(tasks)
     saved: dict[str, Any] = {}
     plugin.update_config = lambda value, plugin_id=None: saved.update(deepcopy(value)) or True
@@ -3190,16 +3203,16 @@ def test_active_interval_save_reload_and_task_snapshot(tmp_path: Path) -> None:
     tasks.queue.run()
     tasks.transport.calls.clear()
     assert plugin.trigger_scan()["accepted"]
-    tasks.configuration["active_recheck_minutes"] = 15
-    assert plugin.save_configuration(tasks.configuration)["data"]["active_recheck_minutes"] == 15
-    tasks.now[0] += 899
+    tasks.configuration["active_recheck_days"] = 1
+    assert plugin.save_configuration(tasks.configuration)["data"]["active_recheck_days"] == 1
+    tasks.now[0] += 86400 - 1
     tasks.queue.run()
     assert tasks.transport.calls == []
     plugin.init_plugin(saved)
     assert plugin.trigger_scan()["accepted"]
     tasks.queue.run()
     assert tasks.transport.calls == []
-    tasks.configuration["active_recheck_minutes"] = 120
+    tasks.configuration["active_recheck_days"] = 2
     assert plugin.save_configuration(tasks.configuration)["success"]
     plugin.init_plugin(saved)
     tasks.now[0] += 1
@@ -3207,7 +3220,7 @@ def test_active_interval_save_reload_and_task_snapshot(tmp_path: Path) -> None:
     tasks.queue.run()
     assert tasks.transport.pages("/library") == [1]
     tasks.transport.calls.clear()
-    tasks.now[0] += 7200 - 1
+    tasks.now[0] += 2 * 86400 - 1
     assert plugin.trigger_scan()["accepted"]
     tasks.queue.run()
     assert tasks.transport.calls == []
@@ -3357,7 +3370,7 @@ def test_pruning_failed_durable_marker_blocks_io_then_preserves_failed_retry_aft
     assert plugin.get_scan_status()["state"] == "failed"
     assert orphan.exists()
     tasks.tree["/library"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     plugin = _pruning_plugin(tasks)
     tasks.transport.calls.clear()
     assert plugin.trigger_scan()["accepted"]
@@ -3383,15 +3396,15 @@ def test_pruning_selection_change_does_not_update_existing_strm(tmp_path: Path) 
     assert tasks.coordinator.status()["counters"]["updated"] == 0  # type: ignore[index]
 
 
-def test_pruning_empty_mapping_rechecks_at_active_interval_and_cleans_checked_range(tmp_path: Path) -> None:
-    """空层期限为一个活跃间隔；未扫描保留、到期完整检查后清理。"""
+def test_pruning_empty_mapping_rechecks_at_seven_days_and_cleans_checked_range(tmp_path: Path) -> None:
+    """空层期限为七天；未扫描保留、到期完整检查后清理。"""
 
     tasks = _PruningTasks(tmp_path)
     tasks.tree["/library"] = []
     tasks.run()
     orphan = tmp_path / "orphan.strm"
     orphan.write_text("keep until checked", encoding="utf-8")
-    tasks.now[0] += 3600 - 1
+    tasks.now[0] += 7 * 86400 - 1
     tasks.restart()
     tasks.transport.calls.clear()
     before = deepcopy(tasks.persisted)
@@ -3426,12 +3439,12 @@ def test_pruning_deadline_starts_after_layer_processing_not_task_start(tmp_path:
     successful_at = tasks.now[0]
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] = successful_at + 3600 - 1
+    tasks.now[0] = successful_at + 7 * 86400 - 1
     tasks.run()
     assert tasks.transport.calls == []
     # 任务排队后再到期，执行时应检查而不是重设期限。
     assert tasks.coordinator.trigger().accepted
-    tasks.now[0] = successful_at + 3600
+    tasks.now[0] = successful_at + 7 * 86400
     tasks.queue.run()
     assert tasks.transport.pages("/library") == [1]
 
@@ -3609,7 +3622,7 @@ def test_failed_work_retries_at_active_deadline_after_restart(tmp_path: Path, fa
     tasks.transport.stream_factory = None
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.run()
     assert tasks.transport.pages("/library") == ([] if failure in {"cleanup", "cleanup_listing"} else [1])
     assert tasks.coordinator.status()["state"] == "success"
@@ -3658,11 +3671,11 @@ def test_pruning_interrupted_work_remains_required_across_restart(tmp_path: Path
         assert tasks.coordinator.status()["state"] == "stopped"
     if interruption != "cleanup_stop":
         assert orphan.exists()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
-    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library") == ([] if interruption == "cleanup_stop" else [1])
     assert tasks.coordinator.status()["state"] == "success"
     assert not orphan.exists()
     assert (tmp_path / "Film.strm").read_text(encoding="utf-8") == "https://play-new.example.invalid/d/library/Film.mkv"
@@ -3697,7 +3710,7 @@ def test_pruning_playback_failure_retains_full_update_requirement_after_restart(
     assert (tmp_path / "Other.strm").read_text(
         encoding="utf-8"
     ) == "https://play-old.example.invalid/d/library/Other.mkv"
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -3725,13 +3738,13 @@ def test_pruning_coverage_protects_cold_mapping_and_cleans_checked_mapping(tmp_p
         {"name": "New.mkv", "is_dir": False, "modified": datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()}
     ]
     tasks.run()
-    _stabilize_except(tasks, ("/active",))
+    _set_recent_paths(tasks, ("/active",))
     cold_orphan = cold_output / "old.strm"
     active_orphan = active_output / "old.strm"
     cold_orphan.write_text("unscanned", encoding="utf-8")
     active_orphan.write_text("checked", encoding="utf-8")
     tasks.transport.calls.clear()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.run()
     assert tasks.transport.pages("/library") == []
@@ -3840,7 +3853,7 @@ def test_pruning_stop_during_incomplete_marker_does_not_start_remote_client(tmp_
     assert tasks.coordinator.status()["state"] == "stopped"
     assert opened == []
     assert tasks.transport.calls == []
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.run()
     assert tasks.transport.pages("/library") == [1]
@@ -4041,13 +4054,13 @@ def test_force_complete_unfinished_work_is_rechecked_by_next_normal_scan(tmp_pat
     assert first.status()["state"] == expected_state
     assert stale.exists() is (failure != "cleanup_stop")
     active_failure[0] = False
-    now[0] += 3600
+    now[0] += 86400
     restarted, queue = coordinator()
     calls_before = len(transport.calls)
     assert restarted.trigger(target).accepted
     queue.run()
     assert restarted.status()["state"] == "success"
-    assert len(transport.calls) > calls_before
+    assert (len(transport.calls) > calls_before) is (failure not in {"cleanup", "cleanup_listing", "cleanup_stop"})
     assert (tmp_path / "movie.strm").is_file()
     assert (tmp_path / "movie.srt").is_file()
     assert not stale.exists()
@@ -4106,7 +4119,7 @@ def test_force_complete_success_restarts_normal_recheck_deadline(tmp_path: Path)
 
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] = original_success + 2 * 86400 - 1
+    tasks.now[0] = original_success + 91 * 86400 - 1
     assert tasks.coordinator.trigger(target).accepted
     tasks.queue.run()
     assert tasks.transport.calls == []
@@ -4147,11 +4160,11 @@ def test_pruning_parent_and_child_recheck_and_cleanup_independently(tmp_path: Pa
     original_post = tasks.transport.post_json
 
     def slow_child(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
-        """首次子层完成比父层晚一分钟，使两个截止期可独立观察。"""
+        """首次子层完成比父层晚一天，使两个截止期可独立观察。"""
 
         response = original_post(url, payload, headers)
         if payload["path"] == "/library/Season":
-            tasks.now[0] += 60
+            tasks.now[0] += 86400
         return response
 
     tasks.transport.post_json = slow_child
@@ -4161,7 +4174,7 @@ def test_pruning_parent_and_child_recheck_and_cleanup_independently(tmp_path: Pa
     child_stale = tmp_path / "Season" / "child-stale.strm"
     root_stale.write_text("root", encoding="utf-8")
     child_stale.write_text("child", encoding="utf-8")
-    tasks.now[0] = start + 3600
+    tasks.now[0] = start + 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4172,7 +4185,7 @@ def test_pruning_parent_and_child_recheck_and_cleanup_independently(tmp_path: Pa
     assert child_stale.exists()
 
     root_stale.write_text("unobserved root", encoding="utf-8")
-    tasks.now[0] = start + 3660 - 1
+    tasks.now[0] = start + 8 * 86400 - 1
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4198,10 +4211,10 @@ def test_pruning_skipped_directory_alias_protects_resolved_products(tmp_path: Pa
     tasks.tree["/library"].append({"name": "alias", "is_dir": True})
     tasks.tree["/library/alias"] = [{"name": "Movie.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
-    _stabilize_except(tasks, ("/library",))
+    _set_recent_paths(tasks, ("/library",))
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.run()
     assert tasks.coordinator.status()["state"] == "success"
     assert tasks.transport.pages("/library") == [1]
@@ -4209,29 +4222,42 @@ def test_pruning_skipped_directory_alias_protects_resolved_products(tmp_path: Pa
     assert (real / "Movie.strm").is_file()
 
 
-@pytest.mark.parametrize("modified", [None, "2023-01-01T00:00:00Z", "2099-01-01T00:00:00Z"])
-def test_descendant_changes_do_not_heat_ancestors(tmp_path: Path, modified: str | None) -> None:
-    """后代频繁变化不提前祖先期限，包括缺失或未来文件时间。"""
+@pytest.mark.parametrize(("age_days", "ancestor_due_days"), [(1, 7), (40, 7), (100, 30)])
+def test_pruning_descendant_changes_advance_ancestor_without_refreshing_success_time(
+    tmp_path: Path, age_days: int, ancestor_due_days: int
+) -> None:
+    """子层新观测提前祖先期限；已跳过祖先留待下一任务，不能重设成功时钟。"""
 
     tasks = _PruningTasks(tmp_path)
+    start = tasks.now[0]
     tasks.tree["/library"].append({"name": "Season", "is_dir": True})
     tasks.tree["/library/Season"] = []
     tasks.run()
-    _stabilize_except(tasks, ("/library/Season",))
-    store = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None)
-    identity = ("pruning", "/library", str(tmp_path))
-    parent = store.directory(identity, "/library")
-    for number in range(3):
-        tasks.tree["/library/Season"].append({"name": f"note{number}.txt", "is_dir": False, "modified": modified})
-        tasks.now[0] += 3600
-        tasks.restart()
-        tasks.transport.calls.clear()
+    tasks.now[0] = start + 7 * 86400
+    tasks.tree["/library/Season"] = [
+        {
+            "name": "note.txt",
+            "is_dir": False,
+            "modified": datetime.fromtimestamp(tasks.now[0] - age_days * 86400, tz=UTC).isoformat(),
+        }
+    ]
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library/Season") == [1]
+    tasks.restart()
+    tasks.transport.calls.clear()
+    if ancestor_due_days > 7:
+        tasks.now[0] = start + ancestor_due_days * 86400 - 1
         tasks.run()
-        assert tasks.transport.pages("/library") == []
-        assert tasks.transport.pages("/library/Season")
-        recovered = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None)
-        assert recovered.directory(identity, "/library").successful_at == parent.successful_at
-        assert recovered.directory(identity, "/library").recheck_at == parent.recheck_at
+        assert tasks.transport.calls == []
+        tasks.now[0] += 86400
+    else:
+        tasks.now[0] += 86400
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert tasks.transport.pages("/library/Season") == ([1] if age_days == 1 else [])
 
 
 def test_pruning_cooling_descendant_does_not_postpone_ancestor_deadline(tmp_path: Path) -> None:
@@ -4262,9 +4288,7 @@ def test_pruning_cooling_descendant_does_not_postpone_ancestor_deadline(tmp_path
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
-    assert tasks.transport.pages("/library") == []
-    assert tasks.transport.pages("/library/Season") == [1]
-    tasks.transport.calls.clear()
+    assert tasks.transport.calls == []
     tasks.now[0] += 1
     tasks.run()
     assert tasks.transport.pages("/library") == [1]
@@ -4282,7 +4306,6 @@ def test_pruning_due_ancestor_confirms_branch_changes_before_accessing_due_child
     tasks.tree["/library/Gone"] = [{"name": "Film.mkv", "is_dir": False, "modified": modified}]
     tasks.tree["/library/Sibling"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
-    _stabilize_except(tasks, ("/library", "/library/Gone"))
     tasks.tree["/library"] = [{"name": "Sibling", "is_dir": True}]
     del tasks.tree["/library/Gone"]
     if change == "renamed":
@@ -4290,7 +4313,7 @@ def test_pruning_due_ancestor_confirms_branch_changes_before_accessing_due_child
         tasks.tree["/library/Renamed"] = [{"name": "Film.mkv", "is_dir": False, "modified": modified}]
     sibling_orphan = tmp_path / "Sibling" / "unobserved.strm"
     sibling_orphan.write_text("protect skipped sibling", encoding="utf-8")
-    tasks.now[0] += 3600
+    tasks.now[0] += 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4303,7 +4326,7 @@ def test_pruning_due_ancestor_confirms_branch_changes_before_accessing_due_child
     assert sibling_orphan.exists()
     assert tasks.transport.pages("/library/Renamed") == ([1] if change == "renamed" else [])
     # 父层保留旧历史的七天期限；消失旧分支记录不能在未来任务复活。
-    tasks.now[0] += 3600
+    tasks.now[0] += 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4371,13 +4394,13 @@ def test_pruning_invalid_deep_observation_allows_independent_cooling(tmp_path: P
     tasks.now[0] += 86400
     tasks.run()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.run()
     assert tasks.transport.calls == []
 
 
 def test_pruning_three_levels_revisit_deep_empty_directory_under_skipped_ancestors(tmp_path: Path) -> None:
-    """深层空目录独立到期时不依赖两个冷祖先，也不清理未查范围。"""
+    """深层空目录七天到期时不依赖两个冷祖先，也不清理未查范围。"""
 
     tasks = _PruningTasks(tmp_path)
     tasks.tree["/library"].append({"name": "Branch", "is_dir": True})
@@ -4387,13 +4410,12 @@ def test_pruning_three_levels_revisit_deep_empty_directory_under_skipped_ancesto
     ]
     tasks.tree["/library/Branch/Empty"] = []
     tasks.run()
-    _stabilize_except(tasks, ("/library/Branch/Empty",))
     orphan = tmp_path / "Branch" / "Empty" / "orphan.strm"
     orphan.parent.mkdir()
     orphan.write_text("clean checked layer", encoding="utf-8")
     protected = tmp_path / "Branch" / "orphan.strm"
     protected.write_text("preserve unobserved layer", encoding="utf-8")
-    tasks.now[0] += 3600
+    tasks.now[0] += 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4414,7 +4436,7 @@ def test_pruning_partial_multilayer_failure_preserves_mapping_and_rechecks_start
     tasks.tree["/library/Bad"] = []
     tasks.tree["/library/Good"] = []
     tasks.run()
-    _stabilize_except(tasks, ("/library/Bad", "/library/Good"))
+    _set_recent_paths(tasks, ("/library/Bad", "/library/Good"))
     root_orphan = tmp_path / "orphan.strm"
     root_orphan.write_text("unobserved root", encoding="utf-8")
     good_orphan = tmp_path / "Good" / "orphan.strm"
@@ -4454,27 +4476,27 @@ def test_pruning_partial_multilayer_failure_preserves_mapping_and_rechecks_start
     tasks.transport.post_json = failing_post
     if failure == "download":
         tasks.transport.stream_factory = lambda _url, _headers: DownloadResponse(status_code=403, body=())
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart(BrokenWrite())
     tasks.transport.calls.clear()
     tasks.run()
-    assert tasks.coordinator.status()["state"] == ("stopped" if failure == "stop" else "failed")
-    assert tasks.transport.pages("/library") == []
+    assert tasks.coordinator.status()["state"] == ("stopped" if failure == "stop" else "partial_failure")
+    assert tasks.transport.pages("/library") == [1, 2]
     assert tasks.transport.pages("/library/Good") == [1]
     assert tasks.transport.pages("/library/Bad") == [1]
     assert root_orphan.exists()
     assert good_orphan.exists()
     tasks.transport.post_json = original_post
     tasks.transport.stream_factory = original_stream
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
     assert tasks.coordinator.status()["state"] == "success"
-    assert tasks.transport.pages("/library") == []
+    assert tasks.transport.pages("/library") == [1, 2]
     assert tasks.transport.pages("/library/Good") == [1]
     assert tasks.transport.pages("/library/Bad") == [1]
-    assert root_orphan.exists()
+    assert not root_orphan.exists()
     assert not good_orphan.exists()
     assert (tmp_path / "Bad" / ("new.srt" if failure == "download" else "new.strm")).exists()
 
@@ -4493,7 +4515,7 @@ def test_pruning_removed_branch_cleanup_retry_remains_with_parent(tmp_path: Path
     ]
     tasks.tree["/library/Sibling"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
-    _stabilize_except(tasks, ("/library", "/library/Gone"))
+    _set_recent_paths(tasks, ("/library", "/library/Gone"))
     protected = tmp_path / "Sibling" / "orphan.strm"
     protected.write_text("skipped sibling", encoding="utf-8")
     tasks.tree["/library"] = [entry for entry in tasks.tree["/library"] if entry["name"] != "Gone"]
@@ -4518,7 +4540,7 @@ def test_pruning_removed_branch_cleanup_retry_remains_with_parent(tmp_path: Path
                 raise OSError("cannot enumerate")
             return list(super().iter_files(root))
 
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart(BrokenCleanup())
     tasks.transport.calls.clear()
     tasks.run()
@@ -4527,7 +4549,7 @@ def test_pruning_removed_branch_cleanup_retry_remains_with_parent(tmp_path: Path
     assert tasks.transport.pages("/library/Gone") == []
     assert tasks.transport.pages("/library/Sibling") == []
     assert list((tmp_path / "Gone").glob("*.strm"))
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4549,7 +4571,7 @@ def test_pruning_deadline_crossed_during_selection_does_not_fail_task(tmp_path: 
 
     tasks = _PruningTasks(tmp_path)
     tasks.run()
-    tasks.now[0] += 3600 - seconds_until_due
+    tasks.now[0] += 86400 - seconds_until_due
     tasks.transport.calls.clear()
 
     def ticking_clock() -> float:
@@ -4583,7 +4605,7 @@ def test_pruning_failed_ancestor_listing_does_not_hide_known_due_child(tmp_path:
     tasks.tree["/library/Due"] = [{"name": "Film.mkv", "is_dir": False, "modified": modified}]
     tasks.tree["/library/Cold"] = [{"name": "Kept.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
-    _stabilize_except(tasks, ("/library", "/library/Due"))
+    _set_recent_paths(tasks, ("/library", "/library/Due"))
     product = tmp_path / "Due" / "Film.strm"
     product.unlink()
     orphan = tmp_path / "Due" / "orphan.strm"
@@ -4598,7 +4620,7 @@ def test_pruning_failed_ancestor_listing_does_not_hide_known_due_child(tmp_path:
         return original_post(url, payload, headers)
 
     tasks.transport.post_json = failed_root
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4608,7 +4630,7 @@ def test_pruning_failed_ancestor_listing_does_not_hide_known_due_child(tmp_path:
     assert product.exists()
     assert orphan.exists()
     tasks.transport.post_json = original_post
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4628,13 +4650,12 @@ def test_pruning_checked_directory_alias_cleans_its_scope_below_skipped_parent(t
     tasks.tree["/library"].append({"name": "alias", "is_dir": True})
     tasks.tree["/library/alias"] = []
     tasks.run()
-    _stabilize_except(tasks, ("/library/alias",))
     stale = real / "orphan.strm"
     stale.write_text("covered by alias", encoding="utf-8")
     root_stale = tmp_path / "orphan.strm"
     root_stale.write_text("unchecked root", encoding="utf-8")
     tasks.tree["/library/alias"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
-    tasks.now[0] += 3600
+    tasks.now[0] += 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4668,7 +4689,7 @@ def test_pruning_rebuilt_layer_discards_disappeared_orphan_state_before_branch_r
     tasks.tree["/library/Branch"].append({"name": "Deep", "is_dir": True})
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.run()
     assert tasks.coordinator.status()["state"] == "success"
     assert tasks.transport.pages("/library/Branch/Deep") == [1]
@@ -4683,7 +4704,7 @@ def test_force_complete_cleanup_failure_rechecks_only_failed_owner_after_restart
     for branch in ("Broken", "Valid"):
         tasks.tree[f"/library/{branch}"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
-    _stabilize_except(tasks)
+    _set_recent_paths(tasks)
     broken_orphan = tmp_path / "Broken" / "orphan.strm"
     valid_orphan = tmp_path / "Valid" / "orphan.strm"
     broken_orphan.write_text("retry failed owner", encoding="utf-8")
@@ -4707,7 +4728,7 @@ def test_force_complete_cleanup_failure_rechecks_only_failed_owner_after_restart
     assert broken_orphan.exists()
     assert not valid_orphan.exists()
 
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4732,7 +4753,7 @@ def test_force_complete_interrupted_multilayer_task_preserves_unstarted_plan(tmp
     for branch in ("Pending", "Broken", "Done"):
         tasks.tree[f"/library/{branch}"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
-    _stabilize_except(tasks)
+    _set_recent_paths(tasks)
     start = tasks.now[0]
     orphans = [
         tmp_path / "orphan.strm",
@@ -4785,7 +4806,7 @@ def test_force_complete_interrupted_multilayer_task_preserves_unstarted_plan(tmp
     assert all(orphan.exists() for orphan in orphans)
 
     tasks.transport.post_json = original_post
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4798,7 +4819,7 @@ def test_force_complete_interrupted_multilayer_task_preserves_unstarted_plan(tmp
     assert orphans[1].exists()
     assert all(not orphan.exists() for orphan in (orphans[0], orphans[2], orphans[3]))
 
-    tasks.now[0] = start + 7 * 86400 - 1
+    tasks.now[0] = start + 90 * 86400 - 1
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4854,8 +4875,7 @@ def test_pruning_integrated_paged_request_cost_for_first_normal_due_and_force(tm
     assert tasks.coordinator.status()["state"] == "success"
     assert tasks.transport.calls == []
 
-    _stabilize_except(tasks, ("/library", "/library/Warm"))
-    tasks.now[0] += 3600
+    tasks.now[0] = start + 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -4897,8 +4917,6 @@ def test_pruning_integrated_branch_changes_force_snapshot_stop_and_recovery(tmp_
     tasks.tree["/library/Cold/Deep"] = []
     tasks.tree["/library/Warm"] = [{"name": "Warm.mkv", "is_dir": False, "modified": warm}]
     tasks.run()
-    _stabilize_except(tasks, ("/library", "/library/Warm", "/library/Cold/Deep"))
-    start = tasks.now[0]
     tasks.tree["/library/Cold"].append({"name": "Old.srt", "is_dir": False, "modified": old})
     tasks.tree["/library/Cold/Deep"] = [{"name": "Deep.mkv", "is_dir": False, "modified": old}]
     cold_orphan = tmp_path / "Cold" / "orphan.strm"
@@ -4914,7 +4932,7 @@ def test_pruning_integrated_branch_changes_force_snapshot_stop_and_recovery(tmp_
     assert not (tmp_path / "Cold" / "Old.srt").exists()
     assert not (tmp_path / "Cold" / "Deep" / "Deep.strm").exists()
 
-    tasks.now[0] = start + 3600
+    tasks.now[0] = start + 7 * 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -5000,7 +5018,7 @@ def test_pruning_integrated_branch_changes_force_snapshot_stop_and_recovery(tmp_
     )
     assert all(orphan.exists() for orphan in retry_orphans)
 
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.transport.calls.clear()
     tasks.run()
@@ -5024,54 +5042,46 @@ def test_pruning_integrated_branch_changes_force_snapshot_stop_and_recovery(tmp_
     assert tasks.transport.calls == []
 
 
-def test_stability_metadata_order_directory_times_and_same_age_rename(tmp_path: Path) -> None:
-    """顺序和子目录时间不算变化；同时间改名及非白名单文件增删都重新建立基线。"""
+def test_file_age_ignores_directory_time_and_same_age_rename(tmp_path: Path) -> None:
+    """顺序、目录时间和旧文件改名不导致重新进入高频扫描；非白名单时间仍参与。"""
 
     tasks = _PruningTasks(tmp_path)
-    tasks.tree["/library"].append({"name": "Season", "is_dir": True, "modified": "2024-01-01T00:00:00Z"})
+    tasks.tree["/library"].append({"name": "Season", "is_dir": True, "modified": "2099-01-01T00:00:00Z"})
     tasks.tree["/library/Season"] = []
     tasks.run()
-    _stabilize_except(tasks)
     identity = ("pruning", "/library", str(tmp_path))
 
     def observation() -> Any:
-        """从持久边界恢复本层状态。"""
-
+        """恢复成功观测用于检查期限。"""
         return DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None).directory(
             identity, "/library"
         )
 
-    assert observation().stable_seconds == 7 * 86400
+    assert observation().recheck_at == tasks.now[0] + 90 * 86400
     tasks.tree["/library"].reverse()
-    tasks.tree["/library"][0]["modified"] = "2099-01-01T00:00:00Z"
-    tasks.now[0] += 3600
-    assert tasks.coordinator.trigger(force_complete=True).accepted
-    tasks.queue.run()
-    assert observation().stable_seconds == 7 * 86400 + 3600
     tasks.tree["/library"][1]["name"] = "Renamed.mkv"
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     assert tasks.coordinator.trigger(force_complete=True).accepted
     tasks.queue.run()
-    assert observation().stable_seconds == 0
+    assert observation().recheck_at == tasks.now[0] + 90 * 86400
     assert (tmp_path / "Renamed.strm").exists()
     assert not (tmp_path / "Film.strm").exists()
-    tasks.now[0] += 86400
-    tasks.run()
-    assert observation().stable_seconds == 86400
-    tasks.tree["/library"].append({"name": "note.txt", "is_dir": False})
-    tasks.now[0] += 86400
-    tasks.run()
-    assert observation().stable_seconds == 0
+    tasks.tree["/library"].append(
+        {"name": "note.txt", "is_dir": False, "modified": datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()}
+    )
+    assert tasks.coordinator.trigger(force_complete=True).accepted
+    tasks.queue.run()
+    assert observation().recheck_at == tasks.now[0] + 86400
 
 
-def test_failed_interval_is_not_counted_as_observed_stability(tmp_path: Path) -> None:
-    """跨重启失败中断稳定累计，成功恢复保留失败前时长而不包含停顿。"""
+def test_failed_directory_returns_to_file_age_tier_after_recovery(tmp_path: Path) -> None:
+    """失败跨重启等待重试，恢复后旧文件立即回到长期静态档位。"""
 
     tasks = _PruningTasks(tmp_path)
     tasks.run()
-    _stabilize_except(tasks)
+    _set_recent_paths(tasks)
     old = tasks.tree.pop("/library")
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     assert tasks.coordinator.trigger(force_complete=True).accepted
     tasks.queue.run()
     assert tasks.coordinator.status().state == "failed"
@@ -5079,15 +5089,15 @@ def test_failed_interval_is_not_counted_as_observed_stability(tmp_path: Path) ->
     tasks.tree["/library"] = old
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3599
+    tasks.now[0] += 86400 - 1
     assert not tasks.coordinator.trigger(only_due=True).accepted
     assert tasks.transport.calls == []
     tasks.now[0] = failed_at + 10 * 86400
     tasks.run()
     store = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None)
     observed = store.directory(("pruning", "/library", str(tmp_path)), "/library")
-    assert observed.stable_seconds == 7 * 86400
-    assert observed.recheck_at == tasks.now[0] + 7 * 86400
+    assert observed.latest_modified_at == 1_672_531_200.0
+    assert observed.recheck_at == tasks.now[0] + 90 * 86400
 
 
 def test_authentication_retry_survives_restart_and_force_bypasses_wait(tmp_path: Path) -> None:
@@ -5122,14 +5132,15 @@ def test_authentication_retry_survives_restart_and_force_bypasses_wait(tmp_path:
     assert tasks.transport.pages("/second") == [1]
 
 
-def test_legacy_observations_rebuild_without_replacing_existing_products(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_observations_rebuild_without_replacing_existing_products(tmp_path: Path, version: int) -> None:
     """旧版本事实不换算稳定时长，迁移重建基线且沿用已有产物规则。"""
 
     tasks = _PruningTasks(tmp_path)
     tasks.run()
     payload = tasks.persisted["value"]
     assert isinstance(payload, dict)
-    payload["version"] = 1
+    payload["version"] = version
     product = tmp_path / "Film.strm"
     product.write_text("user content", encoding="utf-8")
     tasks.restart()
@@ -5139,20 +5150,21 @@ def test_legacy_observations_rebuild_without_replacing_existing_products(tmp_pat
     assert product.read_text(encoding="utf-8") == "user content"
     store = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None)
     observation = store.directory(("pruning", "/library", str(tmp_path)), "/library")
-    assert observation.stable_seconds == 0
-    assert observation.recheck_at == tasks.now[0] + 3600
+    assert observation.latest_modified_at == 1_672_531_200.0
+    assert observation.recheck_at == tasks.now[0] + 90 * 86400
 
 
 def test_scheduled_no_due_work_does_not_open_client_or_write_history(tmp_path: Path) -> None:
     """分钟唤醒只筛选期限，无到期工作时不生成后台任务或历史。"""
 
     tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()
     history: list[object] = []
     tasks.coordinator._history_callback = history.append
     tasks.run()
     before = len(history)
     tasks.transport.calls.clear()
-    for _ in range(59):
+    for _ in range(24 * 60 - 1):
         tasks.now[0] += 60
         assert not tasks.coordinator.trigger(only_due=True).accepted
     assert not tasks.queue.jobs
@@ -5170,7 +5182,7 @@ def test_partial_configuration_recovery_completes_without_rewriting_successful_s
     tasks = _PruningTasks(tmp_path)
     tasks.tree["/library"] = [{"name": "Good", "is_dir": True}, {"name": "Bad", "is_dir": True}]
     for branch in ("Good", "Bad"):
-        tasks.tree[f"/library/{branch}"] = [{"name": "Film.mkv", "is_dir": False}]
+        tasks.tree[f"/library/{branch}"] = [{"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
     tasks.run()
     tasks.configuration["instances"][0]["playback_url"] = "https://play-new.example.invalid"
     original_post = tasks.transport.post_json
@@ -5191,23 +5203,23 @@ def test_partial_configuration_recovery_completes_without_rewriting_successful_s
     tasks.now[0] += 86400
     tasks.run()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.restart()
     tasks.run()
     assert tasks.transport.pages("/library/Good") == []
-    assert tasks.transport.pages("/library/Bad") == [1]
+    assert tasks.transport.pages("/library/Bad") == []
     store = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None)
     configuration = store.mapping_configuration(("pruning", "/library", str(tmp_path)))
     assert not configuration.needs_check
     assert not configuration.playback_needs_update
 
 
-def test_clock_rollback_rebuilds_stability_without_waiting_for_future_deadline(tmp_path: Path) -> None:
-    """时钟回拨不能长期跳过目录，也不能保留来自未来的稳定跨度。"""
+def test_clock_rollback_rechecks_without_waiting_for_future_deadline(tmp_path: Path) -> None:
+    """时钟回拨不能长期跳过目录，重新按文件时间安排期限。"""
 
     tasks = _PruningTasks(tmp_path)
     tasks.run()
-    _stabilize_except(tasks)
+    _set_recent_paths(tasks)
     tasks.now[0] -= 86400
     tasks.restart()
     tasks.transport.calls.clear()
@@ -5216,30 +5228,31 @@ def test_clock_rollback_rebuilds_stability_without_waiting_for_future_deadline(t
     observed = DirectoryObservationStore(lambda: tasks.persisted["value"], lambda _value: None).directory(
         ("pruning", "/library", str(tmp_path)), "/library"
     )
-    assert observed.stable_seconds == 0
+    assert observed.recheck_at == tasks.now[0] + 90 * 86400
 
 
 def test_slow_listing_failure_waits_full_active_interval_before_retry(tmp_path: Path) -> None:
     """耗时超过活跃间隔的失败请求，结束后仍等待完整间隔再重试。"""
 
     tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"][0]["modified"] = datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()
     tasks.run()
     original_post = tasks.transport.post_json
 
     def slow_failure(url: str, payload: dict[str, Any], headers: dict[str, str]) -> HttpResponse:
-        """返回不可重试的不完整分页，并推进任务时钟两小时。"""
+        """返回不可重试的不完整分页，并推进任务时钟两天。"""
 
-        tasks.now[0] += 7200
+        tasks.now[0] += 2 * 86400
         return HttpResponse(200, {"code": 200, "data": {"content": [], "total": 1}})
 
-    tasks.now[0] += 3600
+    tasks.now[0] += 86400
     tasks.transport.post_json = slow_failure
     tasks.run()
     assert tasks.coordinator.status().state == "failed"
     tasks.transport.post_json = original_post
     tasks.restart()
     tasks.transport.calls.clear()
-    tasks.now[0] += 3599
+    tasks.now[0] += 86400 - 1
     assert not tasks.coordinator.trigger(only_due=True).accepted
     tasks.now[0] += 1
     assert tasks.coordinator.trigger(only_due=True).accepted
@@ -5262,7 +5275,9 @@ def test_scan_logs_each_directory_failure_with_run_context(tmp_path: Path, monke
         def list_dir(self, path: str) -> list[RemoteEntry]:
             """模拟外部边界异常，验证安全日志而不访问网络。"""
 
-            raise OSError(f"{path}: token-a token-b https://user:password@example.invalid/file?sign=private-sign\n伪造日志")
+            raise OSError(
+                f"{path}: token-a token-b https://user:password@example.invalid/file?sign=private-sign\n伪造日志"
+            )
 
     coordinator = ScanCoordinator(
         lambda: configuration,
@@ -5281,3 +5296,113 @@ def test_scan_logs_each_directory_failure_with_run_context(tmp_path: Path, monke
     assert all("private-sign" not in message and "user:password" not in message for message in messages)
     assert all("\n" not in message for message in messages)
     assert all("token-a" not in message and "token-b" not in message for message in messages)
+
+
+def test_initial_old_library_has_no_hourly_remote_rescans(tmp_path: Path) -> None:
+    """建仓首次读取后，整树旧内容立即进入冷档，一天内分钟调度不再读取。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.tree["/library"] = [{"name": f"Branch{index}", "is_dir": True} for index in range(10)]
+    for index in range(10):
+        tasks.tree[f"/library/Branch{index}"] = [
+            {"name": "Film.mkv", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}
+        ]
+    tasks.run()
+    assert len(tasks.transport.calls) == 15  # 根目录五页、十个子层各一页。
+    tasks.restart()
+    tasks.transport.calls.clear()
+    for _ in range(24 * 60):
+        tasks.now[0] += 60
+        assert not tasks.coordinator.trigger(only_due=True).accepted
+    assert tasks.transport.calls == []
+    assert not tasks.queue.jobs
+
+
+@pytest.mark.parametrize("modified", [None, "broken", "2099-01-01T00:00:00Z"])
+@pytest.mark.parametrize("with_recent", [False, True])
+@pytest.mark.parametrize(("recent_interval", "uncertain_interval"), [(1, 7), (3, 2)])
+def test_uncertain_time_has_bounded_recheck_without_hiding_recent_files(
+    tmp_path: Path, modified: str | None, with_recent: bool, recent_interval: int, uncertain_interval: int
+) -> None:
+    """异常时间按配置复查，与近期文件混合时使用较短的检查间隔。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.configuration["active_recheck_days"] = recent_interval
+    tasks.configuration["file_age_policy"] = {"uncertain_recheck_days": uncertain_interval}
+    tasks.tree["/library"].append({"name": "uncertain.txt", "is_dir": False, "modified": modified})
+    if with_recent:
+        tasks.tree["/library"].append(
+            {"name": "new.txt", "is_dir": False, "modified": datetime.fromtimestamp(tasks.now[0], tz=UTC).isoformat()}
+        )
+    tasks.run()
+    interval = (min(recent_interval, uncertain_interval) if with_recent else uncertain_interval) * 86400
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += interval - 1
+    assert not tasks.coordinator.trigger(only_due=True).accepted
+    assert tasks.transport.calls == []
+    tasks.now[0] += 1
+    assert tasks.coordinator.trigger(only_due=True).accepted
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == ([1, 2] if with_recent else [1])
+
+
+@pytest.mark.parametrize(("age", "days"), [(2, 1), (4, 2), (15, 4), (50, 6), (None, 3)])
+def test_custom_file_age_policy_controls_actual_listing_deadline(tmp_path: Path, age: int | None, days: float) -> None:
+    """自定义阈值和间隔影响远端请求，精确期限之前不查，到期才查。"""
+
+    tasks = _PruningTasks(tmp_path)
+    tasks.configuration["file_age_policy"] = {
+        "recent_days": 3,
+        "cold_after_days": 10,
+        "archive_after_days": 20,
+        "stale_recheck_days": 2,
+        "cold_recheck_days": 4,
+        "archive_recheck_days": 6,
+        "uncertain_recheck_days": 3,
+    }
+    tasks.tree["/library"][0]["modified"] = (
+        datetime.fromtimestamp(tasks.now[0] - age * 86400, tz=UTC).isoformat() if age is not None else None
+    )
+    tasks.run()
+    tasks.restart()
+    tasks.transport.calls.clear()
+    tasks.now[0] += days * 86400 - 1
+    assert not tasks.coordinator.trigger(only_due=True).accepted
+    assert tasks.transport.calls == []
+    tasks.now[0] += 1
+    assert tasks.coordinator.trigger(only_due=True).accepted
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+
+
+def test_file_age_settings_persist_and_do_not_change_queued_snapshot(tmp_path: Path) -> None:
+    """保存及重载保留年龄策略，排队任务使用旧配置，新期限提前后不能撤销。"""
+
+    tasks = _PruningTasks(tmp_path)
+    plugin = _pruning_plugin(tasks)
+    saved: dict[str, Any] = {}
+    plugin.update_config = lambda value, plugin_id=None: saved.update(deepcopy(value)) or True
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    tasks.transport.calls.clear()
+    assert plugin.trigger_scan()["accepted"]
+    tasks.configuration["file_age_policy"] = {"archive_recheck_days": 30}
+    result = plugin.save_configuration(tasks.configuration)
+    assert result["data"]["file_age_policy"]["archive_recheck_days"] == 30
+    assert saved["file_age_policy"]["archive_recheck_days"] == 30
+    tasks.now[0] += 40 * 86400
+    tasks.queue.run()
+    assert tasks.transport.calls == []  # 排队快照仍为九十天。
+    plugin.init_plugin(saved)
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]
+    tasks.transport.calls.clear()
+    tasks.configuration["file_age_policy"] = {"archive_recheck_days": 90}
+    assert plugin.save_configuration(tasks.configuration)["success"]
+    plugin.init_plugin(saved)
+    tasks.now[0] += 30 * 86400
+    assert plugin.trigger_scan()["accepted"]
+    tasks.queue.run()
+    assert tasks.transport.pages("/library") == [1]  # 延长不撤销已建立的三十天期限。

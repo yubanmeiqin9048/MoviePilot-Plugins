@@ -287,6 +287,30 @@ class OpenListInstance(BaseModel):
         return self.playback_url or self.scan_url
 
 
+class FileAgePolicy(BaseModel):
+    """文件年龄分档阈值与复查间隔，单位为天。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    recent_days: StrictInt = Field(default=30, gt=0)
+    cold_after_days: StrictInt = Field(default=90, gt=0)
+    archive_after_days: StrictInt = Field(default=365, gt=0)
+    stale_recheck_days: StrictInt = Field(default=7, gt=0)
+    cold_recheck_days: StrictInt = Field(default=30, gt=0)
+    archive_recheck_days: StrictInt = Field(default=90, gt=0)
+    uncertain_recheck_days: StrictInt = Field(default=7, gt=0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> FileAgePolicy:
+        """年龄阈值严格递增，越冷的正常目录复查间隔不能缩短。"""
+
+        if not self.recent_days < self.cold_after_days < self.archive_after_days:
+            raise ValueError("年龄阈值必须满足：近期窗口 < 冷目录阈值 < 长期静态阈值")
+        if not self.stale_recheck_days <= self.cold_recheck_days <= self.archive_recheck_days:
+            raise ValueError("复查间隔必须满足：陈旧目录 ≤ 冷目录 ≤ 长期静态目录")
+        return self
+
+
 class PluginConfiguration(BaseModel):
     """Alist2Strm 的可持久化公开配置。"""
 
@@ -294,13 +318,14 @@ class PluginConfiguration(BaseModel):
 
     instances: list[OpenListInstance] = Field(default_factory=list)
     schedule_enabled: StrictBool = False
-    active_recheck_minutes: StrictInt = Field(default=60, ge=1, le=1440)
+    active_recheck_days: StrictInt = Field(default=1, gt=0)
+    file_age_policy: FileAgePolicy = Field(default_factory=FileAgePolicy)
     history_retention_days: StrictInt = Field(default=DEFAULT_HISTORY_RETENTION_DAYS, gt=0)
 
     @model_validator(mode="before")
     @classmethod
     def _normalise_input(cls, value: object) -> object:
-        """迁移旧定时与文件年龄配置，新策略不复用旧参数。"""
+        """迁移旧定时配置，将旧分钟间隔提升为一天。"""
 
         value = _alias_fields(
             value,
@@ -312,9 +337,23 @@ class PluginConfiguration(BaseModel):
         )
         if isinstance(value, Mapping):
             value = dict(value)
+            has_legacy_minutes = "active_recheck_minutes" in value
+            legacy_minutes = value.pop("active_recheck_minutes", None)
+            if "active_recheck_days" not in value and has_legacy_minutes:
+                if type(legacy_minutes) is not int or not 1 <= legacy_minutes <= 1440:
+                    raise ValueError("旧近期复查间隔必须为 1 至 1440 的整数分钟数")
+                value["active_recheck_days"] = 1
             for key in ("schedule_cron", "cron", "time_pruning"):
                 value.pop(key, None)
         return value
+
+    @model_validator(mode="after")
+    def _ordered_recheck_intervals(self) -> PluginConfiguration:
+        """近期目录的复查间隔不得超过陈旧目录。"""
+
+        if self.active_recheck_days > self.file_age_policy.stale_recheck_days:
+            raise ValueError("复查间隔必须满足：近期目录 ≤ 陈旧目录 ≤ 冷目录 ≤ 长期静态目录")
+        return self
 
 
 class ConfigurationValidationError(ValueError):
@@ -528,7 +567,8 @@ def public_configuration(configuration: PluginConfiguration, *, plugin_id: str |
     result: dict[str, object] = {
         "instances": instances,
         "schedule_enabled": configuration.schedule_enabled,
-        "active_recheck_minutes": configuration.active_recheck_minutes,
+        "active_recheck_days": configuration.active_recheck_days,
+        "file_age_policy": configuration.file_age_policy.model_dump(mode="python"),
         "history_retention_days": configuration.history_retention_days,
         "notices": {
             "admin_token": ADMIN_TOKEN_WARNING,
