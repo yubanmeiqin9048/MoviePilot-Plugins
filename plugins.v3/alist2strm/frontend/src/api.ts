@@ -51,8 +51,8 @@ export function readConfiguration(api: PluginApi, pluginId: string): Promise<Con
 }
 
 /** 启动全部映射的手动扫描，服务端只读取已保存配置。 */
-export function startScan(api: PluginApi, pluginId: string): Promise<ScanTriggerResponse> {
-  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan'), { scan_mode: 'normal' })
+export function startScan(api: PluginApi, pluginId: string, scanMode: ScanMode = 'normal'): Promise<ScanTriggerResponse> {
+  return api.post<ScanTriggerResponse>(pluginPath(pluginId, 'scan'), { scan_mode: scanMode })
 }
 
 /** 启动一个已保存映射的手动扫描。 */

@@ -196,11 +196,15 @@ def test_force_complete_api_passes_selected_mapping_and_mode(endpoint: str, nest
     ],
 )
 def test_force_complete_api_rejects_invalid_target(endpoint: str, payload: dict[str, object]) -> None:
-    """强制请求不能省略、批量或使用非法单组选择。"""
+    """全量入口允许省略目标，单映射入口仍拒绝无效选择。"""
 
     from fastapi import HTTPException
 
     plugin = object.__new__(Alist2Strm)
+    if endpoint == "start_scan" and payload.get("target") is None:
+        plugin.trigger_scan = lambda target=None, force_complete=False: {"target": target, "force": force_complete}
+        assert plugin.start_scan(payload, _=object()) == {"target": None, "force": True}
+        return
     plugin.trigger_scan = lambda *args, **kwargs: pytest.fail("无效目标不能进入任务入口")
     with pytest.raises(HTTPException) as error:
         getattr(plugin, endpoint)(payload, _=object())

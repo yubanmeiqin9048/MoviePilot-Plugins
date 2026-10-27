@@ -3,7 +3,7 @@ import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { getErrorMessage, readConfiguration, saveConfiguration } from '@/api'
 import { configurationEditorState } from '@/configState'
-import type { ConfigModel, DirectoryMapping, Notices, OpenListInstance, PluginApi, TimePruningConfiguration } from '@/types'
+import type { ConfigModel, DirectoryMapping, Notices, OpenListInstance, PluginApi } from '@/types'
 
 const DEFAULT_NOTICES: Notices = {
   admin_token: '仅支持 OpenList 管理员 API Token，不支持普通用户 Token、账号或密码。',
@@ -13,25 +13,6 @@ const DEFAULT_NOTICES: Notices = {
 }
 
 const LIST_DELIMITERS = [',', '，', ';', '；']
-const DEFAULT_TIME_PRUNING: TimePruningConfiguration = {
-  recent_days: 30,
-  cold_after_days: 90,
-  archive_after_days: 365,
-  stale_recheck_days: 7,
-  cold_recheck_days: 30,
-  archive_recheck_days: 90,
-  empty_recheck_days: 7,
-}
-const PRUNING_FIELDS: { key: keyof TimePruningConfiguration; label: string; hint: string }[] = [
-  { key: 'recent_days', label: '近期窗口', hint: '最新文件不超过此天数时，每次扫描任务都检查。' },
-  { key: 'empty_recheck_days', label: '空子树复查间隔', hint: '已确认整个子树无文件时使用。' },
-  { key: 'cold_after_days', label: '冷目录阈值', hint: '超过近期窗口、不超过此阈值时，使用陈旧目录复查间隔。' },
-  { key: 'stale_recheck_days', label: '陈旧目录复查间隔', hint: '最新文件超过近期窗口、不超过冷目录阈值。' },
-  { key: 'archive_after_days', label: '长期静态目录阈值', hint: '超过冷目录阈值、不超过此阈值时，使用冷目录复查间隔。' },
-  { key: 'cold_recheck_days', label: '冷目录复查间隔', hint: '最新文件超过冷目录阈值、不超过长期静态目录阈值。' },
-  { key: 'archive_recheck_days', label: '长期静态目录复查间隔', hint: '最新文件超过长期静态目录阈值。' },
-]
-
 type HostToast = {
   success(message: string): unknown
   error(message: string): unknown
@@ -68,8 +49,10 @@ const pluginId = computed(() => props.pluginId.trim() || props.initialConfig?.pl
 const dirty = computed(() => serialize(toPayload(draft.value)) !== baseline.value)
 const notices = computed(() => ({ ...DEFAULT_NOTICES, ...(draft.value.notices || {}) }))
 const outputConflicts = computed(() => findOutputConflicts(draft.value.instances))
-const pruningErrors = computed(() => validateTimePruning(draft.value.time_pruning))
-const pruningError = computed(() => Object.values(pruningErrors.value)[0] || '')
+const pruningError = computed(() => {
+  const minutes = draft.value.active_recheck_minutes
+  return Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440 ? '' : '请输入 1 至 1440 的整数分钟数'
+})
 const canSave = computed(() => !saving.value && dirty.value && !outputConflicts.value.size && !pruningError.value)
 const activeInstance = computed(() => draft.value.instances[activeIndex.value] ?? null)
 const mappingTotal = computed(() => draft.value.instances.reduce((sum, item) => sum + item.mappings.length, 0))
@@ -115,9 +98,8 @@ function emptyModel(): ConfigModel {
   return {
     instances: [],
     schedule_enabled: false,
-    schedule_cron: '0 3 * * *',
+    active_recheck_minutes: 60,
     history_retention_days: 90,
-    time_pruning: { ...DEFAULT_TIME_PRUNING },
     notices: { ...DEFAULT_NOTICES },
   }
 }
@@ -128,16 +110,10 @@ function normalizeConfig(value?: Partial<ConfigModel>): ConfigModel {
   return {
     instances: rawInstances.map((item, instanceIndex) => normalizeInstance(item, instanceIndex)),
     schedule_enabled: input.schedule_enabled === true,
-    schedule_cron: typeof input.schedule_cron === 'string' && input.schedule_cron.trim() ? input.schedule_cron : '0 3 * * *',
+    active_recheck_minutes: typeof input.active_recheck_minutes === 'number' ? input.active_recheck_minutes : 60,
     history_retention_days: Number.isInteger(Number(input.history_retention_days)) && Number(input.history_retention_days) > 0
       ? Number(input.history_retention_days)
       : 90,
-    time_pruning: {
-      ...DEFAULT_TIME_PRUNING,
-      ...(typeof input.time_pruning === 'object' && input.time_pruning !== null
-        ? input.time_pruning as Partial<TimePruningConfiguration>
-        : {}),
-    },
     notices: typeof input.notices === 'object' && input.notices !== null
       ? { ...DEFAULT_NOTICES, ...(input.notices as Partial<Notices>) }
       : { ...DEFAULT_NOTICES },
@@ -279,19 +255,6 @@ function setList(mapping: DirectoryMapping, field: 'extensions' | 'exclude_keywo
 
 function required(value: string): true | string {
   return !!value?.trim() || '必填'
-}
-
-function validateTimePruning(value: TimePruningConfiguration): Partial<Record<keyof TimePruningConfiguration, string>> {
-  const errors: Partial<Record<keyof TimePruningConfiguration, string>> = {}
-  for (const { key } of PRUNING_FIELDS) {
-    if (!Number.isInteger(value[key]) || value[key] <= 0) errors[key] = '请输入大于 0 的整数天数'
-  }
-  if (Object.keys(errors).length) return errors
-  if (value.cold_after_days <= value.recent_days) errors.cold_after_days = '冷目录阈值必须大于近期窗口'
-  if (value.archive_after_days <= value.cold_after_days) errors.archive_after_days = '长期静态目录阈值必须大于冷目录阈值'
-  if (value.cold_recheck_days < value.stale_recheck_days) errors.cold_recheck_days = '冷目录复查间隔不能小于陈旧目录'
-  if (value.archive_recheck_days < value.cold_recheck_days) errors.archive_recheck_days = '长期静态目录复查间隔不能小于冷目录'
-  return errors
 }
 
 function comparablePath(value: string): string {
@@ -640,35 +603,8 @@ async function save(): Promise<void> {
           <section class="a2s-section">
             <div class="a2s-section-head">
               <div>
-                <h3 class="a2s-section-title">时间剪枝</h3>
-                <p class="a2s-section-desc">所有映射共用，按子树最新文件修改时间减少远端列目录请求。一天按 24 小时计算。</p>
-              </div>
-            </div>
-            <div class="a2s-grid">
-              <VTextField
-                v-for="field in PRUNING_FIELDS"
-                :key="field.key"
-                v-model.number="draft.time_pruning[field.key]"
-                :label="field.label"
-                :hint="field.hint"
-                :error-messages="pruningErrors[field.key]"
-                type="number"
-                min="1"
-                step="1"
-                suffix="天"
-                persistent-hint
-              />
-            </div>
-            <p class="a2s-section-desc">
-              到期后只在下一次手动或定时扫描中复查，新增、删除等变化可能延迟发现。保存后用于后续任务；缩短间隔可提前复查，延长间隔不推迟已定期限。需要立即检查时，可运行指定映射的强制完整扫描。
-            </p>
-          </section>
-
-          <section class="a2s-section">
-            <div class="a2s-section-head">
-              <div>
-                <h3 class="a2s-section-title">定时扫描</h3>
-                <p class="a2s-section-desc">按 Cron 计划依次扫描全部实例的全部映射。</p>
+                <h3 class="a2s-section-title">自动扫描</h3>
+                <p class="a2s-section-desc">自动检查到期目录，稳定目录逐步降低读取频率。</p>
               </div>
               <VSwitch
                 v-model="draft.schedule_enabled"
@@ -676,20 +612,28 @@ async function save(): Promise<void> {
                 inset
                 hide-details
                 density="compact"
-                aria-label="启用定时扫描"
+                aria-label="启用自动扫描"
                 class="a2s-switch"
               />
             </div>
             <div class="a2s-grid">
               <VTextField
-                v-model="draft.schedule_cron"
-                label="Cron 表达式"
-                :disabled="!draft.schedule_enabled"
-                hint="分 时 日 月 周，例如 0 3 * * * 表示每天 03:00"
+                v-model.number="draft.active_recheck_minutes"
+                label="活跃目录复查间隔"
+                hint="默认 60 分钟；检查失败后也按此间隔重试。"
+                :error-messages="pruningError"
+                type="number"
+                min="1"
+                max="1440"
+                step="1"
+                suffix="分钟"
                 persistent-hint
-                class="a2s-mono"
               />
             </div>
+            <p class="a2s-section-desc">
+              每层目录独立判断变化。成功检查确认稳定达到 1、7、30 天后，分别每 1、7、30 天复查；发现变化后恢复活跃间隔。空目录遵循相同规则。
+              冷却期间新增、删除等变化可能延迟发现。需要立即检查时，可在总览运行全部强制完整扫描，或单独运行某个映射的强制完整扫描。
+            </p>
           </section>
 
           <section class="a2s-section">

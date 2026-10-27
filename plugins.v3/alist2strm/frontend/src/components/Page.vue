@@ -177,17 +177,8 @@ function emptyConfig(): ConfigModel {
   return {
     instances: [],
     schedule_enabled: false,
-    schedule_cron: '0 3 * * *',
+    active_recheck_minutes: 60,
     history_retention_days: 90,
-    time_pruning: {
-      recent_days: 30,
-      cold_after_days: 90,
-      archive_after_days: 365,
-      stale_recheck_days: 7,
-      cold_recheck_days: 30,
-      archive_recheck_days: 90,
-      empty_recheck_days: 7,
-    },
   }
 }
 
@@ -233,10 +224,10 @@ async function refreshStatus(): Promise<void> {
   }
 }
 
-async function runAll(): Promise<void> {
+async function runAll(scanMode: ScanMode = 'normal'): Promise<void> {
   triggering.value = true
   try {
-    const response = await startScan(props.api, pluginId.value)
+    const response = await startScan(props.api, pluginId.value, scanMode)
     showResult(response.accepted ? 'success' : 'warning', response.message)
   } catch (error) {
     showResult('error', `启动扫描失败：${getErrorMessage(error, '请稍后重试')}`)
@@ -358,9 +349,18 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
                   prepend-icon="mdi-play"
                   :loading="triggering"
                   :disabled="loading || triggering || status.running || !config.instances.length"
-                  @click="runAll"
+                  @click="runAll()"
                 >
                   运行全部
+                </VBtn>
+                <VBtn
+                  color="primary"
+                  variant="tonal"
+                  prepend-icon="mdi-folder-refresh-outline"
+                  :disabled="loading || triggering || status.running || !config.instances.length"
+                  @click="runAll('force_complete')"
+                >
+                  全部强制完整扫描
                 </VBtn>
               </div>
             </div>
@@ -423,7 +423,7 @@ function showResult(tone: 'success' | 'warning' | 'error', text: string): void {
             <div class="a2s-section-head">
               <div class="a2s-section-title">目录映射</div>
               <p v-if="config.instances.length" class="a2s-section-desc">
-                强制完整扫描仅绕过时间剪枝，检查指定映射的所有允许目录并尝试补回缺失产物；白名单、排除、已有文件跳过及播放地址更新规则仍生效。
+                强制完整扫描仅绕过时间剪枝，检查所选范围的所有允许目录并尝试补回缺失产物；白名单、排除、已有文件跳过及播放地址更新规则仍生效。
               </p>
             </div>
 

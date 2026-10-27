@@ -23,7 +23,6 @@ ADMIN_TOKEN_WARNING = "仅支持 OpenList 管理员 API Token，不支持普通�
 ROOT_WARNING = "OpenList 管理员根目录必须为 /；插件不探测或换算用户根目录。"
 SIGN_WARNING = "请关闭 OpenList 的 sign；插件不探测、生成或续签 sign。"
 OUTPUT_DIRECTORY_WARNING = "完整扫描成功后，会清理该目录中不再需要的受管文件，包括手工放入的文件；请使用专用输出目录。"
-DEFAULT_SCHEDULE_CRON = "0 3 * * *"
 DEFAULT_HISTORY_RETENTION_DAYS = 90
 
 WhitelistMode = Literal["follow_host", "custom"]
@@ -134,24 +133,6 @@ def _is_path_overlap(first: str, second: str) -> bool:
         or resolved_first in resolved_second.parents
         or resolved_second in resolved_first.parents
     )
-
-
-def _valid_cron(value: str) -> str:
-    """校验五字段 Cron 表达式，不创建或更新调度任务。"""
-
-    cron = value.strip()
-    if len(cron.split()) != 5:
-        raise ValueError("Cron 必须包含 5 个字段")
-    try:
-        from apscheduler.triggers.cron import CronTrigger
-
-        CronTrigger.from_crontab(cron)
-    except ImportError:
-        # 纯 schema 使用时允许没有宿主调度依赖，但仍保证基本字段数。
-        pass
-    except ValueError as error:
-        raise ValueError(f"Cron 表达式无效：{error}") from error
-    return cron
 
 
 class DirectoryMapping(BaseModel):
@@ -306,30 +287,6 @@ class OpenListInstance(BaseModel):
         return self.playback_url or self.scan_url
 
 
-class TimePruningConfiguration(BaseModel):
-    """所有目录映射共用的时间剪枝窗口和复查间隔，单位为天。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    recent_days: StrictInt = Field(default=30, gt=0)
-    cold_after_days: StrictInt = Field(default=90, gt=0)
-    archive_after_days: StrictInt = Field(default=365, gt=0)
-    stale_recheck_days: StrictInt = Field(default=7, gt=0)
-    cold_recheck_days: StrictInt = Field(default=30, gt=0)
-    archive_recheck_days: StrictInt = Field(default=90, gt=0)
-    empty_recheck_days: StrictInt = Field(default=7, gt=0)
-
-    @model_validator(mode="after")
-    def _ordered_times(self) -> TimePruningConfiguration:
-        """阈值严格递增，陈旧程度增加时复查间隔不能缩短。"""
-
-        if not self.recent_days < self.cold_after_days < self.archive_after_days:
-            raise ValueError("剪枝阈值必须满足：近期窗口 < 冷目录阈值 < 长期静态目录阈值")
-        if not self.stale_recheck_days <= self.cold_recheck_days <= self.archive_recheck_days:
-            raise ValueError("复查间隔必须满足：陈旧目录 ≤ 冷目录 ≤ 长期静态目录")
-        return self
-
-
 class PluginConfiguration(BaseModel):
     """Alist2Strm 的可持久化公开配置。"""
 
@@ -337,39 +294,27 @@ class PluginConfiguration(BaseModel):
 
     instances: list[OpenListInstance] = Field(default_factory=list)
     schedule_enabled: StrictBool = False
-    schedule_cron: str = DEFAULT_SCHEDULE_CRON
+    active_recheck_minutes: StrictInt = Field(default=60, ge=1, le=1440)
     history_retention_days: StrictInt = Field(default=DEFAULT_HISTORY_RETENTION_DAYS, gt=0)
-    time_pruning: TimePruningConfiguration = Field(default_factory=TimePruningConfiguration)
 
     @model_validator(mode="before")
     @classmethod
     def _normalise_input(cls, value: object) -> object:
-        """去掉只属于浏览器投影的字段。"""
+        """迁移旧定时与文件年龄配置，新策略不复用旧参数。"""
 
-        return _alias_fields(
+        value = _alias_fields(
             value,
             {
                 "instances": ("openlist_instances",),
                 "schedule_enabled": ("enable_schedule",),
-                "schedule_cron": ("cron",),
                 "history_retention_days": ("retention_days",),
             },
         )
-
-    @field_validator("schedule_cron")
-    @classmethod
-    def _cron(cls, value: str) -> str:
-        """校验并规范共用定时计划。"""
-
-        return _valid_cron(value)
-
-    @model_validator(mode="after")
-    def _enabled_schedule_has_cron(self) -> PluginConfiguration:
-        """启用定时计划时不允许空 Cron。"""
-
-        if self.schedule_enabled and not self.schedule_cron.strip():
-            raise ValueError("启用定时扫描时必须填写 Cron")
-        return self
+        if isinstance(value, Mapping):
+            value = dict(value)
+            for key in ("schedule_cron", "cron", "time_pruning"):
+                value.pop(key, None)
+        return value
 
 
 class ConfigurationValidationError(ValueError):
@@ -583,9 +528,8 @@ def public_configuration(configuration: PluginConfiguration, *, plugin_id: str |
     result: dict[str, object] = {
         "instances": instances,
         "schedule_enabled": configuration.schedule_enabled,
-        "schedule_cron": configuration.schedule_cron,
+        "active_recheck_minutes": configuration.active_recheck_minutes,
         "history_retention_days": configuration.history_retention_days,
-        "time_pruning": configuration.time_pruning.model_dump(mode="python"),
         "notices": {
             "admin_token": ADMIN_TOKEN_WARNING,
             "root": ROOT_WARNING,
@@ -601,7 +545,6 @@ def public_configuration(configuration: PluginConfiguration, *, plugin_id: str |
 __all__ = [
     "ADMIN_TOKEN_WARNING",
     "DEFAULT_HISTORY_RETENTION_DAYS",
-    "DEFAULT_SCHEDULE_CRON",
     "OUTPUT_DIRECTORY_WARNING",
     "ROOT_WARNING",
     "SIGN_WARNING",
@@ -609,7 +552,6 @@ __all__ = [
     "DirectoryMapping",
     "OpenListInstance",
     "PluginConfiguration",
-    "TimePruningConfiguration",
     "build_configuration",
     "find_output_conflicts",
     "host_default_extensions",

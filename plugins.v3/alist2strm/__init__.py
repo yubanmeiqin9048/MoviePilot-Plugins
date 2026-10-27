@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
@@ -65,7 +66,7 @@ class Alist2Strm(_PluginBase):
         self._secret_tokens: dict[str, str] = {}
         self._configuration_valid = True
         self._stopped = False
-        # 当前票据仅通过宿主一次性任务执行手动扫描；保存和启动不会调用它。
+        # 扫描由宿主一次性任务执行，周期服务仅负责检查到期工作。
         self._scan_coordinator: ScanCoordinator | None = None
         self._history_store: HistoryStore | None = None
         self._observation_store: DirectoryObservationStore | None = None
@@ -241,7 +242,7 @@ class Alist2Strm(_PluginBase):
         return bool(getattr(self, "_configuration_valid", False) and getattr(self, "_configuration", None))
 
     def get_service(self) -> list[dict[str, Any]]:
-        """声明独立的历史清理 Cron，并按开关声明共用扫描 Cron。"""
+        """声明历史清理服务，并按开关启用每分钟到期检查。"""
 
         if getattr(self, "_stopped", False):
             return []
@@ -264,18 +265,15 @@ class Alist2Strm(_PluginBase):
         ]
         if not configuration.schedule_enabled:
             return services
-        try:
-            trigger = CronTrigger.from_crontab(configuration.schedule_cron)
-        except TypeError, ValueError:
-            return services
+        trigger = CronTrigger.from_crontab("* * * * *")
         services.insert(
             0,
             {
                 "id": "shared-scan",
-                "name": "Alist2Strm 共用定时扫描",
+                "name": "Alist2Strm 到期目录检查",
                 "trigger": trigger,
                 "func": self.scheduled_scan,
-                "kwargs": common_kwargs,
+                "kwargs": {**common_kwargs, "next_run_time": datetime.now(UTC)},
             },
         )
         return services
@@ -288,9 +286,15 @@ class Alist2Strm(_PluginBase):
             self._prune_history(configuration.history_retention_days)
 
     def scheduled_scan(self) -> dict[str, object]:
-        """通过现有全量扫描入口触发一次定时运行，不创建第二套扫描流程。"""
+        """检查到期工作后复用扫描流程，没有到期目录时不创建运行记录。"""
 
-        return self.trigger_scan()
+        configuration = getattr(self, "_configuration", None)
+        if getattr(self, "_stopped", False) or configuration is None or not configuration.schedule_enabled:
+            return {"accepted": False, "message": "自动扫描未启用"}
+        result = self._get_scan_coordinator().trigger(only_due=True)
+        if result.accepted:
+            self.scan_invocations = int(getattr(self, "scan_invocations", 0)) + 1
+        return result.as_dict()
 
     @staticmethod
     def get_command() -> list[dict[str, Any]]:
@@ -338,9 +342,8 @@ class Alist2Strm(_PluginBase):
         return {
             "instances": instances,
             "schedule_enabled": configuration.schedule_enabled,
-            "schedule_cron": configuration.schedule_cron,
+            "active_recheck_minutes": configuration.active_recheck_minutes,
             "history_retention_days": configuration.history_retention_days,
-            "time_pruning": configuration.time_pruning.model_dump(mode="python"),
         }
 
     def save_configuration(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -491,7 +494,7 @@ class Alist2Strm(_PluginBase):
         return coordinator
 
     def trigger_scan(self, target: ScanTarget | None = None, *, force_complete: bool = False) -> dict[str, object]:
-        """捕获已保存配置并提交普通扫描或指定映射强制完整扫描。"""
+        """捕获已保存配置并提交普通扫描或强制完整扫描。"""
 
         result = self._get_scan_coordinator().trigger(target, force_complete=force_complete)
         if result.accepted:
@@ -556,7 +559,7 @@ class Alist2Strm(_PluginBase):
         """运行全部映射，兼容带 target 的单组请求并使用启动快照。"""
 
         force_complete = self._force_complete(payload)
-        target = self._scan_target(payload, required=force_complete)
+        target = self._scan_target(payload)
         return self.trigger_scan(target, force_complete=True) if force_complete else self.trigger_scan(target)
 
     def run_mapping_scan(

@@ -234,7 +234,7 @@ def test_save_during_queued_scan_keeps_snapshot_until_next_run(tmp_path: Path) -
     plugin.save_configuration(new_payload)
     jobs.pop()()
     assert target.read_text(encoding="utf-8") == "https://play-old.example.invalid/d/library/Movie.mkv"
-    assert plugin.get_scan_status()["counters"]["skipped"] == 1  # type: ignore[index]
+    assert plugin.get_scan_status()["counters"]["skipped"] == 0  # type: ignore[index]
     assert plugin.get_scan_status()["counters"]["updated"] == 0  # type: ignore[index]
 
     assert plugin.trigger_scan() == {"accepted": True, "message": "扫描已在后台启动"}

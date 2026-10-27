@@ -175,7 +175,11 @@ def test_enabled_configuration_registers_shared_and_history_cron_services() -> N
     assert service["id"] == "shared-scan"
     assert isinstance(service["trigger"], CronTrigger)
     assert service["func"].__self__ is plugin
-    assert service["kwargs"] == {"coalesce": True, "max_instances": 1, "misfire_grace_time": None}
+    assert service["kwargs"]["coalesce"] is True
+    assert service["kwargs"]["max_instances"] == 1
+    assert service["kwargs"]["misfire_grace_time"] is None
+    assert service["kwargs"]["next_run_time"] is not None
+    assert str(service["trigger"]) == str(CronTrigger.from_crontab("* * * * *"))
     retention = services[1]
     assert retention["id"] == "history-retention"
     assert isinstance(retention["trigger"], CronTrigger)
@@ -232,16 +236,16 @@ def test_disabled_or_invalid_configuration_registers_history_only_or_no_service(
     assert plugin.get_service() == []
 
 
-def test_invalid_cron_is_rejected_before_persistence_or_schedule_refresh() -> None:
-    """无效 Cron 在保存前失败，既不写入也不刷新宿主计划。"""
+def test_invalid_active_interval_is_rejected_before_persistence_or_schedule_refresh() -> None:
+    """无效 活跃间隔 在保存前失败，既不写入也不刷新宿主计划。"""
 
     plugin = _plugin()
     refreshes: list[str] = []
     plugin._schedule_update = lambda plugin_id: refreshes.append(plugin_id)
-    plugin.update_config = lambda *args, **kwargs: pytest.fail("Cron 校验失败不应写入宿主")
+    plugin.update_config = lambda *args, **kwargs: pytest.fail("活跃间隔 校验失败不应写入宿主")
 
     with pytest.raises(ConfigurationValidationError):
-        plugin.save_configuration(_payload(enabled=True, cron="not a cron"))
+        plugin.save_configuration({**_payload(enabled=True), "active_recheck_minutes": 0})
 
     assert refreshes == []
     assert plugin._configuration.schedule_enabled is False
@@ -327,7 +331,7 @@ def test_save_refresh_preserves_host_pending_scan_snapshot(
     periodic_job = owner._scheduler.get_job(periodic_job_id)
     assert periodic_job is not None
     assert periodic_job_id in owner._jobs
-    assert str(periodic_job.trigger) == str(CronTrigger.from_crontab("*/20 * * * *"))
+    assert str(periodic_job.trigger) == str(CronTrigger.from_crontab("* * * * *"))
     assert owner._scheduler.get_job(once_job_id) is not None
     retained = owner._jobs[once_job_id]
     assert retained["_plugin_instance"] is plugin
@@ -366,7 +370,7 @@ def test_stop_service_removes_periodic_jobs_and_rejects_retained_schedule_callba
         ("periodic", "Alist2Strm", True),
         ("manual-scan", "Alist2Strm", True),
     ]
-    assert retained_callback() == {"accepted": False, "message": "没有可运行的已保存配置"}
+    assert retained_callback() == {"accepted": False, "message": "自动扫描未启用"}
     assert plugin.trigger_scan()["accepted"] is False
     assert plugin.scan_invocations == 0
 
@@ -442,9 +446,9 @@ def test_manual_and_scheduled_scans_share_single_layer_pruning_deadline(tmp_path
     orphan = tmp_path / "removed.strm"
     orphan.write_text("protected until checked", encoding="utf-8")
     service = next(item for item in plugin.get_service() if item["id"] == "shared-scan")
-    now[0] += 7 * 86400 - 1
-    service["func"]()
-    queue.run_one()
+    now[0] += 3600 - 1
+    assert service["func"]()["accepted"] is False
+    assert not queue.jobs
     assert calls == ["/library"]
     assert orphan.exists()
     now[0] += 1
@@ -452,4 +456,4 @@ def test_manual_and_scheduled_scans_share_single_layer_pruning_deadline(tmp_path
     queue.run_one()
     assert calls == ["/library", "/library"]
     assert not orphan.exists()
-    assert plugin.scan_invocations == 3
+    assert plugin.scan_invocations == 2
