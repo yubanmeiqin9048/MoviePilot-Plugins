@@ -514,12 +514,16 @@ def secret_tokens(configuration: PluginConfiguration) -> dict[str, str]:
 
 
 def host_default_extensions() -> list[str]:
-    """读取宿主当前媒体与字幕后缀，供 follow_host 模式动态投影。"""
+    """读取宿主当前视频、音频与字幕后缀，供 follow_host 模式动态投影。"""
 
     try:
         from app.sdk.config import settings
 
-        values = [*getattr(settings, "RMT_MEDIAEXT", ()), *getattr(settings, "RMT_SUBEXT", ())]
+        values = [
+            *getattr(settings, "RMT_MEDIAEXT", ()),
+            *getattr(settings, "RMT_AUDIOEXT", ()),
+            *getattr(settings, "RMT_SUBEXT", ()),
+        ]
     except (ImportError, AttributeError):  # fmt: skip
         values = [".mp4", ".mkv", ".ts", ".srt", ".ass", ".ssa", ".sup"]
     result: list[str] = []

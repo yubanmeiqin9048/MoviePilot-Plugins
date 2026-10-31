@@ -28,9 +28,10 @@ def _instance(name: str, output_dir: str, *, source_dir: str = "/library") -> di
 def test_follow_host_defaults_refresh_and_custom_whitelist_restores_follow_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """默认模式读取宿主当前媒体和字幕后缀，自定义值保持且恢复默认后重新跟随。"""
+    """默认模式读取宿主当前视频、音频和字幕后缀，自定义值保持且恢复默认后重新跟随。"""
 
     monkeypatch.setattr(settings, "RMT_MEDIAEXT", [".MKV"])
+    monkeypatch.setattr(settings, "RMT_AUDIOEXT", [".MP3", ".mp3"])
     monkeypatch.setattr(settings, "RMT_SUBEXT", [".SRT"])
     payload = {
         "instances": [
@@ -45,11 +46,12 @@ def test_follow_host_defaults_refresh_and_custom_whitelist_restores_follow_mode(
     }
 
     follow = build_configuration(payload)
-    assert public_configuration(follow)["instances"][0]["mappings"][0]["effective_extensions"] == [".mkv", ".srt"]
+    assert public_configuration(follow)["instances"][0]["mappings"][0]["effective_extensions"] == [".mkv", ".mp3", ".srt"]
 
     monkeypatch.setattr(settings, "RMT_MEDIAEXT", [".MP4"])
+    monkeypatch.setattr(settings, "RMT_AUDIOEXT", [".FLAC"])
     monkeypatch.setattr(settings, "RMT_SUBEXT", [".ASS"])
-    assert public_configuration(follow)["instances"][0]["mappings"][0]["effective_extensions"] == [".mp4", ".ass"]
+    assert public_configuration(follow)["instances"][0]["mappings"][0]["effective_extensions"] == [".mp4", ".flac", ".ass"]
 
     custom_payload = {
         **payload,
@@ -88,7 +90,7 @@ def test_follow_host_defaults_refresh_and_custom_whitelist_restores_follow_mode(
     }
     restored = build_configuration(restored_payload)
     assert restored.instances[0].mappings[0].extensions == [".nfo"]
-    assert public_configuration(restored)["instances"][0]["mappings"][0]["effective_extensions"] == [".mp4", ".ass"]
+    assert public_configuration(restored)["instances"][0]["mappings"][0]["effective_extensions"] == [".mp4", ".flac", ".ass"]
 
 
 def test_valid_configuration_supports_multiple_instances_and_overlapping_sources() -> None:

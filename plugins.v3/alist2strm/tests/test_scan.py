@@ -28,6 +28,7 @@ from app.plugins.alist2strm.scan import (  # ty: ignore[unresolved-import]
     ScanTarget,
     build_playback_url,
 )
+from app.sdk.config import settings
 
 
 class _Transport:
@@ -214,6 +215,90 @@ def test_scan_entry_generates_relative_video_strm_with_pages_and_downloads_attac
         assert call["headers"] == {"Authorization": "token-a"} or call["headers"] == {"Authorization": "token-b"}
         assert "Bearer" not in str(call["headers"])
         assert "token" not in str(call["payload"]).casefold()
+
+
+@pytest.mark.parametrize("whitelist_mode", ["follow_host", "custom"])
+def test_audio_generates_strm_with_host_suffixes_and_cleans_stale_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, whitelist_mode: str
+) -> None:
+    """默认和自定义音频白名单均生成 STRM，沿用跳过、地址更新和清理规则。"""
+
+    monkeypatch.setattr(settings, "RMT_MEDIAEXT", [".MKV"])
+    monkeypatch.setattr(settings, "RMT_AUDIOEXT", [".MP3", ".flac"])
+    monkeypatch.setattr(settings, "RMT_SUBEXT", [".SRT"])
+    configuration = build_configuration(
+        {
+            "instances": [
+                {
+                    "id": "audio",
+                    "name": "音频实例",
+                    "scan_url": "https://audio.example.invalid",
+                    "api_token": "configured",
+                    "mappings": [
+                        {
+                            "source_dir": "/music",
+                            "output_dir": str(tmp_path),
+                            "whitelist_mode": whitelist_mode,
+                            "extensions": [".mp3", ".flac", ".srt"],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    transport = _Transport(
+        {
+            "https://audio.example.invalid": {
+                "/music": [
+                    {"name": "Song.Mp3", "is_dir": False},
+                    {"name": "Album", "is_dir": True},
+                    {"name": "lyrics.srt", "is_dir": False},
+                    {"name": "ignored.wav", "is_dir": False},
+                ],
+                "/music/Album": [{"name": "Track.FLAC", "is_dir": False}],
+            }
+        }
+    )
+    queue = _Queue()
+    coordinator = ScanCoordinator(
+        lambda: configuration,
+        dispatch=queue,
+        client_factory=lambda url, token: OpenListClient(url, token, transport=transport),
+    )
+    (tmp_path / "stale.strm").write_text("stale", encoding="utf-8")
+
+    assert coordinator.trigger().accepted
+    queue.run()
+
+    song = tmp_path / "Song.strm"
+    track = tmp_path / "Album" / "Track.strm"
+    assert song.read_text(encoding="utf-8") == "https://audio.example.invalid/d/music/Song.Mp3"
+    assert track.read_text(encoding="utf-8") == "https://audio.example.invalid/d/music/Album/Track.FLAC"
+    assert (tmp_path / "lyrics.srt").is_file()
+    assert not (tmp_path / "Song.Mp3").exists()
+    assert not (tmp_path / "Album" / "Track.FLAC").exists()
+    assert not (tmp_path / "ignored.wav").exists()
+    assert not (tmp_path / "stale.strm").exists()
+    assert coordinator.status()["counters"] == {
+        "generated": 2,
+        "downloaded": 1,
+        "updated": 0,
+        "skipped": 0,
+        "deleted": 1,
+        "failed": 0,
+    }
+
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert coordinator.status()["counters"]["skipped"] == 3
+    configuration.instances[0].playback_url = "https://play-audio.example.invalid"
+    assert coordinator.trigger().accepted
+    queue.run()
+    assert song.read_text(encoding="utf-8") == "https://play-audio.example.invalid/d/music/Song.Mp3"
+    assert track.read_text(encoding="utf-8") == "https://play-audio.example.invalid/d/music/Album/Track.FLAC"
+    assert coordinator.status()["counters"]["updated"] == 2
+    downloads = [call["url"] for call in transport.calls if "/d/" in call["url"]]
+    assert downloads == ["https://audio.example.invalid/d/music/lyrics.srt"]
 
 
 @pytest.mark.parametrize("force_complete", [False, True])
@@ -3447,6 +3532,38 @@ def test_pruning_deadline_starts_after_layer_processing_not_task_start(tmp_path:
     tasks.now[0] = successful_at + 7 * 86400
     tasks.queue.run()
     assert tasks.transport.pages("/library") == [1]
+
+
+def test_host_audio_suffix_change_rechecks_cold_custom_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """音频分类变化使冷目录重新生成 STRM，未选后缀变化不触发重查。"""
+
+    monkeypatch.setattr(settings, "RMT_AUDIOEXT", [])
+    tasks = _PruningTasks(tmp_path)
+    tasks.configuration["instances"][0]["mappings"][0]["extensions"] = [".mp3"]
+    tasks.tree["/library"] = [{"name": "Song.mp3", "is_dir": False, "modified": "2023-01-01T00:00:00Z"}]
+    monkeypatch.setattr(tasks.coordinator, "_media_suffix_provider", ScanCoordinator._host_suffixes)
+    tasks.run()
+    assert (tmp_path / "Song.mp3").is_file()
+    tasks.transport.calls.clear()
+    tasks.run()
+    assert tasks.transport.calls == []
+
+    monkeypatch.setattr(settings, "RMT_AUDIOEXT", [".MP3"])
+    tasks.run()
+    assert tasks.transport.pages("/library") == [1]
+    assert (tmp_path / "Song.strm").read_text(encoding="utf-8") == (
+        "https://play-old.example.invalid/d/library/Song.mp3"
+    )
+    assert tasks.coordinator.status()["counters"]["generated"] == 1
+    assert tasks.coordinator.status()["counters"]["downloaded"] == 0
+    assert (tmp_path / "Song.mp3").is_file()
+
+    tasks.transport.calls.clear()
+    monkeypatch.setattr(settings, "RMT_AUDIOEXT", [".MP3", ".FLAC"])
+    tasks.run()
+    assert tasks.transport.calls == []
 
 
 @pytest.mark.parametrize("change", ["playback", "source", "output", "whitelist", "exclude"])

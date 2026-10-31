@@ -577,7 +577,7 @@ async function save(): Promise<void> {
                     <div v-else class="a2s-filter-hint">
                       {{ mapping.effective_extensions?.length
                         ? mapping.effective_extensions.join('  ')
-                        : '使用 MoviePilot 的媒体与字幕后缀' }}
+                        : '使用 MoviePilot 的视频、音频与字幕后缀' }}
                     </div>
                   </div>
 

@@ -599,8 +599,8 @@ def _strip_url_credentials(url: str) -> str:
     return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, parsed.query, parsed.fragment))
 
 
-def is_video_name(name: str, suffixes: frozenset[str]) -> bool:
-    """按文件最后一个扩展名匹配宿主媒体后缀，且忽略大小写。"""
+def is_media_name(name: str, suffixes: frozenset[str]) -> bool:
+    """按文件最后一个扩展名匹配宿主视频或音频后缀，且忽略大小写。"""
 
     suffix = PurePosixPath(name).suffix.casefold()
     return bool(suffix) and suffix in suffixes
@@ -809,7 +809,7 @@ class _ScanRun:
     """单次运行的不可变配置快照与可变进度。"""
 
     mappings: list[_MappingRun]
-    video_suffixes: frozenset[str]
+    media_suffixes: frozenset[str]
     started_at: float
     run_id: str
     cleanup_disqualified: bool = False
@@ -890,15 +890,15 @@ class ScanCoordinator:
 
     @staticmethod
     def _host_suffixes() -> Sequence[str]:
-        """读取宿主当前媒体后缀设置。"""
+        """读取宿主当前生成 STRM 的视频与音频后缀。"""
 
-        return getattr(settings, "RMT_MEDIAEXT", ())
+        return [*getattr(settings, "RMT_MEDIAEXT", ()), *getattr(settings, "RMT_AUDIOEXT", ())]
 
     @staticmethod
     def _host_whitelist_suffixes() -> Sequence[str]:
-        """动态读取宿主当前媒体与字幕后缀。"""
+        """动态读取宿主当前视频、音频与字幕后缀。"""
 
-        return [*getattr(settings, "RMT_MEDIAEXT", ()), *getattr(settings, "RMT_SUBEXT", ())]
+        return [*ScanCoordinator._host_suffixes(), *getattr(settings, "RMT_SUBEXT", ())]
 
     def trigger(
         self, target: ScanTarget | None = None, *, force_complete: bool = False, only_due: bool = False
@@ -1163,7 +1163,7 @@ class ScanCoordinator:
             for mapping in instance.mappings
         ):
             return ScanTriggerResult(False, "目录映射身份状态保存失败，扫描未启动")
-        video_suffixes = self._normalise_suffixes(self._media_suffix_provider)
+        media_suffixes = self._normalise_suffixes(self._media_suffix_provider)
         cleanup_disqualified = self._has_overlapping_output_roots(
             Path(mapping.output_dir) for instance in snapshot.instances for mapping in instance.mappings
         )
@@ -1200,6 +1200,7 @@ class ScanCoordinator:
                     mapping.output_dir,
                     allowed_suffixes,
                     tuple(mapping.exclude_keywords),
+                    media_suffixes,
                 )
                 previous_configuration = (
                     self._observation_store.mapping_configuration(identity)
@@ -1253,7 +1254,7 @@ class ScanCoordinator:
             return ScanTriggerResult(False, "指定目标必须唯一匹配一个目录映射")
         return _ScanRun(
             mappings=mappings,
-            video_suffixes=video_suffixes,
+            media_suffixes=media_suffixes,
             started_at=self._clock(),
             run_id=uuid.uuid4().hex,
             cleanup_disqualified=cleanup_disqualified,
@@ -1267,6 +1268,7 @@ class ScanCoordinator:
         output_dir: str,
         allowed_suffixes: frozenset[str],
         exclude_keywords: tuple[str, ...],
+        media_suffixes: frozenset[str],
     ) -> str:
         """生成不含凭据的映射配置依据，供重启后判断剪枝是否失效。"""
 
@@ -1276,6 +1278,7 @@ class ScanCoordinator:
                 "source_dir": source_dir,
                 "output_dir": output_dir,
                 "allowed_suffixes": sorted(allowed_suffixes),
+                "strm_suffixes": sorted(allowed_suffixes.intersection(media_suffixes)),
                 "exclude_keywords": list(exclude_keywords),
             },
             ensure_ascii=False,
@@ -1477,7 +1480,7 @@ class ScanCoordinator:
                         )
                     self._observe_stop(run)
                     self._scan_mapping(
-                        lambda mapping=mapping: self._mapping_reader(mapping, readers), mapping, run.video_suffixes
+                        lambda mapping=mapping: self._mapping_reader(mapping, readers), mapping, run.media_suffixes
                     )
                     self._observe_stop(run)
                     if mapping.status.counters.failed:
@@ -1649,9 +1652,9 @@ class ScanCoordinator:
         getattr(logger, level)(context)
 
     def _scan_mapping(
-        self, reader_provider: Callable[[], Any], mapping: _MappingRun, video_suffixes: frozenset[str]
+        self, reader_provider: Callable[[], Any], mapping: _MappingRun, media_suffixes: frozenset[str]
     ) -> None:
-        """按任务快照递归筛选并生成视频 STRM 或下载其他白名单文件。"""
+        """按任务快照递归筛选，视频和音频生成 STRM，其他白名单文件原样下载。"""
 
         pending = [(mapping.source_dir, False)]
         visited: set[str] = set()
@@ -1748,7 +1751,7 @@ class ScanCoordinator:
                         self._log_mapping(mapping, "debug", f"后缀不在白名单：{remote_path}")
                         continue
                     self._log_mapping(mapping, "debug", f"文件处理开始：{remote_path}")
-                    if is_video_name(entry.name, video_suffixes):
+                    if is_media_name(entry.name, media_suffixes):
                         target = local_strm_path(mapping.output_dir, mapping.source_dir, remote_path)
                         self._remember_expected_output(mapping, target)
                         if self._filesystem.exists(target):
@@ -1878,7 +1881,7 @@ class ScanCoordinator:
             mapping.status.cleanup_eligible = False
             return
 
-        managed_suffixes = self._managed_output_suffixes(mapping.allowed_suffixes, run.video_suffixes)
+        managed_suffixes = self._managed_output_suffixes(mapping.allowed_suffixes, run.media_suffixes)
         self._observe_stop(run)
         candidates: list[tuple[Path, str | None]] = []
         for raw_target in self._filesystem.iter_files(mapping.output_dir):
@@ -1969,11 +1972,11 @@ class ScanCoordinator:
         )
 
     @staticmethod
-    def _managed_output_suffixes(allowed_suffixes: frozenset[str], video_suffixes: frozenset[str]) -> frozenset[str]:
+    def _managed_output_suffixes(allowed_suffixes: frozenset[str], media_suffixes: frozenset[str]) -> frozenset[str]:
         """返回当前映射仍管理的本地产物后缀。"""
 
-        managed = set(allowed_suffixes - video_suffixes)
-        if allowed_suffixes.intersection(video_suffixes):
+        managed = set(allowed_suffixes - media_suffixes)
+        if allowed_suffixes.intersection(media_suffixes):
             managed.add(STRM_SUFFIX)
         return frozenset(managed)
 
@@ -2122,7 +2125,7 @@ __all__ = [
     "build_playback_url",
     "default_transport",
     "encode_remote_path",
-    "is_video_name",
+    "is_media_name",
     "local_file_path",
     "local_strm_path",
     "playback_address_changed",
